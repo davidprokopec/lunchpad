@@ -21,11 +21,11 @@ function settings(audio: AudioSettings): Settings {
   };
 }
 
-const original = { getSettings: api.getSettings, setAudioSettings: api.setAudioSettings, setDeveloperMode: api.setDeveloperMode, onSettings: events.onSettings, onInputUnavailable: events.onInputUnavailable };
+const original = { getSettings: api.getSettings, setAudioSettings: api.setAudioSettings, setDeveloperMode: api.setDeveloperMode, setWindowSettings: api.setWindowSettings, onSettings: events.onSettings, onInputUnavailable: events.onInputUnavailable };
 let dispose = () => {};
 afterEach(() => {
   dispose();
-  Object.assign(api, { getSettings: original.getSettings, setAudioSettings: original.setAudioSettings, setDeveloperMode: original.setDeveloperMode });
+  Object.assign(api, { getSettings: original.getSettings, setAudioSettings: original.setAudioSettings, setDeveloperMode: original.setDeveloperMode, setWindowSettings: original.setWindowSettings });
   Object.assign(events, { onSettings: original.onSettings, onInputUnavailable: original.onInputUnavailable });
 });
 
@@ -205,3 +205,35 @@ test("refresh failure does not report settlement success and a retry survives it
   await t.succeed(2); await retry;
   expect(useSettingsStore.getState().audioError).toBeNull();
 });
+
+for (const source of ["setter", "event"]) {
+  test(`audio settlement confirms audio without reverting newer unrelated ${source} settings`, async () => {
+    const t = await transport(true);
+    const oldRead = settings({ outputDevice: "settled-output", macosAppVolume: false });
+    const settlement = deferred<Settings>();
+    const entered = deferred<void>();
+    t.refreshWith(() => { entered.resolve(); return settlement.promise; });
+    const audio = useSettingsStore.getState().setAudio(oldRead.audio);
+    await t.succeed(1);
+    await entered.promise;
+    const newer = { ...oldRead, window: { ...oldRead.window, stayOnTop: true }, developerMode: true };
+    if (source === "setter") {
+      api.setWindowSettings = async () => newer;
+      await useSettingsStore.getState().setWindow(newer.window);
+    } else {
+      t.event(newer);
+    }
+    expect(useSettingsStore.getState().settings?.window.stayOnTop).toBe(true);
+    expect(useSettingsStore.getState().settings?.developerMode).toBe(true);
+    expect(useSettingsStore.getState().settings?.audio.macosAppVolume).toBe(true);
+    expect(useSettingsStore.getState().audioPending).toBe(true);
+    settlement.resolve(oldRead);
+    await audio;
+    expect(useSettingsStore.getState().settings?.window.stayOnTop).toBe(true);
+    expect(useSettingsStore.getState().settings?.developerMode).toBe(true);
+    expect(useSettingsStore.getState().settings?.audio).toEqual(oldRead.audio);
+    expect(useSettingsStore.getState().audioDesired).toEqual(oldRead.audio);
+    expect(useSettingsStore.getState().audioPending).toBe(false);
+    expect(useSettingsStore.getState().audioError).toBeNull();
+  });
+}

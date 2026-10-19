@@ -26,21 +26,28 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   let audioQueue = Promise.resolve();
   let audioRevision = 0;
   let settingsRevision = 0;
+  let receivedRevision = 0;
   let pendingAudio = 0;
 
   // Full snapshots from unrelated commands/events may contain older audio fields.
   // Only a fenced get_settings read can replace the confirmed audio snapshot.
-  const receiveSettings = (settings: Settings) => set((state) => ({
-    settings: state.settings ? { ...settings, audio: state.settings.audio } : settings,
-  }));
+  const receiveSettings = (settings: Settings) => {
+    ++receivedRevision;
+    set((state) => ({ settings: state.settings ? { ...settings, audio: state.settings.audio } : settings }));
+  };
 
   const refreshSettings = async () => {
     const revision = ++settingsRevision;
     const audioVersion = audioRevision;
+    const receivedVersion = receivedRevision;
     try {
       const settings = await api.getSettings();
       if (revision !== settingsRevision || audioVersion !== audioRevision || pendingAudio > 0) return;
-      set((state) => ({ settings, audioDesired: state.audioError ? state.audioDesired : settings.audio }));
+      // A read confirms audio, but cannot roll back unrelated updates received in flight.
+      set((state) => ({
+        settings: receivedVersion !== receivedRevision && state.settings ? { ...state.settings, audio: settings.audio } : settings,
+        audioDesired: state.audioError ? state.audioDesired : settings.audio,
+      }));
     } catch (error) {
       if (revision === settingsRevision && audioVersion === audioRevision && pendingAudio === 0) {
         set((state) => ({ audioError: [state.audioError, `Settings refresh failed: ${String(error)}`].filter(Boolean).join("; ") }));
