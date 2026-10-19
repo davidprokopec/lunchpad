@@ -49,19 +49,28 @@ struct Subscriber {
     wake: SyncSender<()>,
 }
 
-#[derive(Default)]
 pub struct Hub {
-    subscribers: Mutex<Vec<Subscriber>>,
+    subscribers: Mutex<Option<Vec<Subscriber>>>,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            subscribers: Mutex::new(Some(Vec::new())),
+        }
+    }
 }
 
 impl Hub {
     pub fn subscribe(&self) -> Subscription {
         let (wake, rx) = mpsc::sync_channel(1);
         let pending = Arc::new(AtomicU8::new(0));
-        lock(&self.subscribers).push(Subscriber {
-            pending: Arc::clone(&pending),
-            wake,
-        });
+        if let Some(subscribers) = lock(&self.subscribers).as_mut() {
+            subscribers.push(Subscriber {
+                pending: Arc::clone(&pending),
+                wake,
+            });
+        }
         Subscription { pending, wake: rx }
     }
 
@@ -71,16 +80,32 @@ impl Hub {
         if changes.is_empty() {
             return;
         }
-        lock(&self.subscribers).retain(|s| {
+        let mut subscribers = lock(&self.subscribers);
+        let Some(subscribers) = subscribers.as_mut() else {
+            return;
+        };
+        subscribers.retain(|s| {
             s.pending.fetch_or(changes.0, Ordering::AcqRel);
             // Full: a wake-up is already queued and will see the new bits.
             !matches!(s.wake.try_send(()), Err(TrySendError::Disconnected(_)))
         });
     }
 
+    /// Deliver a final invalidation, then disconnect even if handles remain.
+    pub fn close(&self) {
+        if let Some(subscribers) = lock(&self.subscribers).take() {
+            for subscriber in subscribers {
+                subscriber
+                    .pending
+                    .fetch_or(Changes::ALL.0, Ordering::AcqRel);
+                let _ = subscriber.wake.try_send(());
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn subscriber_count(&self) -> usize {
-        lock(&self.subscribers).len()
+        lock(&self.subscribers).as_ref().map_or(0, Vec::len)
     }
 }
 
@@ -95,7 +120,8 @@ impl Subscription {
         Changes(self.pending.swap(0, Ordering::AcqRel))
     }
 
-    /// Blocks until something changed. `None` once the audio service is gone.
+    /// Blocks until something changed. Shutdown delivers a final `ALL`, then
+    /// `None`, even if service handles remain alive.
     pub fn recv(&self) -> Option<Changes> {
         loop {
             self.wake.recv().ok()?;
@@ -186,5 +212,19 @@ mod tests {
             sub.recv_timeout(Duration::from_millis(20)),
             Err(RecvTimeoutError::Timeout)
         );
+    }
+
+    #[test]
+    fn closing_a_live_hub_invalidates_then_disconnects_all_subscriptions() {
+        let hub = Hub::default();
+        let sub = hub.subscribe();
+        hub.notify(Changes::DEVICES); // an already-full wakeup must include final state
+        hub.close();
+        assert_eq!(sub.recv(), Some(Changes::ALL));
+        assert_eq!(sub.recv(), None);
+        hub.notify(Changes::APPS);
+        hub.close();
+        assert_eq!(hub.subscribe().recv(), None);
+        assert_eq!(hub.subscriber_count(), 0);
     }
 }

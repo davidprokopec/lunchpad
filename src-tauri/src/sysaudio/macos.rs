@@ -367,7 +367,7 @@ impl Backend for MacBackend {
                 permission: taps.permission(),
                 message: match (taps.problem(), taps.permission()) {
                     (Some(problem), _) => problem.to_string(),
-                    (None, Permission::Granted) => String::new(),
+                    (None, Permission::Granted) => "Experimental process taps enabled; capture/revocation/output-switch safety requires user-present verification".into(),
                     (None, Permission::Unconfirmed) => "The System Audio Recording permission could not be confirmed: play audio in the app, then retry".into(),
                     (None, _) => "Process taps need the System Audio Recording permission; it is confirmed on the first change".into(),
                 },
@@ -384,8 +384,11 @@ impl Backend for MacBackend {
             return Ok(Vec::new());
         }
         autoreleasepool(|_| {
-            let objects = get_ids(SYSTEM_OBJECT, HW_PROCESS_LIST)
-                .map_err(|e| e.into_error(ErrorKind::Native))?;
+            let objects = match &mut self.taps {
+                Some(taps) => taps.process_list(),
+                None => get_ids(SYSTEM_OBJECT, HW_PROCESS_LIST)
+                    .map_err(|e| e.into_error(ErrorKind::Native)),
+            }?;
             self.identities.retain(|obj, _| objects.contains(obj));
             let mut members = Vec::with_capacity(objects.len());
             let mut by_app: HashMap<String, Vec<ObjId>> = HashMap::new();
@@ -403,9 +406,12 @@ impl Backend for MacBackend {
                 if identity.pid == self.own_pid {
                     continue;
                 }
-                let active = get::<u32>(obj, PROC_RUNNING_OUTPUT)
-                    .map(|v| v != 0)
-                    .unwrap_or(false);
+                let active = match &mut self.taps {
+                    Some(taps) => taps.active(obj),
+                    None => get::<u32>(obj, PROC_RUNNING_OUTPUT)
+                        .map(|v| v != 0)
+                        .map_err(|e| e.into_error(ErrorKind::Native)),
+                }?;
                 by_app.entry(identity.app_id.clone()).or_default().push(obj);
                 members.push(Member {
                     app_id: identity.app_id,
@@ -423,12 +429,7 @@ impl Backend for MacBackend {
                 // May rebuild or forget taps (process set, output, silence),
                 // so settings are read after it.
                 taps.maintain(&by_app);
-                for member in &mut members {
-                    if let Some((volume, muted)) = taps.setting(&member.app_id) {
-                        member.volume = volume;
-                        member.muted = muted;
-                    }
-                }
+                taps.apply_settings(&mut members);
             }
             self.members = by_app;
             Ok(group(members))
@@ -457,11 +458,12 @@ impl MacBackend {
     }
 
     /// Whether the given app is producing audio right now (any member process).
-    pub fn is_running_output(processes: &[ObjId]) -> bool {
-        processes.iter().any(|p| {
+    /// Property errors remain unknown/error, never evidence of an idle app.
+    pub fn is_running_output(processes: &[ObjId]) -> Result<bool, Error> {
+        processes.iter().try_fold(false, |active, p| {
             get::<u32>(*p, PROC_RUNNING_OUTPUT)
-                .map(|v| v != 0)
-                .unwrap_or(false)
+                .map(|v| active || v != 0)
+                .map_err(|e| e.into_error(ErrorKind::Native))
         })
     }
 }

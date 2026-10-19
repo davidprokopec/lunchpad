@@ -16,8 +16,11 @@
 //! run a probe: an UNMUTED tap whose IOProc outputs nothing and measures the
 //! input peak while the app is producing audio. Only a non-zero peak counts as
 //! evidence of the permission; silence is reported as unconfirmed, never as
-//! granted or denied. After that, muted taps fail open (G1, `SilenceWatch`)
-//! and follow the default output (G2, `route`).
+//! granted or denied. After that, a conditional watchdog (`SilenceWatch`)
+//! removes silent taps when the process reports running output. That property
+//! is unverified while tap-muted; a false report may prevent detection. This
+//! path remains experimental, opt-in and default-off pending user-present
+//! revocation/capture-failure/output-switch testing, not guaranteed fail-open.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,8 +36,9 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 use super::engine::{Error, ErrorKind, Permission};
 use super::macos::{
     check, get, get_string, CaResult, MacBackend, OSStatus, ObjId, DEV_UID, HW_DEFAULT_OUTPUT,
-    SYSTEM_OBJECT, TAP_FORMAT,
+    HW_PROCESS_LIST, SYSTEM_OBJECT, TAP_FORMAT,
 };
+use super::model::Member;
 
 type CFRef = *const c_void;
 
@@ -378,10 +382,13 @@ fn route(current: &Output, now: Option<&Output>) -> Route {
     }
 }
 
-/// G1: muted taps fail open. A muted tap without the System Audio Recording
+/// Experimental G1 watchdog. A muted tap without the System Audio Recording
 /// permission delivers zeros while the app stays muted, so the app would go
 /// silent while Lunchpad reports success. If the tap's input stays silent for
 /// `SILENCE_LIMIT` while the app is producing output, the tap is dropped.
+/// This is conditional: IsRunningOutput may itself be false for a tap-muted
+/// app. It does not prove playback or guarantee revocation recovery. Taps stay
+/// opt-in/default-off pending user-present capture/revocation/route testing.
 const SILENCE_LIMIT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
@@ -402,11 +409,20 @@ impl SilenceWatch {
     }
 }
 
-/// One tapped app. Field order is drop order: IOProc, aggregate, tap.
-struct Control {
+/// The OS resource lifetime is injectable; production field drop order stays
+/// IOProc, aggregate, tap. Tests substitute a drop-counted resource, no taps.
+trait ControlResources {}
+
+struct NativeResources {
     _running: Running,
     _aggregate: Aggregate,
     _tap: Tap,
+}
+
+impl ControlResources for NativeResources {}
+
+struct Control {
+    _resources: Box<dyn ControlResources>,
     gain: Arc<Gain>,
     processes: Vec<ObjId>,
     output: Output,
@@ -430,9 +446,11 @@ fn build_control(
     let gain = Arc::new(Gain::new(gain));
     let running = Running::start(aggregate.id, Arc::clone(&gain))?;
     Ok(Control {
-        _running: running,
-        _aggregate: aggregate,
-        _tap: tap,
+        _resources: Box::new(NativeResources {
+            _running: running,
+            _aggregate: aggregate,
+            _tap: tap,
+        }),
         gain,
         processes: processes.to_vec(),
         output: output.clone(),
@@ -440,7 +458,50 @@ fn build_control(
     })
 }
 
+/// Narrow seam for failure-injected maintenance tests. Calls still run only
+/// on the audio worker, never under engine locks.
+trait TapSystem {
+    fn processes(&self) -> Result<Vec<ObjId>, Error>;
+    fn output(&self) -> Result<Output, Error>;
+    fn running(&self, processes: &[ObjId]) -> Result<bool, Error>;
+    fn build(&self, processes: &[ObjId], gain: f32, output: &Output) -> Result<Control, Error>;
+    /// Unmuted, silent-output positive-signal check. Never mutes the app.
+    fn probe(&self, processes: &[ObjId], output: &Output) -> Result<(), Error>;
+}
+
+struct CoreAudio;
+
+impl TapSystem for CoreAudio {
+    fn processes(&self) -> Result<Vec<ObjId>, Error> {
+        super::macos::get_ids(SYSTEM_OBJECT, HW_PROCESS_LIST).map_err(native)
+    }
+    fn output(&self) -> Result<Output, Error> {
+        default_output()
+    }
+    fn running(&self, processes: &[ObjId]) -> Result<bool, Error> {
+        MacBackend::is_running_output(processes)
+    }
+    fn build(&self, processes: &[ObjId], gain: f32, output: &Output) -> Result<Control, Error> {
+        build_control(processes, true, gain, output)
+    }
+    fn probe(&self, processes: &[ObjId], output: &Output) -> Result<(), Error> {
+        if !self.running(processes)? {
+            return Err(Error::new(ErrorKind::Permission, "cannot confirm the System Audio Recording permission while the app is silent; play audio in it and retry"));
+        }
+        let probe = build_control(processes, false, 0.0, output)?;
+        let started = Instant::now();
+        while started.elapsed() < PROBE_WINDOW {
+            if probe.gain.peak() > 0.0 {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(Error::new(ErrorKind::Permission, "the tap delivered only silence: Lunchpad probably lacks the System Audio Recording permission (silence cannot be told apart from denial)"))
+    }
+}
+
 pub struct Taps {
+    system: Box<dyn TapSystem>,
     permission: Permission,
     controls: HashMap<String, Control>,
     settings: HashMap<String, (f32, bool)>,
@@ -451,7 +512,12 @@ pub struct Taps {
 
 impl Taps {
     pub fn new() -> Taps {
+        Self::with_system(Box::new(CoreAudio))
+    }
+
+    fn with_system(system: Box<dyn TapSystem>) -> Taps {
         Taps {
+            system,
             permission: Permission::Unknown,
             controls: HashMap::new(),
             settings: HashMap::new(),
@@ -472,6 +538,35 @@ impl Taps {
         self.settings.get(app).copied()
     }
 
+    /// Without a trustworthy process list we cannot maintain existing taps.
+    /// Restore the direct path before exposing the enumeration failure.
+    pub fn process_list(&mut self) -> Result<Vec<ObjId>, Error> {
+        self.verified(self.system.processes())
+    }
+
+    pub fn active(&mut self, process: ObjId) -> Result<bool, Error> {
+        self.verified(self.system.running(&[process]))
+    }
+
+    fn verified<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        result.inspect_err(|error| {
+            self.controls.clear();
+            self.settings.clear();
+            self.permission = Permission::Unconfirmed;
+            self.problem = Some(format!(
+                "Process taps were removed because app processes could not be verified: {error}"
+            ));
+        })
+    }
+
+    pub fn apply_settings(&self, members: &mut [Member]) {
+        for member in members {
+            let (volume, muted) = self.setting(&member.app_id).unwrap_or((1.0, false));
+            member.volume = volume;
+            member.muted = muted;
+        }
+    }
+
     /// Runs on every refresh of the worker: follows process-set changes,
     /// output changes (G2) and silent muted taps (G1). Whenever a tap cannot
     /// be kept or rebuilt, its setting is forgotten too, so the reported state
@@ -481,7 +576,7 @@ impl Taps {
             self.settings.retain(|app, _| apps.contains_key(app));
             return;
         }
-        let output = default_output().ok();
+        let output = self.system.output().ok();
         self.retain_apps(apps, output.as_ref());
         self.follow_output(output.as_ref());
         self.watch_silence(Instant::now());
@@ -539,40 +634,46 @@ impl Taps {
 
     /// G1: see [`SilenceWatch`].
     fn watch_silence(&mut self, now: Instant) {
-        let silent: Vec<String> = self
+        let silent: Vec<(String, Option<Error>)> = self
             .controls
             .iter_mut()
             .filter_map(|(app, control)| {
-                let producing = MacBackend::is_running_output(&control.processes);
+                let producing = self.system.running(&control.processes);
                 let heard = control.gain.take_peak() > 0.0;
-                control
-                    .silence
-                    .observe(now, producing, heard)
-                    .then(|| app.clone())
+                match producing {
+                    Ok(producing) => control
+                        .silence
+                        .observe(now, producing, heard)
+                        .then(|| (app.clone(), None)),
+                    Err(error) => Some((app.clone(), Some(error))),
+                }
             })
             .collect();
-        for app in silent {
+        for (app, reason) in silent {
             self.controls.remove(&app);
             self.settings.remove(&app);
-            self.permission = Permission::Denied;
-            self.problem = Some(format!(
+            if let Some(error) = reason {
+                self.permission = Permission::Unconfirmed;
+                self.problem = Some(format!("Process tap for {app} was removed because output activity could not be verified: {error}"));
+            } else {
+                self.permission = Permission::Denied;
+                self.problem = Some(format!(
                 "Per-app volume for {app} was switched off: its tap stayed silent for {} s while the app was playing, so Lunchpad probably lacks the System Audio Recording permission",
                 SILENCE_LIMIT.as_secs()
-            ));
+                ));
+            }
         }
     }
 
     /// Rebuilds a tap with the app's setting; on failure the setting goes too.
     fn rebuild(&mut self, app: &str, processes: &[ObjId], output: &Output) {
-        let rebuilt = self.settings.get(app).and_then(|&(volume, muted)| {
-            build_control(processes, true, if muted { 0.0 } else { volume }, output).ok()
-        });
-        match rebuilt {
-            Some(control) => {
+        if let Some((volume, muted)) = self.settings.remove(app) {
+            if let Ok(control) =
+                self.system
+                    .build(processes, if muted { 0.0 } else { volume }, output)
+            {
                 self.controls.insert(app.to_string(), control);
-            }
-            None => {
-                self.settings.remove(app);
+                self.settings.insert(app.to_string(), (volume, muted));
             }
         }
     }
@@ -598,9 +699,22 @@ impl Taps {
             self.settings.remove(app);
             return Ok(());
         }
-        let output = default_output()?;
+        let output = self.system.output().inspect_err(|_| {
+            self.controls.remove(app);
+            self.settings.remove(app);
+        })?;
+        if self
+            .controls
+            .get(app)
+            .is_some_and(|control| control.processes != processes || control.output != output)
+        {
+            self.controls.remove(app);
+            self.settings.remove(app);
+        }
         if self.permission != Permission::Granted {
-            if let Err(e) = self.probe(processes, &output) {
+            if let Err(e) = self.system.probe(processes, &output) {
+                self.controls.remove(app);
+                self.settings.remove(app);
                 // Silence is ambiguous; earlier evidence of denial (G1) stands.
                 if self.permission != Permission::Denied {
                     self.permission = Permission::Unconfirmed;
@@ -616,7 +730,8 @@ impl Taps {
             }
             _ => {
                 self.controls.remove(app);
-                let control = build_control(processes, true, gain, &output)?;
+                self.settings.remove(app);
+                let control = self.system.build(processes, gain, &output)?;
                 self.controls.insert(app.to_string(), control);
             }
         }
@@ -624,31 +739,249 @@ impl Taps {
         self.problem = None;
         Ok(())
     }
-
-    /// Looks for positive evidence of the permission with an unmuted,
-    /// silent-output tap. Never mutes the app.
-    fn probe(&self, processes: &[ObjId], output: &Output) -> Result<(), Error> {
-        if !MacBackend::is_running_output(processes) {
-            return Err(Error::new(ErrorKind::Permission, "cannot confirm the System Audio Recording permission while the app is silent; play audio in it and retry"));
-        }
-        let probe = build_control(processes, false, 0.0, output)?;
-        let started = Instant::now();
-        while started.elapsed() < PROBE_WINDOW {
-            if probe.gain.peak() > 0.0 {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Err(Error::new(
-            ErrorKind::Permission,
-            "the tap delivered only silence: Lunchpad probably lacks the System Audio Recording permission (silence cannot be told apart from denial)",
-        ))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    struct FakeResource {
+        live: Rc<Cell<usize>>,
+        dropped: Rc<Cell<usize>>,
+    }
+
+    impl ControlResources for FakeResource {}
+    impl Drop for FakeResource {
+        fn drop(&mut self) {
+            self.live.set(self.live.get() - 1);
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    struct FakeState {
+        output: Result<Output, Error>,
+        processes: Result<Vec<ObjId>, Error>,
+        running: Result<bool, Error>,
+        fail_build: bool,
+        live_at_build: Vec<usize>,
+        probes: usize,
+        probe_result: Result<(), Error>,
+    }
+
+    #[derive(Clone)]
+    struct FakeSystem {
+        state: Rc<RefCell<FakeState>>,
+        live: Rc<Cell<usize>>,
+        dropped: Rc<Cell<usize>>,
+    }
+
+    impl FakeSystem {
+        fn new() -> Self {
+            Self {
+                state: Rc::new(RefCell::new(FakeState {
+                    output: Ok(output(40, "speakers")),
+                    processes: Ok(vec![7]),
+                    running: Ok(true),
+                    fail_build: false,
+                    live_at_build: Vec::new(),
+                    probes: 0,
+                    probe_result: Ok(()),
+                })),
+                live: Rc::new(Cell::new(0)),
+                dropped: Rc::new(Cell::new(0)),
+            }
+        }
+    }
+
+    impl TapSystem for FakeSystem {
+        fn processes(&self) -> Result<Vec<ObjId>, Error> {
+            self.state.borrow().processes.clone()
+        }
+        fn output(&self) -> Result<Output, Error> {
+            self.state.borrow().output.clone()
+        }
+        fn running(&self, _: &[ObjId]) -> Result<bool, Error> {
+            self.state.borrow().running.clone()
+        }
+        fn probe(&self, _: &[ObjId], _: &Output) -> Result<(), Error> {
+            let mut state = self.state.borrow_mut();
+            state.probes += 1;
+            state.probe_result.clone()
+        }
+        fn build(&self, processes: &[ObjId], gain: f32, output: &Output) -> Result<Control, Error> {
+            let mut state = self.state.borrow_mut();
+            state.live_at_build.push(self.live.get());
+            if state.fail_build {
+                return Err(injected("building tap"));
+            }
+            self.live.set(self.live.get() + 1);
+            Ok(Control {
+                _resources: Box::new(FakeResource {
+                    live: self.live.clone(),
+                    dropped: self.dropped.clone(),
+                }),
+                gain: Arc::new(Gain::new(gain)),
+                processes: processes.to_vec(),
+                output: output.clone(),
+                silence: SilenceWatch::default(),
+            })
+        }
+    }
+
+    fn injected(what: &str) -> Error {
+        Error::new(ErrorKind::Native, format!("injected error: {what}"))
+    }
+
+    fn assert_direct_path(taps: &Taps, apps: &[&str]) {
+        let mut members: Vec<Member> = apps
+            .iter()
+            .map(|app| Member {
+                app_id: (*app).into(),
+                name: (*app).into(),
+                active: true,
+                volume: 0.2,
+                muted: true,
+            })
+            .collect();
+        taps.apply_settings(&mut members);
+        assert!(members.iter().all(|m| m.volume == 1.0 && !m.muted));
+        assert!(taps.controls.is_empty() && taps.settings.is_empty());
+    }
+
+    #[test]
+    fn process_enumeration_error_drops_controls_and_settings_before_returning() {
+        for activity_error in [false, true] {
+            let os = FakeSystem::new();
+            let mut taps = Taps::with_system(Box::new(os.clone()));
+            taps.set("a", &[7], Some(0.2), None).unwrap();
+            taps.set("b", &[8], None, Some(true)).unwrap();
+            assert_eq!(os.live.get(), 2);
+            if activity_error {
+                os.state.borrow_mut().running = Err(injected("process activity"));
+                assert_eq!(taps.active(7), Err(injected("process activity")));
+            } else {
+                os.state.borrow_mut().processes = Err(injected("process list"));
+                assert_eq!(taps.process_list(), Err(injected("process list")));
+            }
+            assert_eq!(os.live.get(), 0);
+            assert_eq!(os.dropped.get(), 2);
+            assert_direct_path(&taps, &["a", "b"]);
+            assert_eq!(taps.permission(), Permission::Unconfirmed);
+            os.state.borrow_mut().processes = Ok(vec![7, 8]);
+            assert_eq!(taps.process_list().unwrap(), [7, 8]);
+            taps.maintain(&HashMap::from([
+                ("a".into(), vec![7]),
+                ("b".into(), vec![8]),
+            ]));
+            assert_direct_path(&taps, &["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn failed_activity_query_is_unknown_and_removes_the_control_not_idle() {
+        let os = FakeSystem::new();
+        let mut taps = Taps::with_system(Box::new(os.clone()));
+        taps.set("a", &[7], Some(0.2), None).unwrap();
+        os.state.borrow_mut().running = Err(injected("running output"));
+        taps.maintain(&HashMap::from([("a".into(), vec![7])]));
+        assert_eq!(os.live.get(), 0);
+        assert_eq!(os.dropped.get(), 1);
+        assert_direct_path(&taps, &["a"]);
+        assert_eq!(taps.permission(), Permission::Unconfirmed);
+        assert!(taps.problem().unwrap().contains("running output"));
+    }
+
+    #[test]
+    fn command_time_output_switch_build_failure_cannot_leave_phantom_settings() {
+        for muted in [false, true] {
+            let os = FakeSystem::new();
+            let mut taps = Taps::with_system(Box::new(os.clone()));
+            taps.set("a", &[7], Some(0.2), Some(muted)).unwrap();
+            assert_eq!(taps.setting("a"), Some((0.2, muted)));
+            os.state.borrow_mut().output = Ok(output(70, "headphones"));
+            os.state.borrow_mut().fail_build = true;
+            assert_eq!(
+                taps.set("a", &[7], Some(0.4), None),
+                Err(injected("building tap"))
+            );
+            assert_eq!(
+                os.state.borrow().live_at_build,
+                [0, 0],
+                "old resources drop before new construction"
+            );
+            assert_eq!(os.live.get(), 0);
+            assert_eq!(os.dropped.get(), 1);
+            taps.maintain(&HashMap::from([("a".into(), vec![7])]));
+            assert_direct_path(&taps, &["a"]);
+            os.state.borrow_mut().fail_build = false;
+            taps.set("a", &[7], Some(0.6), None).unwrap();
+            assert_eq!(
+                taps.setting("a"),
+                Some((0.6, false)),
+                "failed mute/gain is not resurrected on retry"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_reprobe_forgets_an_existing_unverifiable_control() {
+        let os = FakeSystem::new();
+        let mut taps = Taps::with_system(Box::new(os.clone()));
+        taps.set("a", &[7], Some(0.2), Some(true)).unwrap();
+        taps.permission = Permission::Unconfirmed;
+        os.state.borrow_mut().probe_result = Err(injected("permission probe"));
+        assert_eq!(
+            taps.set("a", &[7], Some(0.4), None),
+            Err(injected("permission probe"))
+        );
+        assert_eq!(os.live.get(), 0);
+        assert_eq!(os.dropped.get(), 1);
+        assert_direct_path(&taps, &["a"]);
+    }
+
+    #[test]
+    fn maintenance_route_loss_or_failed_rebuild_drops_real_control_ownership() {
+        for cause in ["output missing", "output changed", "process set changed"] {
+            let os = FakeSystem::new();
+            let mut taps = Taps::with_system(Box::new(os.clone()));
+            taps.set("a", &[7], Some(0.2), Some(true)).unwrap();
+            os.state.borrow_mut().fail_build = true;
+            let processes = match cause {
+                "output missing" => {
+                    os.state.borrow_mut().output = Err(injected("output"));
+                    vec![7]
+                }
+                "output changed" => {
+                    os.state.borrow_mut().output = Ok(output(70, "headphones"));
+                    vec![7]
+                }
+                _ => vec![7, 8],
+            };
+            taps.maintain(&HashMap::from([("a".into(), processes)]));
+            assert_eq!(os.live.get(), 0);
+            assert_eq!(os.dropped.get(), 1);
+            assert_direct_path(&taps, &["a"]);
+        }
+    }
+
+    #[test]
+    fn conditional_watchdog_removes_resources_when_running_output_is_observed() {
+        let os = FakeSystem::new();
+        let mut taps = Taps::with_system(Box::new(os.clone()));
+        taps.set("a", &[7], Some(0.2), None).unwrap();
+        let start = Instant::now();
+        taps.watch_silence(start);
+        assert_eq!(os.live.get(), 1);
+        taps.watch_silence(start + SILENCE_LIMIT);
+        assert_eq!(os.live.get(), 0);
+        assert_eq!(os.dropped.get(), 1);
+        assert_direct_path(&taps, &["a"]);
+        assert_eq!(taps.permission(), Permission::Denied);
+        // This only establishes software cleanup for a known running signal.
+        // Real tap-muted IsRunningOutput semantics remain a hardware gate.
+    }
 
     fn output(object: ObjId, uid: &str) -> Output {
         Output {
@@ -676,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn a_muted_tap_fails_open_after_a_second_of_silence_while_the_app_plays() {
+    fn silence_timer_trips_with_known_output_and_resets_on_known_idle() {
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
         let mut watch = SilenceWatch::default();

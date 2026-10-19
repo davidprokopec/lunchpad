@@ -196,9 +196,8 @@ struct Shared {
     apps: Mutex<Vec<App>>,
     devices: Mutex<Result<Vec<Device>, Error>>,
     status: Mutex<AppStatus>,
-    /// Set (under the `status` lock) when `start` gave up waiting for the
-    /// worker. From then on the worker may no longer publish a status, so a
-    /// late start cannot flip the handle back to available.
+    /// Terminal publication fence, set under `requests` for shutdown, panic or
+    /// failed startup. Late OS results cannot resurrect a stopped handle.
     detached: AtomicBool,
     requests: Mutex<Requests>,
     running: AtomicBool,
@@ -210,7 +209,13 @@ struct Shared {
 #[derive(Default)]
 struct Requests {
     issued: u64,
-    /// Highest command id whose device refresh the worker has published.
+    /// Highest request whose backend command has returned, before readback.
+    handled: u64,
+    /// Latest handled generation covered by a published app snapshot.
+    apps_refreshed: u64,
+    /// App snapshots started before this request was handled cannot recover it.
+    apps_blocked_by: Option<u64>,
+    /// Highest command id whose device readback has returned.
     refreshed: u64,
     /// Highest timed-out command id not yet refreshed. While set, the device
     /// cache stays invalid and further commands fail fast instead of each
@@ -237,14 +242,17 @@ impl Shared {
     /// timeout that loses the race with the command's own refresh is a no-op.
     fn time_out(&self, id: u64) {
         let mut requests = lock(&self.requests);
-        if requests.refreshed >= id {
+        if self.detached.load(Ordering::Acquire) || requests.refreshed >= id {
             return;
         }
         let was_wedged = requests.wedged_by.is_some();
         requests.wedged_by = Some(requests.wedged_by.map_or(id, |w| w.max(id)));
+        if requests.apps_refreshed < id {
+            requests.apps_blocked_by = Some(requests.apps_blocked_by.map_or(id, |w| w.max(id)));
+        }
         if !was_wedged {
             *lock(&self.devices) = Err(Error::new(ErrorKind::Timeout, "the audio thread is busy"));
-            self.hub.notify(Changes::DEVICES);
+            self.hub.notify(Changes::ALL);
         }
     }
 
@@ -257,6 +265,9 @@ impl Shared {
         applied: bool,
     ) -> bool {
         let mut requests = lock(&self.requests);
+        if self.detached.load(Ordering::Acquire) {
+            return false;
+        }
         if let Some(id) = serviced {
             requests.refreshed = requests.refreshed.max(id);
         }
@@ -265,6 +276,7 @@ impl Shared {
                 return false;
             }
             requests.wedged_by = None;
+            self.hub.notify(Changes::APPS | Changes::STATUS);
         }
         let changed = {
             let mut devices = lock(&self.devices);
@@ -278,16 +290,41 @@ impl Shared {
         true
     }
 
-    fn publish_apps(&self, next: Vec<App>, applied: bool) {
+    fn publish_apps(&self, next: Vec<App>, status: AppStatus, applied: bool, handled: u64) -> bool {
+        let mut requests = lock(&self.requests);
+        if self.detached.load(Ordering::Acquire)
+            || requests.apps_blocked_by.is_some_and(|id| handled < id)
+        {
+            return false;
+        }
+        let recovered = requests.apps_blocked_by.take().is_some();
+        requests.apps_refreshed = requests.apps_refreshed.max(handled);
         let changed = {
             let mut apps = lock(&self.apps);
             let changed = *apps != next;
             *apps = next;
             changed
         };
-        if changed || applied {
+        self.publish_status(status);
+        if recovered {
+            self.hub.notify(Changes::APPS | Changes::STATUS);
+        } else if changed || applied {
             self.hub.notify(Changes::APPS);
         }
+        true
+    }
+
+    fn stop(&self, kind: ErrorKind, message: String) {
+        let _requests = lock(&self.requests);
+        if self.detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.running.store(false, Ordering::Release);
+        *lock(&self.devices) = Err(Error::new(kind, message.clone()));
+        lock(&self.apps).clear();
+        let mut status = lock(&self.status);
+        *status = AppStatus::unavailable(status.backend, message);
+        self.hub.close();
     }
 
     /// The worker's only way to change the status (see `detached`).
@@ -344,14 +381,10 @@ impl Engine {
                     run_worker(worker_shared, make, notifier, rx, ready_tx);
                 });
                 if let Err(panic) = catch_unwind(run) {
-                    panicked.running.store(false, Ordering::Release);
-                    *lock(&panicked.devices) =
-                        Err(Error::new(ErrorKind::Native, "the audio thread panicked"));
-                    panicked.hub.notify(Changes::DEVICES | Changes::APPS);
-                    panicked.publish_status(AppStatus::unavailable(
-                        kind,
+                    panicked.stop(
+                        ErrorKind::Native,
                         format!("the audio thread panicked: {}", panic_message(&*panic)),
-                    ));
+                    );
                     let _ = ready_on_panic.try_send(false);
                 }
             });
@@ -363,8 +396,10 @@ impl Engine {
         let join = match spawned {
             Ok(join) => join,
             Err(e) => {
-                *lock(&shared.status) =
-                    AppStatus::unavailable(kind, format!("cannot start the audio thread: {e}"));
+                shared.stop(
+                    ErrorKind::Native,
+                    format!("cannot start the audio thread: {e}"),
+                );
                 return engine(None);
             }
         };
@@ -373,20 +408,18 @@ impl Engine {
             Ok(false) => {
                 // The worker reported an unavailable backend and has exited.
                 let _ = join.join();
+                let message = lock(&shared.status).message.clone();
+                shared.stop(ErrorKind::Unsupported, message);
                 engine(None)
             }
             Err(_) => {
-                {
-                    let mut status = lock(&shared.status);
-                    shared.detached.store(true, Ordering::Release);
-                    *status = AppStatus::unavailable(
-                        kind,
-                        format!(
-                            "the audio backend did not start within {} s",
-                            open_timeout.as_secs_f32()
-                        ),
-                    );
-                }
+                shared.stop(
+                    ErrorKind::Timeout,
+                    format!(
+                        "the audio backend did not start within {} s",
+                        open_timeout.as_secs_f32()
+                    ),
+                );
                 let _ = tx.send(Msg::Shutdown);
                 engine(None)
             }
@@ -394,13 +427,41 @@ impl Engine {
     }
 
     pub fn status(&self) -> AppStatus {
-        lock(&self.shared.status).clone()
+        let requests = lock(&self.shared.requests);
+        self.effective_status(&requests)
+    }
+
+    fn effective_status(&self, requests: &Requests) -> AppStatus {
+        let mut status = lock(&self.shared.status).clone();
+        if !self.shared.running.load(Ordering::Acquire)
+            || self.shared.detached.load(Ordering::Acquire)
+        {
+            status.available = false;
+            status.can_set_volume = false;
+            status.can_mute = false;
+        } else if requests.wedged_by.is_some() || requests.apps_blocked_by.is_some() {
+            status.available = false;
+            status.can_set_volume = false;
+            status.can_mute = false;
+            status.message =
+                "the audio thread is busy; app state is unavailable until readback".into();
+        }
+        status
     }
 
     pub fn list(&self) -> Result<Vec<App>, Error> {
-        let status = self.status();
+        let requests = lock(&self.shared.requests);
+        let status = self.effective_status(&requests);
         if !status.available {
-            return Err(Error::new(ErrorKind::Unsupported, status.message));
+            let code = if !self.shared.detached.load(Ordering::Acquire)
+                && self.shared.running.load(Ordering::Acquire)
+                && (requests.wedged_by.is_some() || requests.apps_blocked_by.is_some())
+            {
+                ErrorKind::Timeout
+            } else {
+                ErrorKind::Unsupported
+            };
+            return Err(Error::new(code, status.message));
         }
         Ok(lock(&self.shared.apps).clone())
     }
@@ -419,6 +480,15 @@ impl Engine {
     }
 
     pub fn command(&self, command: Command) -> Result<(), Error> {
+        if self.shared.detached.load(Ordering::Acquire) {
+            return Err(Error::new(ErrorKind::Unsupported, self.status().message));
+        }
+        if lock(&self.shared.requests).wedged_by.is_some() {
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                "the audio thread is still busy with an earlier request",
+            ));
+        }
         let status = self.status();
         let capable = match command {
             Command::AppVolume(..) => status.can_set_volume,
@@ -445,6 +515,14 @@ impl Engine {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         let id = {
             let mut requests = lock(&self.shared.requests);
+            if self.shared.detached.load(Ordering::Acquire)
+                || !self.shared.running.load(Ordering::Acquire)
+            {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "the audio backend has stopped",
+                ));
+            }
             if requests.wedged_by.is_some() {
                 return Err(Error::new(
                     ErrorKind::Timeout,
@@ -480,6 +558,10 @@ impl Engine {
     /// own thread. Waits at most `CLOSE_TIMEOUT`; a worker stuck in an OS call
     /// is detached rather than blocking the caller forever. Idempotent.
     pub fn shutdown(&self) {
+        self.shared.stop(
+            ErrorKind::Unsupported,
+            "the audio backend has stopped".into(),
+        );
         let Some(Worker { tx, join }) = lock(&self.worker).take() else {
             return;
         };
@@ -540,8 +622,16 @@ fn run_worker(
     loop {
         match rx.recv_timeout(backend.poll_interval()) {
             Ok(Msg::Command(command, reply, id)) => {
+                if shared.detached.load(Ordering::Acquire) {
+                    let _ = reply.send(Err(Error::new(
+                        ErrorKind::Unsupported,
+                        "the audio backend has stopped",
+                    )));
+                    continue;
+                }
                 let device_command = command.is_device();
                 let result = execute(&shared, backend.as_mut(), command);
+                lock(&shared.requests).handled = id;
                 let applied = result.is_ok();
                 // A successful reply guarantees an authoritative target read.
                 // Unrelated snapshots remain after the reply so a slow app
@@ -566,7 +656,10 @@ fn run_worker(
             Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    shared.running.store(false, Ordering::Release);
+    shared.stop(
+        ErrorKind::Unsupported,
+        "the audio backend has stopped".into(),
+    );
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> &str {
@@ -664,17 +757,25 @@ fn refresh_devices(
 }
 
 fn refresh_apps(shared: &Shared, backend: &mut dyn Backend, applied: bool) -> Result<(), Error> {
+    // Fence BEFORE the OS read: a snapshot already in flight when a later
+    // request times out is not authoritative for that later request.
+    let handled = lock(&shared.requests).handled;
     match backend.snapshot() {
         Ok(next) => {
-            shared.publish_apps(next, applied);
             let status = backend.status();
             let result = if status.available {
                 Ok(())
             } else {
                 Err(Error::new(ErrorKind::Unsupported, status.message.clone()))
             };
-            shared.publish_status(status);
-            result
+            if shared.publish_apps(next, status, applied, handled) {
+                result
+            } else {
+                Err(Error::new(
+                    ErrorKind::Timeout,
+                    "app readback was superseded by a later request or shutdown",
+                ))
+            }
         }
         Err(e) => {
             shared.publish_status(AppStatus::unavailable(
@@ -1320,6 +1421,7 @@ mod tests {
             let mut engine =
                 Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
             engine.command_timeout = Duration::from_millis(50);
+            let sub = engine.subscribe();
             gate.store(true, Ordering::Release);
             std::thread::scope(|scope| {
                 let request = scope.spawn(|| {
@@ -1348,8 +1450,19 @@ mod tests {
             });
             assert!(engine.list_devices().is_err());
             assert!(is_wedged(&engine));
+            let public = super::super::SystemAudio {
+                engine: Arc::new(engine),
+            };
+            assert!(public.apps().is_err());
+            let status = public.status();
+            assert!(!status.available && !status.apps_available);
+            assert!(!status.can_set_app_volume && !status.can_mute_apps);
+            assert_eq!(sub.try_recv(), Ok(Changes::ALL));
             release_read.send(()).unwrap();
-            wait_until(|| !is_wedged(&engine));
+            wait_until(|| public.status().apps_available);
+            let engine = &public.engine;
+            assert!(!is_wedged(engine));
+            assert!(public.status().can_set_app_volume && public.status().can_mute_apps);
             assert_eq!(
                 if device_target {
                     engine.list_devices().unwrap()[0].volume
@@ -1359,6 +1472,100 @@ mod tests {
                 0.3
             );
         }
+    }
+
+    #[test]
+    fn failed_timed_out_app_readback_recovers_only_with_a_fresh_later_snapshot() {
+        let (entered, read_entered) = mpsc::channel();
+        let (release_read, release) = mpsc::channel();
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let gate = Arc::new(AtomicBool::new(false));
+        let fail_read = Arc::new(AtomicBool::new(false));
+        let backend = Readback {
+            gate: gate.clone(),
+            fail_read: fail_read.clone(),
+            device_target: false,
+            entered,
+            release,
+            volume: 0.5,
+            muted: false,
+        };
+        let mut engine = Engine::start(
+            BackendKind::None,
+            Box::new(move |notifier| {
+                notify_tx.send(notifier).unwrap();
+                Ok(Box::new(backend))
+            }),
+        );
+        engine.command_timeout = Duration::from_millis(50);
+        gate.store(true, Ordering::Release);
+        std::thread::scope(|scope| {
+            let request = scope.spawn(|| engine.command(Command::AppVolume("a".into(), 0.27)));
+            read_entered.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                request.join().unwrap().map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+        });
+        fail_read.store(true, Ordering::Release);
+        release_read.send(()).unwrap();
+        wait_until(|| !is_wedged(&engine));
+        assert!(engine.list().is_err());
+        assert!(!engine.status().can_set_volume && !engine.status().can_mute);
+        fail_read.store(false, Ordering::Release);
+        notify_rx.recv().unwrap().notify();
+        wait_until(|| engine.status().available);
+        assert_eq!(engine.list().unwrap()[0].volume, 0.3);
+    }
+
+    #[test]
+    fn shutdown_during_blocked_readback_cannot_be_undone_by_late_publication() {
+        let (entered, read_entered) = mpsc::channel();
+        let (release_read, release) = mpsc::channel();
+        let gate = Arc::new(AtomicBool::new(false));
+        let backend = Readback {
+            gate: gate.clone(),
+            fail_read: Arc::new(AtomicBool::new(false)),
+            device_target: false,
+            entered,
+            release,
+            volume: 0.5,
+            muted: false,
+        };
+        let mut engine = Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
+        engine.command_timeout = Duration::from_millis(50);
+        let sub = engine.subscribe();
+        gate.store(true, Ordering::Release);
+        std::thread::scope(|scope| {
+            let request = scope.spawn(|| engine.command(Command::AppMute("a".into(), true)));
+            read_entered.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                request.join().unwrap().map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+        });
+        let started = std::time::Instant::now();
+        engine.shutdown();
+        assert!(started.elapsed() < CLOSE_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(sub.recv(), Some(Changes::ALL));
+        assert_eq!(sub.recv(), None);
+        assert_eq!(
+            engine
+                .command(Command::AppMute("a".into(), false))
+                .map_err(|e| e.kind),
+            Err(ErrorKind::Unsupported)
+        );
+        assert_eq!(lock(&engine.shared.requests).issued, 1);
+        release_read.send(()).unwrap();
+        assert_eq!(
+            read_entered.recv_timeout(WAIT),
+            Err(RecvTimeoutError::Disconnected),
+            "backend dropped after late readback"
+        );
+        assert!(engine.list().is_err() && engine.list_devices().is_err());
+        let status = engine.status();
+        assert!(!status.available && !status.can_set_volume && !status.can_mute);
+        assert!(status.message.contains("stopped"));
     }
 
     /// Records every write and holds it until released.
@@ -1453,7 +1660,17 @@ mod tests {
         let backend = script.clone();
         let engine = Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
         assert!(engine.list_devices().is_ok());
+        let sub = engine.subscribe();
         engine.shutdown();
+        assert_eq!(sub.recv_timeout(WAIT), Ok(Changes::ALL));
+        assert_eq!(sub.recv(), None);
+        assert_eq!(engine.subscribe().recv(), None);
+        assert!(engine.list().is_err());
+        assert!(
+            !engine.status().available
+                && !engine.status().can_set_volume
+                && !engine.status().can_mute
+        );
         assert!(
             script.dropped.load(Ordering::Acquire),
             "the backend is dropped on its worker before shutdown returns"
@@ -1492,6 +1709,7 @@ mod tests {
         );
         assert!(!engine.status().available);
         assert!(engine.status().message.contains("did not start"));
+        assert_eq!(engine.subscribe().recv(), None);
         // The worker finishes starting after the timeout; it must not flip
         // the handle back to available.
         std::thread::sleep(Duration::from_millis(500));
@@ -1599,7 +1817,7 @@ mod tests {
             engine.list_devices().map_err(|e| e.kind),
             Err(ErrorKind::Timeout)
         );
-        assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
+        assert_eq!(sub.try_recv(), Ok(Changes::ALL));
         let started = std::time::Instant::now();
         for _ in 0..1000 {
             assert_eq!(
@@ -1611,7 +1829,7 @@ mod tests {
         release_tx.send(()).expect("release setter");
         wait_until(|| !is_wedged(&engine));
         assert_eq!(engine.list_devices().expect("recovered")[0].volume, 0.2);
-        assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
+        assert_eq!(changes_until(&sub, Changes::ALL), Changes::ALL);
         assert_eq!(
             lock(&script.calls).len(),
             1,
@@ -1646,6 +1864,16 @@ mod tests {
         setter_entered: Sender<()>,
         setter_release: Receiver<()>,
         app_setters: Arc<AtomicUsize>,
+        gate_apps: bool,
+    }
+
+    impl TwoGates {
+        fn gate_read(&self) {
+            if self.gate_devices.swap(false, Ordering::AcqRel) {
+                self.devices_entered.send(()).expect("refresh entered");
+                self.devices_release.recv().expect("release refresh");
+            }
+        }
     }
 
     impl Backend for TwoGates {
@@ -1656,12 +1884,14 @@ mod tests {
             Duration::from_secs(60)
         }
         fn snapshot(&mut self) -> Result<Vec<App>, Error> {
+            if self.gate_apps {
+                self.gate_read();
+            }
             Ok(vec![app("a")])
         }
         fn devices(&mut self) -> Result<Vec<Device>, Error> {
-            if self.gate_devices.swap(false, Ordering::AcqRel) {
-                self.devices_entered.send(()).expect("refresh entered");
-                self.devices_release.recv().expect("release refresh");
+            if !self.gate_apps {
+                self.gate_read();
             }
             self.script.devices()
         }
@@ -1699,98 +1929,105 @@ mod tests {
 
     #[test]
     fn an_earlier_refresh_cannot_recover_a_later_timed_out_request() {
-        let script = device_script();
-        let backend = script.clone();
-        let gate_devices = Arc::new(AtomicBool::new(false));
-        let app_setters = Arc::new(AtomicUsize::new(0));
-        let (devices_entered_tx, devices_entered) = mpsc::channel();
-        let (devices_release, devices_release_rx) = mpsc::channel();
-        let (setter_entered_tx, setter_entered) = mpsc::channel();
-        let (setter_release, setter_release_rx) = mpsc::channel();
-        let (notifier_tx, notifier_rx) = mpsc::channel();
-        let (backend_gate, backend_setters) = (Arc::clone(&gate_devices), Arc::clone(&app_setters));
-        let mut engine = Engine::start(
-            BackendKind::None,
-            Box::new(move |notifier| {
-                notifier_tx.send(notifier).expect("notifier");
-                Ok(Box::new(TwoGates {
-                    script: backend,
-                    gate_devices: backend_gate,
-                    devices_entered: devices_entered_tx,
-                    devices_release: devices_release_rx,
-                    setter_entered: setter_entered_tx,
-                    setter_release: setter_release_rx,
-                    app_setters: backend_setters,
-                }))
-            }),
-        );
-        engine.command_timeout = Duration::from_millis(50);
-        let sub = engine.subscribe();
-        let set_app = || Command::AppVolume("a".into(), 0.5);
-        let set_device = || Command::DeviceVolume("opaque UID / é".into(), DeviceKind::Output, 0.2);
-        assert_eq!(engine.list_devices().expect("devices").len(), 2);
+        for gate_apps in [false, true] {
+            let script = device_script();
+            let backend = script.clone();
+            let gate_devices = Arc::new(AtomicBool::new(false));
+            let app_setters = Arc::new(AtomicUsize::new(0));
+            let (devices_entered_tx, devices_entered) = mpsc::channel();
+            let (devices_release, devices_release_rx) = mpsc::channel();
+            let (setter_entered_tx, setter_entered) = mpsc::channel();
+            let (setter_release, setter_release_rx) = mpsc::channel();
+            let (notifier_tx, notifier_rx) = mpsc::channel();
+            let (backend_gate, backend_setters) =
+                (Arc::clone(&gate_devices), Arc::clone(&app_setters));
+            let mut engine = Engine::start(
+                BackendKind::None,
+                Box::new(move |notifier| {
+                    notifier_tx.send(notifier).expect("notifier");
+                    Ok(Box::new(TwoGates {
+                        script: backend,
+                        gate_devices: backend_gate,
+                        devices_entered: devices_entered_tx,
+                        devices_release: devices_release_rx,
+                        setter_entered: setter_entered_tx,
+                        setter_release: setter_release_rx,
+                        app_setters: backend_setters,
+                        gate_apps,
+                    }))
+                }),
+            );
+            engine.command_timeout = Duration::from_millis(50);
+            let sub = engine.subscribe();
+            let set_app = || Command::AppVolume("a".into(), 0.5);
+            let set_device =
+                || Command::DeviceVolume("opaque UID / é".into(), DeviceKind::Output, 0.2);
+            assert_eq!(engine.list_devices().expect("devices").len(), 2);
 
-        // An earlier dirty refresh blocks inside its OS device read.
-        gate_devices.store(true, Ordering::Release);
-        notifier_rx.recv().expect("notifier").notify();
-        devices_entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("earlier refresh blocked");
-        // B queues behind it and times out.
-        assert_eq!(
-            engine.command(set_app()).map_err(|e| e.kind),
-            Err(ErrorKind::Timeout)
-        );
-        assert_eq!(
-            engine.list_devices().map_err(|e| e.kind),
-            Err(ErrorKind::Timeout)
-        );
-        assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
+            // An earlier dirty refresh blocks inside its OS device read.
+            gate_devices.store(true, Ordering::Release);
+            notifier_rx.recv().expect("notifier").notify();
+            devices_entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("earlier refresh blocked");
+            // B queues behind it and times out.
+            assert_eq!(
+                engine.command(set_app()).map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+            assert_eq!(
+                engine.list_devices().map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+            assert_eq!(sub.try_recv(), Ok(Changes::ALL));
 
-        // The earlier refresh completes; the serial worker then blocks in B.
-        devices_release.send(()).expect("release refresh");
-        setter_entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("B reached its setter after timing out");
-        assert!(is_wedged(&engine), "the earlier refresh cleared B's wedge");
-        assert_eq!(
-            engine.list_devices().map_err(|e| e.kind),
-            Err(ErrorKind::Timeout),
-            "the earlier refresh restored devices while B is blocked"
-        );
-        assert_eq!(
-            sub.try_recv(),
-            Ok(Changes::default()),
-            "stale availability notification"
-        );
-        let started = std::time::Instant::now();
-        assert_eq!(
-            engine.command(set_device()).map_err(|e| e.kind),
-            Err(ErrorKind::Timeout)
-        );
-        assert_eq!(
-            engine.command(set_app()).map_err(|e| e.kind),
-            Err(ErrorKind::Timeout)
-        );
-        assert!(started.elapsed() < Duration::from_millis(40));
-        assert_eq!(app_setters.load(Ordering::Acquire), 1);
-        assert!(lock(&script.calls).is_empty());
+            // The earlier refresh completes; the serial worker then blocks in B.
+            devices_release.send(()).expect("release refresh");
+            setter_entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("B reached its setter after timing out");
+            assert!(is_wedged(&engine), "the earlier refresh cleared B's wedge");
+            assert!(
+                engine.list().is_err(),
+                "the earlier refresh restored B's app availability"
+            );
+            assert!(!engine.status().available && !engine.status().can_set_volume);
+            assert_eq!(
+                engine.list_devices().map_err(|e| e.kind),
+                Err(ErrorKind::Timeout),
+                "the earlier refresh restored devices while B is blocked"
+            );
+            assert_eq!(
+                sub.try_recv(),
+                Ok(Changes::default()),
+                "stale availability notification"
+            );
+            let started = std::time::Instant::now();
+            assert_eq!(
+                engine.command(set_device()).map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+            assert_eq!(
+                engine.command(set_app()).map_err(|e| e.kind),
+                Err(ErrorKind::Timeout)
+            );
+            assert!(started.elapsed() < Duration::from_millis(40));
+            assert_eq!(app_setters.load(Ordering::Acquire), 1);
+            assert!(lock(&script.calls).is_empty());
 
-        // Servicing B and its own refresh recovers authoritative devices.
-        setter_release.send(()).expect("release B");
-        wait_until(|| !is_wedged(&engine));
-        assert_eq!(
-            engine.list_devices().expect("recovered"),
-            *lock(&script.devices)
-        );
-        // Devices recovered; the app setter publishes its authoritative state.
-        assert_eq!(
-            changes_until(&sub, Changes::DEVICES | Changes::APPS),
-            Changes::DEVICES | Changes::APPS
-        );
-        setter_release.send(()).expect("allow next setter");
-        assert_eq!(engine.command(set_app()), Ok(()));
-        assert_eq!(app_setters.load(Ordering::Acquire), 2);
+            // Servicing B and its own refresh recovers authoritative devices.
+            setter_release.send(()).expect("release B");
+            wait_until(|| !is_wedged(&engine));
+            assert_eq!(
+                engine.list_devices().expect("recovered"),
+                *lock(&script.devices)
+            );
+            // Devices recovered; the app setter publishes its authoritative state.
+            assert_eq!(changes_until(&sub, Changes::ALL), Changes::ALL);
+            setter_release.send(()).expect("allow next setter");
+            assert_eq!(engine.command(set_app()), Ok(()));
+            assert_eq!(app_setters.load(Ordering::Acquire), 2);
+        }
     }
 
     #[test]
@@ -1819,7 +2056,7 @@ mod tests {
         // unrelated refresh nor servicing the earlier request recovers it.
         let (earlier, later) = (issue(&shared), issue(&shared));
         shared.time_out(later);
-        assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
+        assert_eq!(sub.try_recv(), Ok(Changes::ALL));
         assert!(!shared.publish_devices(None, devices(), true));
         assert!(!shared.publish_devices(Some(earlier), devices(), true));
         assert!(wedged(&shared));
@@ -1836,11 +2073,36 @@ mod tests {
         shared.time_out(last);
         assert_eq!(sub.try_recv(), Ok(Changes::default()));
         assert!(!shared.publish_devices(Some(later), devices(), false));
+        assert!(!shared.publish_apps(vec![app("a")], Tunable::default().status(), false, later));
         assert!(wedged(&shared));
         assert!(shared.publish_devices(Some(last), devices(), false));
         assert!(!wedged(&shared));
         assert!(lock(&shared.devices).is_ok());
-        assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
+        assert_eq!(sub.try_recv(), Ok(Changes::ALL));
+        assert!(shared.publish_apps(vec![app("a")], Tunable::default().status(), false, last));
+        assert!(lock(&shared.requests).apps_blocked_by.is_none());
+    }
+
+    #[test]
+    fn late_timeout_after_own_app_readback_does_not_require_another_poll_to_recover() {
+        let shared = Arc::new(Shared::new(BackendKind::None));
+        shared.running.store(true, Ordering::Release);
+        lock(&shared.requests).issued = 1;
+        lock(&shared.requests).handled = 1;
+        assert!(shared.publish_apps(vec![app("a")], Tunable::default().status(), true, 1));
+        // The app reply raced its deadline, but its own app snapshot already
+        // published. The unrelated device refresh is still in flight.
+        shared.time_out(1);
+        let engine = Engine {
+            shared: shared.clone(),
+            worker: Mutex::new(None),
+            command_timeout: COMMAND_TIMEOUT,
+        };
+        assert!(engine.list().is_err());
+        assert!(!engine.status().available);
+        assert!(shared.publish_devices(Some(1), Tunable::default().devices(), false));
+        assert_eq!(engine.list().unwrap(), [app("a")]);
+        assert!(engine.status().available && engine.status().can_set_volume);
     }
 
     #[test]
@@ -1895,6 +2157,7 @@ mod tests {
         let status = engine.status();
         assert!(!status.available);
         assert_eq!(status.message, "no endpoint");
+        assert_eq!(engine.subscribe().recv(), None);
         assert_eq!(
             engine.list().map_err(|e| e.kind),
             Err(ErrorKind::Unsupported)

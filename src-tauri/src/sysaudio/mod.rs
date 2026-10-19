@@ -48,8 +48,9 @@ pub const EVENT_AUDIO_STATE: &str = "audio:state";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
-    /// macOS: per-app volume and mute through process taps. Needs the System
-    /// Audio Recording permission, so it is off unless the user opts in.
+    /// Experimental macOS process taps, off by default. Needs System Audio
+    /// Recording permission and user-present revocation/capture/output-switch
+    /// verification: the conditional watchdog is not a fail-open guarantee.
     pub macos_taps: bool,
 }
 
@@ -252,6 +253,7 @@ impl SystemAudio {
 
     /// Notifications of what changed; read the new state from this handle.
     /// Coalescing and bounded: a slow subscriber never holds up the worker.
+    /// Shutdown invalidates all state and closes existing/new subscriptions.
     pub fn subscribe(&self) -> Subscription {
         self.engine.subscribe()
     }
@@ -778,10 +780,19 @@ mod tests {
     fn a_stopped_service_reports_errors_instead_of_stale_state() {
         let (audio, _, _) = mock();
         let watcher = audio.clone();
+        let sub = watcher.subscribe();
         audio.shutdown();
+        assert_eq!(sub.recv(), Some(Changes::ALL));
+        assert_eq!(sub.recv(), None);
         let state = watcher.state();
         assert!(state.devices.is_empty());
         assert!(!state.status.available);
+        assert!(state.apps.is_empty());
+        assert!(
+            !state.status.apps_available
+                && !state.status.can_set_app_volume
+                && !state.status.can_mute_apps
+        );
         assert!(state.status.message.is_some());
         assert_eq!(
             watcher
