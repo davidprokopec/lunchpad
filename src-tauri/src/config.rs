@@ -50,6 +50,11 @@ pub struct AudioSettings {
     /// Default output device for sounds (`None` = the system default device)
     #[serde(default)]
     pub output_device: Option<String>,
+    /// macOS: per-app volume and mute through Core Audio process taps. Needs the
+    /// System Audio Recording permission, so it stays off unless turned on.
+    /// Read at start-up.
+    #[serde(default)]
+    pub macos_app_volume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

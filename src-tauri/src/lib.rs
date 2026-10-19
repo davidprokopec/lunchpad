@@ -28,6 +28,7 @@ pub mod slobs;
 pub mod speech;
 pub mod system_audio;
 pub mod system_audio_bridge;
+pub mod sysaudio;
 pub mod system_volume;
 pub mod tray;
 
@@ -276,6 +277,11 @@ pub fn run() {
             let slobs = slobs::SlobsHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime, Some(live.clone()));
             let home_assistant = homeassistant::HaHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime);
             let hub = hub::HubHandle::spawn(app.handle().clone(), settings.clone());
+            // Devices and per-app volume, live. Taps (macOS per-app volume) only on request.
+            let macos_taps = settings.lock().settings.audio.macos_app_volume;
+            let sysaudio =
+                sysaudio::SystemAudio::start_in(sysaudio::Options { macos_taps }, &config_dir);
+            sysaudio::forward_to_window(&sysaudio, app.handle().clone());
 
             let sink = Arc::new(TauriSink {
                 app: app.handle().clone(),
@@ -291,6 +297,7 @@ pub fn run() {
                 obs: Some(obs.clone()),
                 slobs: Some(slobs.clone()),
                 home_assistant: Some(home_assistant.clone()),
+                sysaudio: Some(sysaudio.clone()),
                 settings: Some(settings.clone()),
                 downloads: Some(http::download_dir(app.handle())),
                 config_dir: Some(config_dir.clone()),
@@ -323,7 +330,7 @@ pub fn run() {
             system_audio_bridge::Bridge { audio: system_audio.clone(), live, engine: engine.clone(), profile: profile.clone(), app: Some(app.handle().clone()) }.spawn();
 
             let window_settings = settings.lock().settings.window.clone();
-            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, hub, system_audio, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
+            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, sysaudio, hub, system_audio, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
             if let Err(e) = tray::setup(app.handle(), &window_settings) {
                 tracing::warn!(error = %e, "tray icon could not be created");
             }
@@ -415,6 +422,8 @@ pub fn run() {
             audio_list_devices,
             audio_list_apps,
             audio_status,
+            sysaudio_devices,
+            sysaudio_apps,
             analyze_audio,
             preview_sound,
             stop_sound,
@@ -478,6 +487,10 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 let flusher = app.state::<AppState>().profile.lock().flusher();
                 flusher.flush();
+            }
+            // Taps, listeners and COM objects are released on the audio thread.
+            if let tauri::RunEvent::Exit = event {
+                app.state::<AppState>().sysaudio.shutdown();
             }
             // macOS: clicking the dock icon while the window is hidden brings it back.
             #[cfg(target_os = "macos")]
