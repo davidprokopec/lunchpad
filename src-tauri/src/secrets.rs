@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Keychain service name; the key name is the account.
-const SERVICE: &str = "com.lunchpad.app";
+const SERVICE: &str = crate::APP_IDENTIFIER;
 
 /// Entry name prefix of the user's named secrets.
 const USER_PREFIX: &str = "user.";
@@ -215,6 +215,14 @@ fn write_file(path: &Path, map: &BTreeMap<String, String>) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The log folder and the keychain service use `APP_IDENTIFIER`; it has to
+    /// stay the identifier Tauri bundles with, or they drift from the config dir.
+    #[test]
+    fn app_identifier_matches_tauri_conf() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"].as_str(), Some(crate::APP_IDENTIFIER));
+    }
 
     #[test]
     fn file_store_round_trip() {

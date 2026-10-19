@@ -17,7 +17,6 @@ import { useMediaStore } from "./store/media";
 import { useProfileStore } from "./store/profile";
 import { useSettingsStore } from "./store/settings";
 import { useUiStore } from "./store/ui";
-import { useUpdateStore } from "./store/update";
 import { api } from "./lib/api";
 import i18n from "./i18n";
 import { useVariablesStore } from "./store/variables";
@@ -66,10 +65,7 @@ export default function App() {
       stopAll: i18n.t("tray.stopAll"),
       quit: i18n.t("tray.quit"),
     });
-    // Look for a new release once the window is up; failures stay silent here.
-    const updateTimer = window.setTimeout(() => void useUpdateStore.getState().check(false), 4000);
     return () => {
-      window.clearTimeout(updateTimer);
       disposeDevice?.();
       disposeProfile?.();
       disposeMacros?.();

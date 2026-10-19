@@ -442,9 +442,6 @@
     "copyright": "© {{years}} {{author}}",
     "source": "Source code on GitHub",
     "releases": "Releases",
-    "updatesTitle": "Updates",
-    "updatesHint": "Lunchpad looks for a new release on GitHub when it starts.",
-    "checkUpdates": "Check for updates",
     "legalTitle": "Legal",
     "license": "This software is free under the GNU General Public License v3. Anyone who passes it on has to keep the credits and share the source. If you paid money for it, you got ripped off.",
     "trademarks": "All product and company names are trademarks™ or registered® trademarks of their respective holders. Use of them does not imply any affiliation with or endorsement by them.",
@@ -452,18 +449,6 @@
     "novation": "Launchpad is a trademark of Focusrite-Novation.",
     "communityTitle": "Community",
     "communityHint": "Get the latest builds and help on Discord."
-  },
-  "updater": {
-    "checking": "Checking…",
-    "upToDate": "You have the latest version.",
-    "available": "Version {{version}} is available.",
-    "installing": "Downloading the update…",
-    "installingPercent": "Downloading the update… {{percent}} %",
-    "ready": "Restarting…",
-    "error": "Update check failed: {{error}}",
-    "install": "Install and restart",
-    "noticeTitle": "Update available",
-    "later": "Later"
   },
   "diagnostics": {
     "title": "Report",

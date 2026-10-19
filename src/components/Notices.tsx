@@ -3,7 +3,6 @@ import { useTranslation } from "react-i18next";
 import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useSettingsStore } from "../store/settings";
-import { useUpdateStore } from "../store/update";
 import { Button, IconClose } from "./ui";
 import { useState } from "react";
 import { useUiStore } from "../store/ui";
@@ -37,12 +36,6 @@ export function Notices() {
   const outside = activePage ? buttonsOutside(activePage, layout).length : 0;
   const [outsideDismissed, setOutsideDismissed] = useState<string | null>(null);
   const outsideKey = activePage ? `${activePage.id}:${outside}:${layout?.model ?? ""}` : "";
-  const updateStatus = useUpdateStore((s) => s.status);
-  const updateVersion = useUpdateStore((s) => s.version);
-  const updateNotes = useUpdateStore((s) => s.notes);
-  const updateDismissed = useUpdateStore((s) => s.dismissed);
-  const dismissUpdate = useUpdateStore((s) => s.dismiss);
-  const installUpdate = useUpdateStore((s) => s.install);
 
   const arrival = useHubStore((s) => s.arrival);
   const dismissArrival = useHubStore((s) => s.dismissArrival);
@@ -126,16 +119,6 @@ export function Notices() {
       lines: [t("notices.outsideHint")],
       onClose: () => setOutsideDismissed(outsideKey),
       action: { label: t("notices.outsideShow"), run: openOutside },
-    });
-  }
-  if (updateStatus === "available" && !updateDismissed) {
-    items.push({
-      key: "update",
-      tone: "info",
-      title: t("updater.noticeTitle"),
-      lines: [t("updater.available", { version: updateVersion }), ...(updateNotes ? [updateNotes.split("\n")[0].slice(0, 160)] : [])],
-      onClose: dismissUpdate,
-      action: { label: t("updater.install"), run: () => void installUpdate() },
     });
   }
   if (deviceError && !connected) {

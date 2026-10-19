@@ -5,7 +5,7 @@ use lunchpad_lib::profile::Profile;
 use std::path::PathBuf;
 
 fn main() {
-    let path = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.lunchpad.app/profile.json");
+    let path = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.davidprokopec.lunchpad/profile.json");
     let text = std::fs::read_to_string(&path).expect("profile.json");
     match serde_json::from_str::<Profile>(&text) {
         Ok(profile) => {
