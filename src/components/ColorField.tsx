@@ -42,6 +42,7 @@ export function ColorField({ value, onChange, limited, label }: Props) {
       <button
         ref={triggerRef}
         type="button"
+        aria-label={label}
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}

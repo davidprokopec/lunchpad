@@ -21,6 +21,7 @@ export interface PadRef {
 
 interface EditorTarget extends PadRef {
   pageId: string;
+  preset?: "mute";
 }
 
 interface ProfileStore {
@@ -43,7 +44,7 @@ interface ProfileStore {
   duplicatePage: (pageId: string) => Promise<void>;
   movePage: (pageId: string, toIndex: number) => Promise<void>;
 
-  openEditor: (x: number, y: number) => void;
+  openEditor: (x: number, y: number, preset?: "mute") => void;
   closeEditor: () => void;
   saveButton: (x: number, y: number, button: Button) => Promise<void>;
   openFaderEditor: (x: number, y: number) => void;
@@ -163,9 +164,9 @@ export const useProfileStore = create<ProfileStore>((set, get) => ({
     await guard(set, () => api.movePage(pageId, toIndex));
   },
 
-  openEditor: (x, y) => {
+  openEditor: (x, y, preset) => {
     const page = get().activePage();
-    if (page) set({ editor: { pageId: page.id, x, y } });
+    if (page) set({ editor: { pageId: page.id, x, y, preset } });
   },
   closeEditor: () => set({ editor: null }),
 

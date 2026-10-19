@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion } from "framer-motion";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useTranslation } from "react-i18next";
 import { api, emptyButton, type Button, type Layout, type Look, type Page } from "../lib/api";
@@ -21,7 +21,8 @@ import { ConfirmPrompt } from "./ConfirmPrompt";
 import { Button as UiButton, IconClose, Segmented, Toggle } from "./ui";
 import { Tooltip } from "./Tooltip";
 import { StateLinkField } from "./StateLinkField";
-import { muteButton } from "../lib/buttonPresets";
+import { muteButton, muteCaption } from "../lib/buttonPresets";
+import { DEFAULT_INPUT } from "../lib/systemAudio";
 import { useMediaStore } from "../store/media";
 import { isLinkActive } from "../lib/stateLink";
 import { AudioTargetField } from "./AudioTargetField";
@@ -80,6 +81,7 @@ export function ButtonEditor() {
               x={target.x}
               y={target.y}
               initial={existing ? stripCoords(existing) : null}
+              preset={target.preset}
               limited={limited}
               pages={pages}
               layout={layout}
@@ -112,6 +114,7 @@ function stripCoords(b: Button & { x?: number; y?: number }): Button {
 }
 
 interface FormProps {
+  preset?: "mute";
   pageId: string;
   x: number;
   y: number;
@@ -128,12 +131,14 @@ interface FormProps {
 
 type Tab = "appearance" | "actions";
 
-function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, onDirtyChange, onSave, onRemove }: FormProps) {
+function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onCancel, onDirtyChange, onSave, onRemove }: FormProps) {
   const { t } = useTranslation();
   // What a description may show: the shared variables and the provided values that exist outside a run.
   const descriptionNames = useVariablesStore(useShallow((s) => [...DESCRIPTION_VARIABLES, ...Object.keys(s.globals)].sort()));
-  const [button, setButton] = useState<Button>(() => initial ?? randomNewButton());
+  const newMuteButton = () => muteButton({ target: DEFAULT_INPUT, caption: t("audio.micCaption"), color: { mode: "rgb", r: 0, g: 48, b: 12 }, mutedColor: { mode: "rgb", r: 255, g: 0, b: 0 } });
+  const [button, setButton] = useState<Button>(() => initial ?? (preset === "mute" ? newMuteButton() : randomNewButton()));
   const [tab, setTab] = useState<Tab>("appearance");
+  const muteSettingsRef = useRef<HTMLElement>(null);
   const [previewActive, setPreviewActive] = useState(false);
   const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio));
   const pad = layout?.pads.find((p) => p.x === x && p.y === y);
@@ -184,7 +189,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
       <header className="flex items-center justify-between border-b border-stage-800 px-5 py-3">
         <div className="flex items-center gap-4">
           <h2 className="text-sm font-semibold text-stage-100">
-            {initial ? t("editor.titleEdit") : t("editor.titleNew")}
+            {mutePreset ? t(initial ? "audio.editMute" : "audio.setupMute") : initial ? t("editor.titleEdit") : t("editor.titleNew")}
             <span className="ml-2 font-normal text-stage-400">{t("editor.position", { column: x + 1, row: y + 1 })}</span>
           </h2>
           <Segmented
@@ -216,7 +221,8 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
             <PadFace button={button} cell={144} active={previewActive || linked} corners={cornersOf(pad?.shape)} limited={limited} noLed={ledKind === "none"} mask={pad?.mask ?? false} symbol={pad?.label ?? null} />
           </div>
           <p className="text-center text-xs text-stage-400">{t("editor.previewHint")}</p>
-          {!initial && !momentary && <UiButton size="sm" onClick={() => setButton(muteButton(t("audio.micCaption")))}>{t("audio.mutePreset")}</UiButton>}
+          {!initial && !momentary && !mutePreset && <UiButton size="sm" onClick={() => { setButton(newMuteButton()); setTab("appearance"); }}>{t("audio.mutePreset")}</UiButton>}
+          {mutePreset && <UiButton size="sm" onClick={() => { setTab("appearance"); requestAnimationFrame(() => muteSettingsRef.current?.scrollIntoView({ block: "start" })); }}>{t("audio.muteSettings")}</UiButton>}
         </div>
 
         {/* Form */}
@@ -227,12 +233,24 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
           </div>
         ) : (
         <div className="flex flex-col gap-6">
-          {mutePreset && <section className="flex flex-col gap-3">
+          {mutePreset && <section ref={muteSettingsRef} className="flex flex-col gap-3">
             <h3 className="text-sm font-medium text-stage-100">{t("audio.mutePreset")}</h3>
+            <p className="text-xs text-stage-400">{t("audio.setupHint")}</p>
+            <h4 className="text-xs font-medium text-stage-200">{t("audio.whatMutes")}</h4>
             <AudioTargetField control="mute" value={button.stateLink?.target} onChange={(target) => {
               if (!target || !button.stateLink) return;
-              setButton({ ...button, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target } });
+              const caption = (value: typeof target) => muteCaption(value, t("audio.micCaption"), t("audio.outputCaption"));
+              const look = button.look.type === "text" && button.stateLink.target && button.look.caption === caption(button.stateLink.target) ? { ...button.look, caption: caption(target) } : button.look;
+              setButton({ ...button, look, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target } });
             }} />
+            {textLook && <label className="flex flex-col gap-1 text-xs text-stage-400">
+              {t("editor.caption")}
+              <input aria-label={t("editor.caption")} value={textLook.caption} onChange={(e) => setLook({ ...textLook, caption: e.target.value })} className={inputCls} />
+            </label>}
+            {ledKind !== "none" && <div className="grid grid-cols-2 gap-3">
+              <ColorField label={t("audio.normalColour")} value={button.color} onChange={(color) => setButton({ ...button, color })} limited={limited} />
+              <ColorField label={t("audio.mutedColour")} value={button.activeColor ?? button.color} onChange={(activeColor) => setButton({ ...button, activeColor })} limited={limited} />
+            </div>}
             <p className="text-xs text-stage-500">{t("audio.presetHint", { ms: button.holdMs })}</p>
           </section>}
           <section className="flex flex-col gap-3">
@@ -256,7 +274,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
 
             {textLook ? (
               <div className="grid grid-cols-[1fr_auto] gap-3">
-                <label className="flex flex-col gap-1 text-xs text-stage-400">
+                {!mutePreset && <label className="flex flex-col gap-1 text-xs text-stage-400">
                   {t("editor.caption")}
                   <input
                     autoFocus
@@ -264,7 +282,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
                     onChange={(e) => setLook({ ...textLook, caption: e.target.value })}
                     className={inputCls}
                   />
-                </label>
+                </label>}
                 <RgbField label={t("editor.textColour")} value={textLook.color} onChange={(color) => setLook({ ...textLook, color })} />
                 <div className="flex flex-col gap-1 text-xs text-stage-400">
                   {t("editor.font")}
@@ -310,7 +328,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
             />
           </section>
 
-          {ledKind === "none" ? (
+          {mutePreset ? null : ledKind === "none" ? (
             <p className="text-xs text-stage-500">{t("editor.noLedHint")}</p>
           ) : (
           <section className="flex flex-col gap-3">
@@ -336,7 +354,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
           </section>
           )}
 
-          {ledKind !== "none" && (
+          {ledKind !== "none" && !mutePreset && (
           <section className="flex flex-col gap-3">
             <div>
               <h3 className="text-sm font-medium text-stage-100">{t("editor.linkTitle")}</h3>

@@ -25,7 +25,6 @@ import { buttonsOutside, cornerRadius, cornersOf, isControl, isKey, legendSize, 
 import { PadLabel } from "./PadLabel";
 import { Description } from "./Description";
 import { Tooltip } from "./Tooltip";
-import { muteButton } from "../lib/buttonPresets";
 import { audioControllable, audioFader } from "../lib/systemAudio";
 
 interface Props {
@@ -297,7 +296,7 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
         y: e.clientY,
         items: [
           { label: hasButton ? t("grid.editButton") : t("grid.addButton"), onSelect: () => openEditor(pad.x, pad.y) },
-          ...(!hasButton && !pad.momentary ? [{ label: t("audio.mutePreset"), onSelect: () => void useProfileStore.getState().saveButton(pad.x, pad.y, muteButton(t("audio.micCaption"))) }] : []),
+          ...(!hasButton && !pad.momentary ? [{ label: t("audio.mutePreset"), onSelect: () => openEditor(pad.x, pad.y, "mute") }] : []),
           "divider",
           { label: t("grid.copy"), disabled: !hasButton, onSelect: () => copyButton(pad.x, pad.y) },
           { label: t("grid.cut"), disabled: !hasButton, onSelect: () => void cutButton(pad.x, pad.y) },

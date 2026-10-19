@@ -1,17 +1,20 @@
-import { emptyButton, newActionId, type Action, type Button } from "./api";
-import { DEFAULT_INPUT } from "./systemAudio";
+import { emptyButton, newActionId, type Action, type AudioTarget, type Button, type PadColor } from "./api";
 
-export function muteButton(caption: string): Button {
-  const action = (): Action => ({ id: newActionId(), wait: true, type: "setAudio", target: structuredClone(DEFAULT_INPUT), mode: "holdMute", volume: 50, volumeFrom: null });
+export function muteCaption(target: AudioTarget, mic: string, output: string): string {
+  return target.type === "app" ? target.app.name.slice(0, 12) : target.device.type === "named" ? target.device.label.slice(0, 12) : target.device.type === "defaultInput" ? mic : output;
+}
+
+export function muteButton({ target, caption, color, mutedColor }: { target: AudioTarget; caption: string; color: PadColor; mutedColor: PadColor }): Button {
+  const action = (): Action => ({ id: newActionId(), wait: true, type: "setAudio", target: structuredClone(target), mode: "holdMute", volume: 50, volumeFrom: null });
   return {
     ...emptyButton(),
     look: { type: "text", caption, size: 16, face: "sans", color: "#ffffff" },
-    color: { mode: "rgb", r: 0, g: 48, b: 12 },
-    activeColor: { mode: "rgb", r: 255, g: 0, b: 0 },
+    color: structuredClone(color),
+    activeColor: structuredClone(mutedColor),
     holdMs: 500,
     holdWait: false,
     down: [action()],
     up: [action()],
-    stateLink: { provider: "system", kind: "audioMuted", scene: "", source: "", target: structuredClone(DEFAULT_INPUT) },
+    stateLink: { provider: "system", kind: "audioMuted", scene: "", source: "", target: structuredClone(target) },
   };
 }
