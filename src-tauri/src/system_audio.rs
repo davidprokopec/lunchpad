@@ -156,6 +156,7 @@ pub struct TargetState {
     pub volume: f32,
     pub muted: bool,
     pub can_mute: bool,
+    pub can_set_volume: bool,
     pub emulated: bool,
 }
 
@@ -187,6 +188,7 @@ impl SystemAudioState {
                     volume: found.volume,
                     muted: found.muted,
                     can_mute: found.can_mute || found.emulated,
+                    can_set_volume: found.can_set_volume,
                     emulated: found.emulated,
                 })
             }
@@ -202,6 +204,7 @@ impl SystemAudioState {
                     volume: found.volume,
                     muted: found.muted,
                     can_mute: true,
+                    can_set_volume: true,
                     emulated: false,
                 })
             }
@@ -397,6 +400,41 @@ struct HoldMutes {
 
 type Job = Box<dyn FnOnce(&dyn AudioControl) + Send>;
 
+/// One physical gesture, retained by queued jobs until its release completes.
+pub struct PhysicalMute {
+    captured: Mutex<Option<TargetState>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl PhysicalMute {
+    fn restore(&self, port: &dyn AudioControl, tapped: bool) -> Result<(), String> {
+        let captured = self.captured.lock();
+        let Some(state) = captured.as_ref() else {
+            return Ok(());
+        };
+        let cancelled = self.cancelled.load(std::sync::atomic::Ordering::Acquire);
+        let wanted = if tapped && !cancelled {
+            !state.muted
+        } else {
+            state.muted
+        };
+        let now = read_state(port);
+        let current = match &state.key {
+            Resolved::Device { id, kind } => now
+                .devices
+                .iter()
+                .find(|d| d.id == *id && d.kind == *kind)
+                .map(|d| d.muted),
+            Resolved::App { id } => now.apps.iter().find(|a| a.id == *id).map(|a| a.muted),
+        };
+        if current == Some(wanted) {
+            Ok(())
+        } else {
+            set_muted(port, &state.key, wanted)
+        }
+    }
+}
+
 /// The engine's handle to the system audio. Clone freely.
 #[derive(Clone)]
 pub struct SystemAudio {
@@ -404,6 +442,7 @@ pub struct SystemAudio {
     live: SharedLive,
     jobs: Sender<Job>,
     holds: Arc<HoldMutes>,
+    physical: Arc<Mutex<Vec<std::sync::Weak<PhysicalMute>>>>,
 }
 
 impl SystemAudio {
@@ -429,6 +468,7 @@ impl SystemAudio {
                 slots: Mutex::new(HashMap::new()),
                 stored: watch::channel(0).0,
             }),
+            physical: Default::default(),
         }
     }
 
@@ -444,6 +484,62 @@ impl SystemAudio {
     /// The target as the last change event left it (what the LEDs show).
     pub fn cached(&self, target: &AudioTarget) -> Option<TargetState> {
         self.live.lock().system.resolve(target)
+    }
+
+    pub fn snapshot(&self) -> SystemAudioState {
+        self.live.lock().system.clone()
+    }
+
+    /// Enqueue at input dispatch, not from an independently scheduled macro runner.
+    pub fn physical_press(&self, target: AudioTarget) -> Arc<PhysicalMute> {
+        let press = Arc::new(PhysicalMute {
+            captured: Mutex::new(None),
+            cancelled: false.into(),
+        });
+        let mut physical = self.physical.lock();
+        physical.retain(|p| p.strong_count() != 0);
+        physical.push(Arc::downgrade(&press));
+        let job = press.clone();
+        self.enqueue(move |port| {
+            let state = fresh(port, &target)?;
+            *job.captured.lock() = Some(state.clone());
+            if state.muted {
+                Ok(())
+            } else {
+                set_muted(port, &state.key, true)
+            }
+        });
+        press
+    }
+
+    pub fn physical_release(&self, press: Arc<PhysicalMute>, tapped: bool) {
+        self.enqueue(move |port| press.restore(port, tapped));
+    }
+
+    /// Stop is a safety restore, never a tap. This also covers releases already queued
+    /// behind a slow backend; their shared cancellation flag suppresses the toggle.
+    pub fn cancel_physical(&self) {
+        let mut physical = self.physical.lock();
+        for press in physical.drain(..).filter_map(|p| p.upgrade()) {
+            press
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.physical_release(press, false);
+        }
+    }
+
+    fn enqueue(&self, job: impl FnOnce(&dyn AudioControl) -> Result<(), String> + Send + 'static) {
+        if self
+            .jobs
+            .send(Box::new(move |port| {
+                if let Err(e) = job(port) {
+                    tracing::warn!(error = %e, "physical audio gesture failed");
+                }
+            }))
+            .is_err()
+        {
+            tracing::warn!("the system audio writer has stopped");
+        }
     }
 
     /// Run `f` on the writer thread, after every write asked for before it.

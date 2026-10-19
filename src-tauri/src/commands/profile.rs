@@ -158,6 +158,9 @@ pub(crate) fn mutate_as<T>(app: &AppHandle, state: &AppState, record: bool, kind
     state.manager.lock().request_repaint();
     // A renamed or removed fader leaves its old variable behind; drop it right away.
     state.engine.prune_fader_variables();
+    // Edits, imports and undo can add or retarget bindings without any OS event.
+    // The mutation and manager locks are released before the Os-origin commit.
+    state.engine.reconcile_audio_bindings();
     Ok(result)
 }
 

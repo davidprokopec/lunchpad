@@ -439,6 +439,9 @@ impl Fader {
     pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
         let Some(target) = &self.bound else { return Some(self.value) };
         let state = live.system.resolve(target)?;
+        if !state.can_set_volume {
+            return None;
+        }
         Some(if state.muted { self.min } else { self.value })
     }
 
@@ -765,4 +768,3 @@ mod tests {
         assert_eq!(shown.display_text(), "26 dB");
     }
 }
-

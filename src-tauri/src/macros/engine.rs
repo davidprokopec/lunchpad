@@ -125,12 +125,16 @@ struct Inner {
     pressure: Mutex<HashMap<(u8, u8), u8>>,
     /// When each pad went down and, once released, came up, read by `{{heldMs}}`.
     presses: Mutex<HashMap<(u8, u8), PadPress>>,
+    physical: Mutex<HashMap<(u8, u8), PhysicalPress>>,
+    input_dispatch: Mutex<()>,
     /// The connected device as the manager last reported it, read by `{{model}}` and friends.
     device: Mutex<Option<ConnectedDevice>>,
     /// Latest knob / strip value per fader while a worker is pacing its actions.
     pending_controls: Mutex<HashMap<String, PendingControl>>,
     ptt_count: Mutex<i32>,
     epoch: Instant,
+    #[cfg(test)]
+    input_clock: Mutex<Option<Instant>>,
 }
 
 fn env_of(inner: &Inner) -> builtins::Env {
@@ -148,6 +152,15 @@ fn env_of(inner: &Inner) -> builtins::Env {
 struct PadPress {
     down: Instant,
     up: Option<Instant>,
+    managed_audio: bool,
+    hold_ms: u64,
+}
+
+struct PhysicalPress {
+    page: String,
+    down: Instant,
+    hold_ms: u64,
+    audio: Vec<Arc<crate::system_audio::PhysicalMute>>,
 }
 
 /// Cheap handle to the engine; clone freely.
@@ -172,6 +185,7 @@ pub struct RunContext {
     /// Registers of this run, shared with buttons it calls.
     pub locals: Arc<Mutex<HashMap<String, String>>>,
     depth: u8,
+    press: Option<PadPress>,
 }
 
 impl MacroEngine {
@@ -194,10 +208,14 @@ impl MacroEngine {
                 holds: Mutex::new(HashMap::new()),
                 pressure: Mutex::new(HashMap::new()),
                 presses: Mutex::new(HashMap::new()),
+                physical: Mutex::new(HashMap::new()),
+                input_dispatch: Mutex::new(()),
                 device: Mutex::new(None),
                 pending_controls: Mutex::new(HashMap::new()),
                 ptt_count: Mutex::new(0),
                 epoch: Instant::now(),
+                #[cfg(test)]
+                input_clock: Mutex::new(None),
             }),
         }
     }
@@ -215,7 +233,7 @@ impl MacroEngine {
     /// Pretend a pad went down (and up) at these instants, as `on_button` records them.
     #[cfg(test)]
     pub fn set_press_for_test(&self, x: u8, y: u8, down: Instant, up: Option<Instant>) {
-        self.inner.presses.lock().insert((x, y), PadPress { down, up });
+        self.inner.presses.lock().insert((x, y), PadPress { down, up, managed_audio: false, hold_ms: profile::default_hold_ms() });
     }
 
     #[cfg(test)]
@@ -352,20 +370,53 @@ impl MacroEngine {
 
     /// Hardware or UI press/release on the active page.
     pub fn on_button(&self, event: &ButtonEvent) {
+        let _dispatch = self.inner.input_dispatch.lock();
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = self.inner.input_clock.lock().unwrap_or(now);
+        let owner = if event.pressed {
+            let store = self.inner.profile.lock();
+            store.profile.active().map(|page| {
+                let button = page.get(event.x, event.y).filter(|_| page.fader_at(event.x, event.y).is_none());
+                let audio = button.filter(|b| b.hold.is_empty()).into_iter().flat_map(|b| &b.down).filter_map(|a| match &a.kind {
+                    ActionKind::SetAudio { target, mode: SetAudioMode::HoldMute, .. } if button.is_some_and(|b| b.up.iter().any(|a| matches!(&a.kind, ActionKind::SetAudio { target: up, mode: SetAudioMode::HoldMute, .. } if up == target))) => self.inner.services.system_audio.as_ref().map(|sa| sa.physical_press(target.clone())),
+                    _ => None,
+                }).collect();
+                PhysicalPress { page: page.id.clone(), down: now, hold_ms: button.map(|b| b.hold_ms).unwrap_or_else(profile::default_hold_ms), audio }
+            })
+        } else {
+            self.inner.physical.lock().remove(&(event.x, event.y))
+        };
+        if !event.pressed {
+            if let (Some(owner), Some(sa)) = (&owner, &self.inner.services.system_audio) {
+                for press in &owner.audio {
+                    sa.physical_release(press.clone(), now.duration_since(owner.down).as_millis() < owner.hold_ms as u128);
+                }
+            }
+        }
+        let owner_page = owner.as_ref().map(|p| p.page.clone());
+        let managed_audio = owner.as_ref().is_some_and(|p| !p.audio.is_empty());
+        let threshold = owner.as_ref().map(|p| p.hold_ms).unwrap_or_else(profile::default_hold_ms);
+        if event.pressed {
+            if let Some(owner) = owner {
+                self.inner.physical.lock().insert((event.x, event.y), owner);
+            }
+        }
         if !event.pressed {
             self.inner.pressure.lock().remove(&(event.x, event.y));
         }
         {
             let mut presses = self.inner.presses.lock();
             if event.pressed {
-                presses.insert((event.x, event.y), PadPress { down: Instant::now(), up: None });
+                presses.insert((event.x, event.y), PadPress { down: now, up: None, managed_audio, hold_ms: threshold });
             } else if let Some(press) = presses.get_mut(&(event.x, event.y)) {
-                press.up = Some(Instant::now());
+                press.up = Some(now);
             }
         }
         let (page_id, hold_ms, loops, fader) = {
             let store = self.inner.profile.lock();
             let Some(page) = store.profile.active() else { return };
+            let page = owner_page.as_deref().and_then(|id| store.profile.page(id)).unwrap_or(page);
             let hold = page.get(event.x, event.y).filter(|b| !b.hold.is_empty()).map(|b| (b.hold_ms, b.hold_wait));
             let loops = page.get(event.x, event.y).map(|b| b.loop_down).unwrap_or(false);
             let fader = page.fader_at(event.x, event.y).map(|(f, step)| {
@@ -377,6 +428,7 @@ impl MacroEngine {
         };
         let velocity = event.value.max(1);
         let (x, y) = (event.x, event.y);
+        let input_press = self.inner.presses.lock().get(&(x, y)).copied();
         if let Some(hit) = fader {
             // A fader pad sets the level; the release does nothing.
             if event.pressed {
@@ -386,7 +438,7 @@ impl MacroEngine {
         }
         let Some((hold_ms, hold_wait)) = hold_ms else {
             let list = if event.pressed { ActionList::Down } else { ActionList::Up };
-            let _ = self.start(&page_id, x, y, list, velocity, 0, None);
+            let _ = self.start_input(&page_id, x, y, list, velocity, input_press);
             return;
         };
 
@@ -394,7 +446,7 @@ impl MacroEngine {
         if !hold_wait {
             // Pressed actions run at once; the held list is extra after the hold time.
             if event.pressed {
-                let _ = self.start(&page_id, x, y, ActionList::Down, velocity, 0, None);
+                let _ = self.start_input(&page_id, x, y, ActionList::Down, velocity, input_press);
                 let token = CancellationToken::new();
                 if let Some(old) = self.inner.holds.lock().insert(key, HoldArm { token: token.clone(), state: Arc::new(AtomicU8::new(HOLD_ARMED)) }) {
                     old.token.cancel();
@@ -405,7 +457,7 @@ impl MacroEngine {
                         biased;
                         _ = token.cancelled() => {}
                         _ = tokio::time::sleep(Duration::from_millis(hold_ms.max(50))) => {
-                            let _ = engine.start(&page_id, x, y, ActionList::Hold, velocity, 0, None);
+                            let _ = engine.start_input(&page_id, x, y, ActionList::Hold, velocity, input_press);
                         }
                     }
                 });
@@ -413,7 +465,7 @@ impl MacroEngine {
                 if let Some(arm) = self.inner.holds.lock().remove(&key) {
                     arm.token.cancel();
                 }
-                let _ = self.start(&page_id, x, y, ActionList::Up, velocity, 0, None);
+                let _ = self.start_input(&page_id, x, y, ActionList::Up, velocity, input_press);
             }
             return;
         }
@@ -432,7 +484,7 @@ impl MacroEngine {
                     _ = token.cancelled() => {}
                     _ = tokio::time::sleep(Duration::from_millis(hold_ms.max(50))) => {
                         if state.compare_exchange(HOLD_ARMED, HOLD_FIRED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                            let _ = engine.start(&page_id, x, y, ActionList::Hold, velocity, 0, None);
+                            let _ = engine.start_input(&page_id, x, y, ActionList::Hold, velocity, input_press);
                         }
                     }
                 }
@@ -449,12 +501,12 @@ impl MacroEngine {
             // list waits for the pressed one - the way "tap" behaves when
             // another button runs this one. Both used to start at once, which
             // ran a button's "release the key" before its "hold the key".
-            let down = tapped.then(|| self.start(&page_id, x, y, ActionList::Down, velocity, 0, None)).flatten();
+            let down = tapped.then(|| self.start_input(&page_id, x, y, ActionList::Down, velocity, input_press)).flatten();
             // A looping button is the exception: its released list is what
             // stops the loop, so it cannot wait for the loop to end first.
             match down.filter(|_| !loops) {
                 None => {
-                    let _ = self.start(&page_id, x, y, ActionList::Up, velocity, 0, None);
+                    let _ = self.start_input(&page_id, x, y, ActionList::Up, velocity, input_press);
                 }
                 Some(mut done) => {
                     let engine = self.clone();
@@ -465,7 +517,7 @@ impl MacroEngine {
                                 break;
                             }
                         }
-                        let _ = engine.start(&page, x, y, ActionList::Up, velocity, 0, None);
+                        let _ = engine.start_input(&page, x, y, ActionList::Up, velocity, input_press);
                     });
                 }
             }
@@ -517,7 +569,7 @@ impl MacroEngine {
         for (page_id, fader) in bound {
             let Some(target) = &fader.bound else { continue };
             let Some(st) = state.resolve(target) else { continue };
-            if st.muted {
+            if st.muted || !st.can_set_volume {
                 continue;
             }
             let value = fader.value_of(st.volume);
@@ -542,6 +594,12 @@ impl MacroEngine {
         }
     }
 
+    pub fn reconcile_audio_bindings(&self) {
+        if let Some(audio) = &self.inner.services.system_audio {
+            self.follow_system_audio(&audio.snapshot());
+        }
+    }
+
     /// Persist a fader's new level, expose it as `fader.<name>` and run its actions.
     /// Apply a fader's value (LEDs, level, variables) and run one of its lists, if any.
     fn fader_pressed(&self, page_id: &str, x: u8, y: u8, hit: FaderHit, velocity: u8, run: Option<ActionList>) {
@@ -553,7 +611,7 @@ impl MacroEngine {
     #[allow(clippy::too_many_arguments)]
     fn fader_pressed_from(&self, page_id: &str, x: u8, y: u8, hit: FaderHit, velocity: u8, run: Option<ActionList>, origin: FaderOrigin) {
         let audio = match (&hit.bound, origin) {
-            (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| sa.cached(target).is_some()) {
+            (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)) {
                 Some(sa) => Some((sa.clone(), AudioTarget::clone(target))),
                 None => {
                     tracing::debug!(fader = %hit.id, "the fader's audio target is not available, press ignored");
@@ -617,6 +675,10 @@ impl MacroEngine {
         self.start_with(page_id, x, y, list, velocity, depth, parent, None)
     }
 
+    fn start_input(&self, page_id: &str, x: u8, y: u8, list: ActionList, velocity: u8, press: Option<PadPress>) -> Option<watch::Receiver<bool>> {
+        self.start_with_context(page_id, x, y, list, velocity, 0, None, None, press)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn start_with(
         &self,
@@ -628,6 +690,23 @@ impl MacroEngine {
         depth: u8,
         parent: Option<&RunContext>,
         locals: Option<Arc<Mutex<HashMap<String, String>>>>,
+    ) -> Option<watch::Receiver<bool>> {
+        let press = parent.and_then(|p| p.press).or_else(|| self.inner.presses.lock().get(&(x, y)).copied()).map(|p| PadPress { managed_audio: false, ..p });
+        self.start_with_context(page_id, x, y, list, velocity, depth, parent, locals, press)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_context(
+        &self,
+        page_id: &str,
+        x: u8,
+        y: u8,
+        list: ActionList,
+        velocity: u8,
+        depth: u8,
+        parent: Option<&RunContext>,
+        locals: Option<Arc<Mutex<HashMap<String, String>>>>,
+        press: Option<PadPress>,
     ) -> Option<watch::Receiver<bool>> {
         let (has_actions, mode, queue_size) = {
             let store = self.inner.profile.lock();
@@ -716,6 +795,7 @@ impl MacroEngine {
             token,
             locals: locals.unwrap_or_default(),
             depth,
+            press,
         };
         tracing::info!(id = %id, page = page_id, x, y, ?list, velocity, queued = !ahead.is_empty(), "macro started");
         self.inner.runtime.spawn(async move {
@@ -877,11 +957,7 @@ impl RunContext {
                 .unwrap_or_default();
             (page.map(|p| p.name.clone()).unwrap_or_default(), caption)
         };
-        let held_ms = self
-            .inner
-            .presses
-            .lock()
-            .get(&(self.x, self.y))
+        let held_ms = self.press.as_ref()
             .map(|press| press.up.unwrap_or_else(Instant::now).duration_since(press.down).as_millis() as u64)
             .unwrap_or(0);
         builtins::Press { velocity: self.velocity, pressure, x: self.x, y: self.y, trigger: self.list.as_str(), held_ms, page_id: self.page_id.clone(), page_name, caption }
@@ -889,11 +965,18 @@ impl RunContext {
 
     /// When the pad of this run last went down, as `on_button` recorded it.
     pub(crate) fn pad_down(&self) -> Option<Instant> {
-        self.inner.presses.lock().get(&(self.x, self.y)).map(|p| p.down)
+        self.press.map(|p| p.down)
+    }
+
+    pub(crate) fn physical_audio(&self) -> bool {
+        self.press.is_some_and(|p| p.managed_audio)
     }
 
     /// The hold time of the button this run belongs to (the default for anything else).
     pub(crate) fn hold_ms(&self) -> u64 {
+        if let Some(press) = self.press {
+            return press.hold_ms;
+        }
         let store = self.inner.profile.lock();
         store.profile.page(&self.page_id).and_then(|p| p.get(self.x, self.y)).map(|b| b.hold_ms).unwrap_or_else(profile::default_hold_ms)
     }
@@ -1038,6 +1121,10 @@ impl Inner {
     }
 
     fn stop_all(&self) {
+        let _dispatch = self.input_dispatch.lock();
+        if let Some(audio) = &self.services.system_audio {
+            audio.cancel_physical();
+        }
         let runners = self.runners.lock();
         for r in runners.values() {
             r.token.cancel();
@@ -2927,6 +3014,160 @@ mod tests {
             );
             wait_done(r.engine.start(DEFAULT_PAGE_ID, 0, 0, ActionList::Down, 127, 0, None).unwrap()).await;
             assert_eq!(r.fake.writes(), vec![FakeWrite::Volume("spk".into(), 0.2), FakeWrite::Muted("mic".into(), true)]);
+        }
+
+        async fn block_writer(audio: &SystemAudio) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<Result<(), String>>) {
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let audio = audio.clone();
+            let done = tokio::spawn(async move {
+                audio.run(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().map_err(|e| e.to_string())
+                }).await
+            });
+            ready.await.unwrap();
+            (release, done)
+        }
+
+        fn input(engine: &MacroEngine, pressed: bool) {
+            engine.on_button(&ButtonEvent { x: 3, y: 3, pressed, note: 0, cc: false, value: 127 });
+        }
+
+        async fn finish_input(r: &Rig) {
+            let runners: Vec<_> = r.engine.inner.runners.lock().values().map(|h| h.done.clone()).collect();
+            for runner in runners {
+                wait_done(runner).await;
+            }
+            r.bridge.audio.run(|_| Ok(())).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn physical_rapid_taps_are_event_ordered() {
+            for muted in [false, true] {
+                let r = rig(muted, false);
+                mute_button(&r.profile);
+                let (release, done) = block_writer(&r.bridge.audio).await;
+                input(&r.engine, true);
+                input(&r.engine, false);
+                input(&r.engine, true);
+                input(&r.engine, false);
+                release.send(()).unwrap();
+                done.await.unwrap().unwrap();
+                finish_input(&r).await;
+                assert_eq!(mic_state(&r.fake).0, muted, "two taps starting muted={muted}");
+                assert_eq!(r.fake.writes(), vec![FakeWrite::Muted("mic".into(), !muted), FakeWrite::Muted("mic".into(), muted)]);
+            }
+        }
+
+        #[tokio::test]
+        async fn physical_release_keeps_its_owner_after_page_and_configuration_change() {
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            let down = Instant::now();
+            *r.engine.inner.input_clock.lock() = Some(down);
+            input(&r.engine, true);
+            {
+                let mut store = r.profile.lock();
+                store.profile.pages[0].get_mut(3, 3).unwrap().up.clear();
+                store.profile.pages.push(crate::profile::Page::new("other", "Other"));
+                store.profile.active_page = "other".into();
+            }
+            *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(800));
+            input(&r.engine, false);
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            finish_input(&r).await;
+            assert!(!mic_state(&r.fake).0, "captured hold release restores even after config changes");
+            assert_eq!(r.fake.writes().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn stop_all_restores_even_an_overtaken_physical_release() {
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, true);
+            input(&r.engine, false);
+            r.engine.stop_all();
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            finish_input(&r).await;
+            assert!(!mic_state(&r.fake).0, "stopping restores pre-press state, not a queued tap toggle");
+            assert_eq!(r.fake.writes().len(), 2, "the overtaken press really muted, then restored");
+        }
+
+        #[tokio::test]
+        async fn cancelling_a_runner_does_not_cancel_the_physical_hold_release() {
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            let down = Instant::now();
+            *r.engine.inner.input_clock.lock() = Some(down);
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, true);
+            r.engine.stop_at(DEFAULT_PAGE_ID, 3, 3);
+            *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(800));
+            input(&r.engine, false);
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            finish_input(&r).await;
+            assert_eq!(r.fake.writes(), vec![FakeWrite::Muted("mic".into(), true), FakeWrite::Muted("mic".into(), false)]);
+            assert!(!mic_state(&r.fake).0);
+        }
+
+        #[tokio::test]
+        async fn physical_audio_does_not_override_faders_or_programmatic_runs() {
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            r.profile.lock().profile.pages[0].set_fader(Fader { id: "overlap".into(), x: 3, y: 3, length: 1, ..Default::default() });
+            input(&r.engine, true);
+            input(&r.engine, false);
+            finish_input(&r).await;
+            assert!(r.fake.writes().is_empty(), "the fader takes precedence over the button underneath");
+            r.profile.lock().profile.pages[0].faders.clear();
+            input(&r.engine, true);
+            input(&r.engine, false);
+            finish_input(&r).await;
+            assert!(mic_state(&r.fake).0);
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Down, 127, 0, None).unwrap()).await;
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Up, 127, 0, None).unwrap()).await;
+            assert!(!mic_state(&r.fake).0, "a programmatic run is not mistaken for the previous physical gesture");
+        }
+
+        #[tokio::test]
+        async fn binding_and_retargeting_reconcile_without_audio_notifications() {
+            let r = rig(false, false);
+            bound_fader(&r.profile, mic());
+            r.profile.lock().profile.pages[0].faders[0].value = 100.0;
+            r.engine.reconcile_audio_bindings();
+            assert!((fader_value(&r.profile) - 60.0).abs() < 1e-4);
+            r.profile.lock().profile.pages[0].faders[0].bound = Some(AudioTarget::Device { device: DeviceRef::DefaultOutput });
+            r.engine.reconcile_audio_bindings();
+            assert!((fader_value(&r.profile) - 40.0).abs() < 1e-4);
+            assert!(r.fake.writes().is_empty());
+            assert!(!r.engine.globals().contains_key("runs"));
+        }
+
+        #[tokio::test]
+        async fn fixed_volume_is_unavailable_only_to_faders() {
+            let r = rig(true, false);
+            r.fake.change(|d, _| d[0].can_set_volume = false);
+            r.bridge.refresh();
+            bound_fader(&r.profile, mic());
+            let live = crate::live::LiveStatus { system: crate::system_audio::read_state(r.fake.as_ref()), ..Default::default() };
+            assert!(r.profile.lock().profile.pages[0].faders[0].render_value(&live).is_none());
+            let before = r.profile.lock().profile.clone();
+            press(&r.engine, 4);
+            r.bridge.audio.run(|_| Ok(())).await.unwrap();
+            assert_eq!(r.profile.lock().profile, before, "no user commit");
+            assert!(r.fake.writes().is_empty());
+            assert!(!r.engine.globals().contains_key("runs"));
+            assert!(live.system.resolve(&mic()).unwrap().muted);
+            let link = crate::profile::StateLink { provider: crate::profile::LinkProvider::System, kind: crate::profile::LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(mic()) };
+            assert!(link.is_active(&live), "mute-only state links remain usable");
+            r.bridge.audio.apply(mic(), SetAudioMode::Unmute, 0.0).await.unwrap();
+            assert!(!mic_state(&r.fake).0);
         }
 
         /// A burst of changes from the system turns into one or two looks, not one per change.

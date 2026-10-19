@@ -363,14 +363,18 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
             let Some(sa) = &services.system_audio else { return unavailable(action) };
             let result = match mode {
                 SetAudioMode::HoldMute => {
+                    // Physical input already queued this gesture in event order. Macro
+                    // cancellation must not remove its safety release.
+                    if ctx.physical_audio() {
+                        return;
+                    }
                     let key = (ctx.page_id.clone(), ctx.x, ctx.y);
                     let down = ctx.pad_down();
                     if matches!(ctx.list, ActionList::Up | ActionList::FaderRelease) {
                         let tapped = ctx.press().held_ms < ctx.hold_ms();
-                        tokio::select! {
-                            result = sa.hold_release(key, down, tapped, target.clone()) => result,
-                            _ = ctx.token.cancelled() => Ok(()),
-                        }
+                        // Once started, a safety release outlives its runner's cancellation.
+                        // The missing-press wait is bounded inside hold_release.
+                        sa.hold_release(key, down, tapped, target.clone()).await
                     } else {
                         sa.hold_press(key, down, target.clone()).await
                     }
