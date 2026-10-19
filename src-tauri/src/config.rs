@@ -138,6 +138,17 @@ impl Default for HomeAssistantSettings {
     }
 }
 
+/// System audio control (devices and per-app volume).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemAudioSettings {
+    /// macOS: per-app volume and mute through Core Audio process taps. Needs the
+    /// System Audio Recording permission, so it stays off unless turned on.
+    /// Read at start-up.
+    #[serde(default)]
+    pub macos_taps: bool,
+}
+
 /// Window behaviour, also reachable from the tray menu.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +195,8 @@ pub struct Settings {
     pub home_assistant: HomeAssistantSettings,
     #[serde(default)]
     pub window: WindowSettings,
+    #[serde(default)]
+    pub system_audio: SystemAudioSettings,
     /// Show diagnostics in the main window (device facts, MIDI monitor, variables).
     #[serde(default)]
     pub developer_mode: bool,
@@ -216,6 +229,7 @@ impl Default for Settings {
             slobs: SlobsSettings::default(),
             home_assistant: HomeAssistantSettings::default(),
             window: WindowSettings::default(),
+            system_audio: SystemAudioSettings::default(),
             developer_mode: false,
             secrets: Vec::new(),
             hub: crate::hub::HubSettings::default(),

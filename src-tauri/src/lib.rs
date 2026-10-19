@@ -26,6 +26,7 @@ pub mod hub;
 pub mod secrets;
 pub mod slobs;
 pub mod speech;
+pub mod sysaudio;
 pub mod system_volume;
 pub mod tray;
 
@@ -268,6 +269,10 @@ pub fn run() {
             let slobs = slobs::SlobsHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime, Some(live));
             let home_assistant = homeassistant::HaHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime);
             let hub = hub::HubHandle::spawn(app.handle().clone(), settings.clone());
+            // Devices and per-app volume, live. Taps (macOS per-app volume) only on request.
+            let macos_taps = settings.lock().settings.system_audio.macos_taps;
+            let sysaudio = sysaudio::SystemAudio::start(sysaudio::Options { macos_taps });
+            sysaudio::forward_to_window(&sysaudio, app.handle().clone());
 
             let sink = Arc::new(TauriSink {
                 app: app.handle().clone(),
@@ -283,6 +288,7 @@ pub fn run() {
                 obs: Some(obs.clone()),
                 slobs: Some(slobs.clone()),
                 home_assistant: Some(home_assistant.clone()),
+                sysaudio: Some(sysaudio.clone()),
                 settings: Some(settings.clone()),
                 downloads: Some(http::download_dir(app.handle())),
                 config_dir: Some(config_dir.clone()),
@@ -312,7 +318,7 @@ pub fn run() {
             }
 
             let window_settings = settings.lock().settings.window.clone();
-            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, hub, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
+            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, sysaudio, hub, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
             if let Err(e) = tray::setup(app.handle(), &window_settings) {
                 tracing::warn!(error = %e, "tray icon could not be created");
             }
@@ -401,6 +407,8 @@ pub fn run() {
             // media
             list_audio_devices,
             list_system_audio_devices,
+            sysaudio_devices,
+            sysaudio_apps,
             analyze_audio,
             preview_sound,
             stop_sound,
@@ -464,6 +472,10 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
                 let flusher = app.state::<AppState>().profile.lock().flusher();
                 flusher.flush();
+            }
+            // Taps, listeners and COM objects are released on the audio thread.
+            if let tauri::RunEvent::Exit = event {
+                app.state::<AppState>().sysaudio.shutdown();
             }
             // macOS: clicking the dock icon while the window is hidden brings it back.
             #[cfg(target_os = "macos")]

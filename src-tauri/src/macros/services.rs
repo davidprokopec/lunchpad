@@ -8,6 +8,7 @@ use crate::input::KeyboardHandle;
 use crate::obs::ObsHandle;
 use crate::slobs::SlobsHandle;
 use crate::speech::SpeechHandle;
+use crate::sysaudio::SystemAudio;
 use std::path::PathBuf;
 
 #[derive(Clone, Default)]
@@ -18,6 +19,8 @@ pub struct Services {
     pub obs: Option<ObsHandle>,
     pub slobs: Option<SlobsHandle>,
     pub home_assistant: Option<HaHandle>,
+    /// System audio devices and apps (volume, mute, live changes).
+    pub sysaudio: Option<SystemAudio>,
     pub settings: Option<SharedSettings>,
     /// Where HTTP actions keep the files they download (`None` = a temp folder)
     pub downloads: Option<PathBuf>,
