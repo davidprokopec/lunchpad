@@ -470,6 +470,63 @@ export type StudioMode = "enable" | "disable" | "toggle" | "transition";
 export type SystemVolumeTarget = "output" | "input";
 export type SystemVolumeMode = "set" | "adjust" | "mute" | "unmute" | "toggleMute";
 export const SYSTEM_VOLUME_MODES: SystemVolumeMode[] = ["set", "adjust", "mute", "unmute", "toggleMute"];
+/** Which way a device carries sound. Mirrors `AudioDeviceKind` in src-tauri/src/profile/audio.rs. */
+export type AudioDeviceKind = "input" | "output";
+/** A device: the system default of a kind, or one by its system id (`label` is only shown, or matched when `id` is empty). */
+export type DeviceRef = { type: "defaultInput" } | { type: "defaultOutput" } | { type: "named"; id: string; kind: AudioDeviceKind; label: string };
+/** An application by its stable id (macOS bundle id or `proc:<exe>`, Windows lower-case exe); `name` is shown while it is not running. */
+export interface AppRef {
+  id: string;
+  name: string;
+}
+/** A device or an app whose volume and mute Lunchpad follows or sets. */
+export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef };
+/** `holdMute` goes in both the pressed and the released list: a tap toggles, a hold (the button's holdMs) mutes only while held. */
+export type SetAudioMode = "setVolume" | "adjustVolume" | "mute" | "unmute" | "toggleMute" | "holdMute";
+export const SET_AUDIO_MODES: SetAudioMode[] = ["setVolume", "adjustVolume", "mute", "unmute", "toggleMute", "holdMute"];
+
+/** One device in one direction, as the system reports it (`audio_list_devices`, `audio_status`). */
+export interface AudioDevice {
+  id: string;
+  name: string;
+  kind: AudioDeviceKind;
+  /** 0..1 */
+  volume: number;
+  muted: boolean;
+  isDefault: boolean;
+  canSetVolume: boolean;
+  canMute: boolean;
+  /** no mute of its own: muting parks the volume at 0 and remembers the level */
+  emulated: boolean;
+  /** false for a device the profile names that is not connected */
+  present: boolean;
+}
+/** One app with audio (`audio_list_apps`, `audio_status`). */
+export interface AudioApp {
+  id: string;
+  name: string;
+  /** 0..1 */
+  volume: number;
+  muted: boolean;
+  /** producing sound right now */
+  active: boolean;
+  /** false for an app the profile names that is not running */
+  present: boolean;
+}
+export type AudioPermission = "unknown" | "granted" | "denied" | "unconfirmed";
+/** `audio_status` and the `system-audio:changed` event. */
+export interface AudioStatus {
+  /** devices can be listed and controlled */
+  available: boolean;
+  /** apps can be listed (and, with the permission, controlled) */
+  appsAvailable: boolean;
+  permission: AudioPermission;
+  /** why something is unavailable */
+  message: string | null;
+  devices: AudioDevice[];
+  apps: AudioApp[];
+}
+
 /** dB, or percent of the app's own volume scale (OBS: 100 % = 0 dB; Streamlabs: fader position). */
 export type VolumeUnit = "db" | "percent";
 export type VisibilityMode = "show" | "hide" | "toggle";
@@ -517,6 +574,7 @@ export type ActionKind =
   | { type: "slobsToggleSource"; scene: string; collection: string; source: string; visible: boolean; mode: VisibilityMode | null }
   | { type: "slobsSetAudio"; scene: string; collection: string; source: string; muted: boolean; muteMode: MuteMode | null; volumeDb: number; volumeFrom: string | null; volumeUnit: VolumeUnit; setVolume: boolean }
   | { type: "setSystemVolume"; target: SystemVolumeTarget; mode: SystemVolumeMode; volume: number; volumeFrom: string | null; device: string | null }
+  | { type: "setAudio"; target: AudioTarget; mode: SetAudioMode; volume: number; volumeFrom: string | null }
   | { type: "stopAllSounds" }
   | { type: "setAudioDevice"; target: SystemVolumeTarget; device: string }
   | { type: "addToVariable"; name: string; amount: string; scope: VarScope }
@@ -766,6 +824,7 @@ export const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set<ActionType>([
   "playSound",
   "textToSpeech",
   "setSystemVolume",
+  "setAudio",
   "stopAllSounds",
   "setAudioDevice",
   "addToVariable",
@@ -813,8 +872,9 @@ export interface RunningMacro {
   startedAtMs: number;
 }
 
-export type LinkProvider = "obs" | "slobs";
-export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer";
+export type LinkProvider = "obs" | "slobs" | "system";
+/** `audioMuted` is the System provider's only kind. */
+export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer" | "audioMuted";
 export const LINK_KINDS: LinkKind[] = ["scene", "sourceVisible", "sourceMuted", "streaming", "recording", "replayBuffer"];
 
 /** "Active while …": the button shows its active colour while a streaming app is in this state. */
@@ -824,6 +884,8 @@ export interface StateLink {
   /** empty = the live scene (for sourceVisible) */
   scene: string;
   source: string;
+  /** System provider: the device or app whose mute lights the pad (left out of the file when unset) */
+  target?: AudioTarget | null;
 }
 
 /** What a press does while an earlier run of the same list (pressed, released or held) is still going. */
@@ -886,6 +948,8 @@ export interface Fader {
   onTouch: Action[];
   /** touch strips only: when the finger leaves */
   onRelease: Action[];
+  /** follow and set this device's or app's volume (0 % = min, 100 % = max); left out of the file when unbound */
+  bound?: AudioTarget | null;
 }
 
 /** Variables the fader's actions receive. */
@@ -1034,6 +1098,11 @@ export const api = {
 
   listAudioDevices: () => invoke<AudioDevices>("list_audio_devices"),
   listSystemAudioDevices: (target: SystemVolumeTarget) => invoke<string[]>("list_system_audio_devices", { target }),
+  /** Devices for the fader / action pickers, both directions; saved ones not connected have `present: false`. */
+  audioListDevices: () => invoke<AudioDevice[]>("audio_list_devices"),
+  /** Apps with audio; saved ones not running have `present: false`. */
+  audioListApps: () => invoke<AudioApp[]>("audio_list_apps"),
+  audioStatus: () => invoke<AudioStatus>("audio_status"),
   analyzeAudio: (path: string, buckets = 160) => invoke<AudioInfo>("analyze_audio", { path, buckets }),
   previewSound: (request: { file: string; outputDevice: string | null; volume: number; start: number; end: number }) =>
     invoke<number>("preview_sound", { request }),
@@ -1137,6 +1206,8 @@ export const events = {
     listen<Settings>("settings:changed", (e) => cb(e.payload)),
   onInputUnavailable: (cb: (problem: InputUnavailable) => void): Promise<UnlistenFn> =>
     listen<InputUnavailable>("input:unavailable", (e) => cb(e.payload)),
+  /** The system audio changed (coalesced); same payload as `audioStatus`. */
+  onSystemAudio: (cb: (status: AudioStatus) => void): Promise<UnlistenFn> => listen<AudioStatus>("system-audio:changed", (e) => cb(e.payload)),
   onObsState: (cb: (state: ObsState) => void): Promise<UnlistenFn> => listen<ObsState>("obs:state", (e) => cb(e.payload)),
   onSlobsState: (cb: (state: SlobsState) => void): Promise<UnlistenFn> => listen<SlobsState>("slobs:state", (e) => cb(e.payload)),
   onHomeAssistantState: (cb: (state: HaState) => void): Promise<UnlistenFn> => listen<HaState>("homeassistant:state", (e) => cb(e.payload)),

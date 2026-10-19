@@ -8,7 +8,9 @@ own. Work through both lists before a release that ships the action.
 
 1. **Model**: add a variant to `ActionKind` in `src-tauri/src/macros/model.rs`. Give new
    fields `#[serde(default)]` (or a default function) so profiles written by older versions
-   still load, and extend the JSON shape tests at the bottom of the file.
+   still load, and extend the JSON shape tests at the bottom of the file. A field whose type
+   is new to the contract (an enum or struct the action refers to) goes into `TYPE_SOURCES`
+   in `tools/actions-contract.ts`, as `SetAudio`'s `AudioTarget` and `SetAudioMode` do.
 2. **Engine**: handle the variant in `execute` in `src-tauri/src/macros/engine.rs`. Actions
    that only change Lunchpad's own state live there; actions that talk to the outside world
    (sound, keys, processes, OBS, Streamlabs, HTTP) go to `execute_external` in

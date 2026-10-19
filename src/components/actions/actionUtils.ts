@@ -26,6 +26,7 @@ export const ACTION_ICONS: Record<ActionType, IconName> = {
   playSound: "Volume2",
   textToSpeech: "Speech",
   setSystemVolume: "Volume2",
+  setAudio: "MicOff",
   stopAllSounds: "CircleStop",
   setAudioDevice: "Volume2",
   addToVariable: "Variable",
@@ -239,6 +240,8 @@ export function createActions(type: ActionType): Action[] {
       return [make({ type: "textToSpeech", text: "", voice: null, volume: 1 })];
     case "setSystemVolume":
       return [make({ type: "setSystemVolume", target: "output", mode: "set", volume: 50, volumeFrom: null, device: null })];
+    case "setAudio":
+      return [make({ type: "setAudio", target: { type: "device", device: { type: "defaultOutput" } }, mode: "setVolume", volume: 50, volumeFrom: null })];
     case "stopAllSounds":
       return [make({ type: "stopAllSounds" })];
     case "setAudioDevice":

@@ -10,7 +10,8 @@ type ProviderChoice = LinkProvider | "none";
 /** "Active while …" picker: app, state, and the scene / source it refers to. */
 export function StateLinkField({ value, onChange }: { value: StateLink | null; onChange: (next: StateLink | null) => void }) {
   const { t } = useTranslation();
-  const view = useProviderView(value?.provider ?? "obs");
+  // Only OBS and Streamlabs have scene / source lists to load.
+  const view = useProviderView(value?.provider === "slobs" ? "slobs" : "obs");
   const { loaded, load } = view;
 
   useEffect(() => {

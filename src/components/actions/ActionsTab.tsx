@@ -42,7 +42,7 @@ const MARKERS_WITH_BODY: ReadonlySet<ActionType> = new Set<ActionType>(["ifStart
 
 /** `submenu` groups fold into a nested menu; the others stay inline under a heading. */
 const MENU_GROUPS: { group: string; types: ActionType[]; submenu?: boolean }[] = [
-  { group: "media", types: ["playSound", "textToSpeech", "setSystemVolume", "setAudioDevice", "stopAllSounds"], submenu: true },
+  { group: "media", types: ["playSound", "textToSpeech", "setSystemVolume", "setAudio", "setAudioDevice", "stopAllSounds"], submenu: true },
   { group: "general", types: ["delay", "switchPage", "runButton", "setColor", "setFader"], submenu: true },
   { group: "flow", types: ["ifStart", "loopStart", "flipFlopStart", "pushToTalkStart"], submenu: true },
   { group: "system", types: ["launchApplication", "httpRequest", "runScript", "setVariable", "addToVariable", "debug"], submenu: true },

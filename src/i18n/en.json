@@ -583,6 +583,10 @@
         "name": "System audio",
         "desc": "Set, nudge or mute the volume of the speakers or the microphone, fixed or from a fader."
       },
+      "setAudio": {
+        "name": "Device or app audio",
+        "desc": "Set, nudge or mute a device or an app, or hold to mute: a tap toggles the mute, holding mutes until you let go."
+      },
       "launchApplication": {
         "name": "Launch application",
         "desc": "Start a program or script."
