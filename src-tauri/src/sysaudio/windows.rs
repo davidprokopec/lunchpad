@@ -41,7 +41,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::engine::{
-    Backend, BackendKind, Error, ErrorKind, MakeBackend, Notifier, Permission, Status,
+    AppStatus, Backend, BackendKind, Error, ErrorKind, MakeBackend, Notifier, Permission,
 };
 use super::model::{
     group, slugify, valid_device_id, windows_app_id, windows_app_name, App, Device, DeviceKind,
@@ -224,7 +224,7 @@ pub struct WinBackend {
 pub fn make() -> MakeBackend {
     Box::new(|notifier| {
         let unavailable = |what: &str, e: windows::core::Error| {
-            Status::unavailable(BackendKind::WindowsCoreAudio, format!("{what} failed: {e}"))
+            AppStatus::unavailable(BackendKind::WindowsCoreAudio, format!("{what} failed: {e}"))
         };
         // SAFETY: called once on the worker thread that will own every COM object.
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
@@ -540,6 +540,7 @@ impl WinBackend {
                             muted: muted.is_some_and(|v| v.as_bool()),
                             can_set_volume: volume.is_some(),
                             can_mute: muted.is_some(),
+                            emulated: false,
                         });
                         if let Some(control) = control {
                             controls.push(control);
@@ -630,17 +631,17 @@ impl Backend for WinBackend {
         unsafe { control.SetMute(muted, std::ptr::null()) }
             .map_err(|e| device_error("IAudioEndpointVolume::SetMute", e))
     }
-    fn status(&self) -> Status {
+    fn status(&self) -> AppStatus {
         match self.endpoint {
-            Some(_) => Status {
+            Some(_) => AppStatus {
                 backend: BackendKind::WindowsCoreAudio,
                 available: true,
                 can_set_volume: true,
                 can_mute: true,
-                permission: Permission::NotRequired,
+                permission: Permission::Granted,
                 message: String::new(),
             },
-            None => Status::unavailable(BackendKind::WindowsCoreAudio, self.last_error.clone()),
+            None => AppStatus::unavailable(BackendKind::WindowsCoreAudio, self.last_error.clone()),
         }
     }
 

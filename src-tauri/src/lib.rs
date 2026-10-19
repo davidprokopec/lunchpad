@@ -270,7 +270,7 @@ pub fn run() {
             let home_assistant = homeassistant::HaHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime);
             let hub = hub::HubHandle::spawn(app.handle().clone(), settings.clone());
             // Devices and per-app volume, live. Taps (macOS per-app volume) only on request.
-            let macos_taps = settings.lock().settings.system_audio.macos_taps;
+            let macos_taps = settings.lock().settings.audio.macos_app_volume;
             let sysaudio = sysaudio::SystemAudio::start(sysaudio::Options { macos_taps });
             sysaudio::forward_to_window(&sysaudio, app.handle().clone());
 

@@ -9,9 +9,16 @@
 //! most 3 s, and publish the resulting state afterwards. They block the calling
 //! thread, so async callers should use `spawn_blocking`.
 //!
+//! Writes are serialised FIFO: the single worker executes commands in the
+//! order they were accepted (ids are issued under the same lock as the send),
+//! so for any target a write accepted earlier is applied before one accepted
+//! later. A write is never reordered or retried; one that cannot be served in
+//! time fails with `Timeout` and later ones fail fast until the worker
+//! recovers.
+//!
 //! Ported from LaunchDeck's `native/audio` (the same author's MIT code), minus
 //! its C ABI. Per-app volume on macOS needs process taps, which are off unless
-//! the `system_audio.macos_taps` setting enables them.
+//! the `audio.macosAppVolume` setting enables them.
 
 mod engine;
 mod hub;
@@ -24,11 +31,11 @@ mod macos_taps;
 #[cfg(windows)]
 mod windows;
 
-pub use engine::{BackendKind, Error, ErrorKind, Permission, Status};
+pub use engine::{BackendKind, Error, ErrorKind, Permission};
 pub use hub::{Changes, Subscription};
 pub use model::{App, Device, DeviceKind};
 
-use engine::{Command, Engine, MakeBackend};
+use engine::{AppStatus, Command, Engine, MakeBackend};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Weak};
 
@@ -74,17 +81,59 @@ impl DeviceRef {
     }
 }
 
-/// Everything at once, for the window.
+/// What works right now. Serialises to the frozen UI shape
+/// `{available, appsAvailable, permission, message?}` plus capability details.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Status {
+    pub backend: BackendKind,
+    /// Devices can be listed and controlled. False while the audio thread is
+    /// busy with a request that timed out, or when the backend is unavailable.
+    pub available: bool,
+    /// Apps can be listed.
+    pub apps_available: bool,
+    /// App volume can be changed (Windows; macOS with taps on).
+    pub can_set_app_volume: bool,
+    /// Apps can be muted.
+    pub can_mute_apps: bool,
+    /// Whether the OS lets Lunchpad change app volume.
+    pub permission: Permission,
+    /// Why something is unavailable or limited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl Status {
+    fn compose(apps: AppStatus, devices: &Result<Vec<Device>, Error>) -> Status {
+        let mut reasons: Vec<String> = Vec::new();
+        if let Err(e) = devices {
+            reasons.push(e.message.clone());
+        }
+        if !apps.message.is_empty() && !reasons.contains(&apps.message) {
+            reasons.push(apps.message);
+        }
+        Status {
+            backend: apps.backend,
+            available: devices.is_ok(),
+            apps_available: apps.available,
+            can_set_app_volume: apps.available && apps.can_set_volume,
+            can_mute_apps: apps.available && apps.can_mute,
+            permission: apps.permission,
+            message: (!reasons.is_empty()).then(|| reasons.join("; ")),
+        }
+    }
+}
+
+/// Everything at once, for the window: the frozen
+/// `{available, appsAvailable, permission, message?, devices, apps}` payload.
+/// Lists are empty while their side is unavailable; `message` says why.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioState {
+    #[serde(flatten)]
     pub status: Status,
     pub devices: Vec<Device>,
-    /// Why `devices` is empty, when the device side is unavailable.
-    pub devices_error: Option<Error>,
     pub apps: Vec<App>,
-    /// Why `apps` is empty, when the app side is unavailable.
-    pub apps_error: Option<Error>,
 }
 
 /// Handle to the system audio service. Cheap to clone; the worker stops when
@@ -109,10 +158,9 @@ impl SystemAudio {
         }
     }
 
-    /// The app side of the backend (listing, app volume/mute capability,
-    /// permission) and why it is unavailable.
+    /// What works right now (devices, apps, permission) and why not.
     pub fn status(&self) -> Status {
-        self.engine.status()
+        Status::compose(self.engine.status(), &self.devices())
     }
 
     /// Every input and output device, keyed by `(id, kind)`, sorted by id then kind.
@@ -134,15 +182,22 @@ impl SystemAudio {
         self.engine.list()
     }
 
+    /// The app with this id, if it is listed now.
+    pub fn app(&self, id: &str) -> Result<App, Error> {
+        validate_app(id)?;
+        self.apps()?
+            .into_iter()
+            .find(|a| a.id == id)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no audio app with id {id}")))
+    }
+
     pub fn state(&self) -> AudioState {
-        let (devices, devices_error) = split(self.devices());
-        let (apps, apps_error) = split(self.apps());
+        let devices = self.devices();
+        let status = Status::compose(self.engine.status(), &devices);
         AudioState {
-            status: self.status(),
-            devices,
-            devices_error,
-            apps,
-            apps_error,
+            status,
+            devices: devices.unwrap_or_default(),
+            apps: self.apps().unwrap_or_default(),
         }
     }
 
@@ -155,9 +210,15 @@ impl SystemAudio {
     }
 
     /// Mutes or unmutes a device with its real mute control (never by volume).
+    /// A device without one (`can_mute == false`) fails with `Unsupported`.
     /// Blocks for at most 3 s.
     pub fn set_muted(&self, target: &DeviceRef, muted: bool) -> Result<(), Error> {
         let device = self.device(target)?;
+        // Seam for mute emulation (pending user decision 1): a device without a
+        // mute control would branch here to "volume 0, remember the level
+        // persistently, restore it on unmute", and the snapshot would report it
+        // muted with `emulated: true`. Not built yet, so the worker's
+        // capability check rejects such devices.
         self.engine
             .command(Command::DeviceMute(device.id, device.kind, muted))
     }
@@ -234,19 +295,12 @@ fn platform(options: Options) -> (BackendKind, MakeBackend) {
         (
             BackendKind::None,
             Box::new(|_| {
-                Err(Status::unavailable(
+                Err(AppStatus::unavailable(
                     BackendKind::None,
                     "system audio control is not supported on this platform",
                 ))
             }),
         )
-    }
-}
-
-fn split<T>(result: Result<Vec<T>, Error>) -> (Vec<T>, Option<Error>) {
-    match result {
-        Ok(items) => (items, None),
-        Err(e) => (Vec::new(), Some(e)),
     }
 }
 
@@ -312,17 +366,18 @@ mod tests {
             is_default,
             can_set_volume: true,
             can_mute: true,
+            emulated: false,
         }
     }
 
     impl Backend for Mock {
-        fn status(&self) -> Status {
-            Status {
+        fn status(&self) -> AppStatus {
+            AppStatus {
                 backend: BackendKind::None,
                 available: true,
                 can_set_volume: true,
                 can_mute: false,
-                permission: Permission::NotRequired,
+                permission: Permission::Granted,
                 message: String::new(),
             }
         }
@@ -526,13 +581,78 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_devices_and_apps_independently() {
+        let apps_ok = AppStatus {
+            backend: BackendKind::None,
+            available: true,
+            can_set_volume: true,
+            can_mute: true,
+            permission: Permission::Granted,
+            message: String::new(),
+        };
+        let ok = Status::compose(apps_ok.clone(), &Ok(vec![]));
+        assert!(ok.available && ok.apps_available && ok.can_mute_apps && ok.message.is_none());
+
+        let busy = Error::new(ErrorKind::Timeout, "the audio thread is busy");
+        let busy = Status::compose(apps_ok, &Err(busy));
+        assert!(!busy.available && busy.apps_available);
+        assert_eq!(busy.message.as_deref(), Some("the audio thread is busy"));
+
+        let old_macos = AppStatus::unavailable(BackendKind::MacosTap, "needs macOS 14.2");
+        let no_apps = Status::compose(old_macos, &Ok(vec![]));
+        assert!(no_apps.available && !no_apps.apps_available && !no_apps.can_set_app_volume);
+        assert_eq!(no_apps.permission, Permission::Unknown);
+        assert_eq!(no_apps.message.as_deref(), Some("needs macOS 14.2"));
+
+        let stopped = AppStatus::unavailable(BackendKind::None, "stopped");
+        let both = Status::compose(stopped, &Err(Error::new(ErrorKind::Unsupported, "stopped")));
+        assert_eq!(
+            both.message.as_deref(),
+            Some("stopped"),
+            "a shared reason is not repeated"
+        );
+
+        let values = [
+            Permission::Unknown,
+            Permission::Granted,
+            Permission::Denied,
+            Permission::Unconfirmed,
+        ]
+        .map(|p| serde_json::to_value(p).unwrap());
+        assert_eq!(values, ["unknown", "granted", "denied", "unconfirmed"]);
+    }
+
+    #[test]
+    fn single_apps_are_read_from_the_snapshot() {
+        let (audio, _, _) = mock();
+        assert_eq!(audio.app("a").unwrap().name, "A");
+        assert_eq!(
+            audio.app("missing").map_err(|e| e.kind),
+            Err(ErrorKind::NotFound)
+        );
+        assert_eq!(
+            audio.app("not an id").map_err(|e| e.kind),
+            Err(ErrorKind::InvalidArgument)
+        );
+    }
+
+    #[test]
     fn state_and_references_serialise_for_the_window() {
         let (audio, _, _) = mock();
         let state = serde_json::to_value(audio.state()).unwrap();
-        assert_eq!(state["status"]["backend"], "none");
-        assert_eq!(state["status"]["canSetVolume"], true);
+        // The frozen payload: {available, appsAvailable, permission, message?, devices, apps}.
+        assert_eq!(state["available"], true);
+        assert_eq!(state["appsAvailable"], true);
+        assert_eq!(state["permission"], "granted");
+        assert!(
+            state.get("message").is_none(),
+            "message only when something is limited"
+        );
+        assert_eq!(state["backend"], "none");
+        assert_eq!(state["canSetAppVolume"], true);
+        assert_eq!(state["canMuteApps"], false);
         assert_eq!(state["devices"].as_array().unwrap().len(), 3);
-        assert_eq!(state["devicesError"], serde_json::Value::Null);
+        assert_eq!(state["devices"][0]["emulated"], false);
         assert_eq!(state["apps"][0]["id"], "a");
         assert_eq!(
             serde_json::to_value(DeviceRef::DefaultInput).unwrap(),
@@ -563,7 +683,8 @@ mod tests {
         audio.shutdown();
         let state = watcher.state();
         assert!(state.devices.is_empty());
-        assert!(state.devices_error.is_some());
+        assert!(!state.status.available);
+        assert!(state.status.message.is_some());
         assert_eq!(
             watcher
                 .set_muted(&DeviceRef::DefaultInput, true)
@@ -578,7 +699,7 @@ mod tests {
         let audio = SystemAudio::start(Options::default());
         let status = audio.status();
         assert!(
-            !status.can_set_volume || !cfg!(target_os = "macos"),
+            !status.can_set_app_volume || !cfg!(target_os = "macos"),
             "taps stay off by default"
         );
         if let Ok(devices) = audio.devices() {

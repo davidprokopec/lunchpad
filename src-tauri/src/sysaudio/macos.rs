@@ -8,7 +8,7 @@
 //!
 //! Apps come from Core Audio process objects (macOS 14.2+), which need no TCC
 //! permission. App volume and mute use process taps and are only enabled with
-//! the `system_audio.macos_taps` setting (see `macos_taps`).
+//! the `audio.macosAppVolume` setting (see `macos_taps`).
 //!
 //! Core Audio declarations are hand-written from the SDK headers
 //! (AudioHardware.h, AudioHardwareBase.h).
@@ -23,7 +23,7 @@ use block2::RcBlock;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2_foundation::{NSBundle, NSString};
 
-use super::engine::{Backend, BackendKind, Error, ErrorKind, MakeBackend, Permission, Status};
+use super::engine::{AppStatus, Backend, BackendKind, Error, ErrorKind, MakeBackend, Permission};
 use super::macos_taps::Taps;
 use super::model::{
     app_bundle_name, basename, group, is_xpc_service, outermost_app, slugify, App, Member,
@@ -346,20 +346,20 @@ impl Backend for MacBackend {
     fn set_device_mute(&mut self, id: &str, kind: DeviceKind, muted: bool) -> Result<(), Error> {
         self.devices.set(id, kind, DEV_MUTE, u32::from(muted))
     }
-    fn status(&self) -> Status {
+    fn status(&self) -> AppStatus {
         if !self.process_available {
-            return Status::unavailable(BackendKind::MacosTap, "Core Audio process objects require macOS 14.2 or later; device audio remains available");
+            return AppStatus::unavailable(BackendKind::MacosTap, "Core Audio process objects require macOS 14.2 or later; device audio remains available");
         }
         match &self.taps {
-            None => Status {
+            None => AppStatus {
                 backend: BackendKind::MacosTap,
                 available: true,
                 can_set_volume: false,
                 can_mute: false,
-                permission: Permission::NotRequired,
-                message: "Listing only: per-app volume needs process taps (turn on systemAudio.macosTaps in the settings)".into(),
+                permission: Permission::Unknown,
+                message: "Listing only: per-app volume needs process taps (turn on audio.macosAppVolume in the settings)".into(),
             },
-            Some(taps) => Status {
+            Some(taps) => AppStatus {
                 backend: BackendKind::MacosTap,
                 available: true,
                 can_set_volume: true,
@@ -368,6 +368,7 @@ impl Backend for MacBackend {
                 message: match (taps.problem(), taps.permission()) {
                     (Some(problem), _) => problem.to_string(),
                     (None, Permission::Granted) => String::new(),
+                    (None, Permission::Unconfirmed) => "The System Audio Recording permission could not be confirmed: play audio in the app, then retry".into(),
                     (None, _) => "Process taps need the System Audio Recording permission; it is confirmed on the first change".into(),
                 },
             },
@@ -713,6 +714,7 @@ impl DeviceAudio {
                     can_set_volume: !volumes.is_empty()
                         && volumes.iter().all(|(a, _)| settable(object, a)),
                     can_mute: !mutes.is_empty() && mutes.iter().all(|(a, _)| settable(object, a)),
+                    emulated: false,
                 });
                 targets.push((id.clone(), kind, object));
             }

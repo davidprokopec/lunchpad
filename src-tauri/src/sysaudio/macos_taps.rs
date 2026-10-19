@@ -1,5 +1,5 @@
 //! Per-app volume and mute through Core Audio process taps (macOS 14.2+).
-//! Only reachable with the `system_audio.macos_taps` setting (off by default).
+//! Only reachable with the `audio.macosAppVolume` setting (off by default).
 //!
 //! UNVERIFIED: this path compiles but has never run (ported from LaunchDeck,
 //! where it was never ear-verified either). It needs the System Audio
@@ -600,7 +600,13 @@ impl Taps {
         }
         let output = default_output()?;
         if self.permission != Permission::Granted {
-            self.probe(processes, &output)?;
+            if let Err(e) = self.probe(processes, &output) {
+                // Silence is ambiguous; earlier evidence of denial (G1) stands.
+                if self.permission != Permission::Denied {
+                    self.permission = Permission::Unconfirmed;
+                }
+                return Err(e);
+            }
             self.permission = Permission::Granted;
         }
         let gain = if next.1 { 0.0 } else { next.0 };

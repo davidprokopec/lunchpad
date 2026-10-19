@@ -43,7 +43,13 @@ pub struct Device {
     pub muted: bool,
     pub is_default: bool,
     pub can_set_volume: bool,
+    /// The device has a real mute control (Core Audio mute property, endpoint
+    /// mute). `muted` reports that control.
     pub can_mute: bool,
+    /// Mute is emulated (volume 0 with the level remembered) because the device
+    /// has no mute control. Always false for now: emulation awaits a user
+    /// decision; see the seam in `SystemAudio::set_muted`.
+    pub emulated: bool,
 }
 
 pub fn valid_device_id(id: &str) -> bool {
@@ -322,10 +328,11 @@ mod tests {
             is_default: true,
             can_set_volume: true,
             can_mute: true,
+            emulated: false,
         };
         assert_eq!(
             serde_json::to_value(&device).unwrap(),
-            serde_json::json!({"id":"uid","name":"Mic","kind":"input","volume":0.5,"muted":true,"isDefault":true,"canSetVolume":true,"canMute":true})
+            serde_json::json!({"id":"uid","name":"Mic","kind":"input","volume":0.5,"muted":true,"isDefault":true,"canSetVolume":true,"canMute":true,"emulated":false})
         );
         let app = App {
             id: "a".into(),

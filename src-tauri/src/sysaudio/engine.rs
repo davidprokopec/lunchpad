@@ -68,18 +68,24 @@ pub enum BackendKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// Whether the OS lets Lunchpad change app volume (frozen UI values
+/// `unknown | granted | denied | unconfirmed`).
 pub enum Permission {
+    /// Not checked yet, or not relevant because per-app control is off.
     Unknown,
+    /// Confirmed, or no permission is needed (Windows sessions).
     Granted,
+    /// Evidence of denial: a muted tap stayed silent while its app played (G1).
     Denied,
-    NotRequired,
+    /// A check ran but could not prove the permission (silence is ambiguous).
+    Unconfirmed,
 }
 
 /// The per-app side of the backend. Devices have their own availability: the
 /// device list is an error when they are unavailable.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Status {
+pub struct AppStatus {
     pub backend: BackendKind,
     /// App listing works. When false, `message` says why.
     pub available: bool,
@@ -91,14 +97,14 @@ pub struct Status {
     pub message: String,
 }
 
-impl Status {
-    pub fn unavailable(backend: BackendKind, message: impl Into<String>) -> Status {
-        Status {
+impl AppStatus {
+    pub fn unavailable(backend: BackendKind, message: impl Into<String>) -> AppStatus {
+        AppStatus {
             backend,
             available: false,
             can_set_volume: false,
             can_mute: false,
-            permission: Permission::NotRequired,
+            permission: Permission::Unknown,
             message: message.into(),
         }
     }
@@ -106,7 +112,7 @@ impl Status {
 
 /// A platform backend. Constructed and used only on the engine's worker thread.
 pub trait Backend {
-    fn status(&self) -> Status;
+    fn status(&self) -> AppStatus;
     /// How often to refresh without a `Dirty` notification.
     fn poll_interval(&self) -> Duration;
     /// The complete, grouped app list.
@@ -189,7 +195,7 @@ struct Shared {
     hub: Hub,
     apps: Mutex<Vec<App>>,
     devices: Mutex<Result<Vec<Device>, Error>>,
-    status: Mutex<Status>,
+    status: Mutex<AppStatus>,
     /// Set (under the `status` lock) when `start` gave up waiting for the
     /// worker. From then on the worker may no longer publish a status, so a
     /// late start cannot flip the handle back to available.
@@ -219,7 +225,7 @@ impl Shared {
             hub: Hub::default(),
             apps: Mutex::new(Vec::new()),
             devices: Mutex::new(Err(Error::new(ErrorKind::Unsupported, "starting"))),
-            status: Mutex::new(Status::unavailable(kind, "starting")),
+            status: Mutex::new(AppStatus::unavailable(kind, "starting")),
             detached: AtomicBool::new(false),
             requests: Mutex::new(Requests::default()),
             running: AtomicBool::new(false),
@@ -284,7 +290,7 @@ impl Shared {
     }
 
     /// The worker's only way to change the status (see `detached`).
-    fn publish_status(&self, status: Status) {
+    fn publish_status(&self, status: AppStatus) {
         let mut current = lock(&self.status);
         if !self.detached.load(Ordering::Acquire) && *current != status {
             *current = status;
@@ -307,7 +313,7 @@ pub struct Engine {
 
 /// Builds the backend on the worker thread. On failure, the status explains why
 /// the backend is unavailable.
-pub type MakeBackend = Box<dyn FnOnce(Notifier) -> Result<Box<dyn Backend>, Status> + Send>;
+pub type MakeBackend = Box<dyn FnOnce(Notifier) -> Result<Box<dyn Backend>, AppStatus> + Send>;
 
 impl Engine {
     /// Starts the worker, builds the backend there and waits (at most 5 s) for
@@ -341,7 +347,7 @@ impl Engine {
                     *lock(&panicked.devices) =
                         Err(Error::new(ErrorKind::Native, "the audio thread panicked"));
                     panicked.hub.notify(Changes::DEVICES | Changes::APPS);
-                    panicked.publish_status(Status::unavailable(
+                    panicked.publish_status(AppStatus::unavailable(
                         kind,
                         format!("the audio thread panicked: {}", panic_message(&*panic)),
                     ));
@@ -357,7 +363,7 @@ impl Engine {
             Ok(join) => join,
             Err(e) => {
                 *lock(&shared.status) =
-                    Status::unavailable(kind, format!("cannot start the audio thread: {e}"));
+                    AppStatus::unavailable(kind, format!("cannot start the audio thread: {e}"));
                 return engine(None);
             }
         };
@@ -372,7 +378,7 @@ impl Engine {
                 {
                     let mut status = lock(&shared.status);
                     shared.detached.store(true, Ordering::Release);
-                    *status = Status::unavailable(
+                    *status = AppStatus::unavailable(
                         kind,
                         format!(
                             "the audio backend did not start within {} s",
@@ -386,7 +392,7 @@ impl Engine {
         }
     }
 
-    pub fn status(&self) -> Status {
+    pub fn status(&self) -> AppStatus {
         lock(&self.shared.status).clone()
     }
 
@@ -517,7 +523,9 @@ fn run_worker(
             *lock(&shared.apps) = apps;
             shared.publish_status(backend.status());
         }
-        Err(e) => shared.publish_status(Status::unavailable(backend.status().backend, e.message)),
+        Err(e) => {
+            shared.publish_status(AppStatus::unavailable(backend.status().backend, e.message))
+        }
     }
     let devices = backend.devices();
     *lock(&shared.devices) = devices;
@@ -651,7 +659,9 @@ fn refresh_with(
             shared.publish_apps(next, applied.apps);
             shared.publish_status(backend.status());
         }
-        Err(e) => shared.publish_status(Status::unavailable(backend.status().backend, e.message)),
+        Err(e) => {
+            shared.publish_status(AppStatus::unavailable(backend.status().backend, e.message))
+        }
     }
 }
 
@@ -675,8 +685,8 @@ mod tests {
     }
 
     impl Backend for DeviceScript {
-        fn status(&self) -> Status {
-            Status::unavailable(BackendKind::None, "no app endpoint")
+        fn status(&self) -> AppStatus {
+            AppStatus::unavailable(BackendKind::None, "no app endpoint")
         }
         fn poll_interval(&self) -> Duration {
             Duration::from_secs(60)
@@ -747,6 +757,7 @@ mod tests {
                         is_default: true,
                         can_set_volume: true,
                         can_mute: kind == DeviceKind::Input,
+                        emulated: false,
                     })
                     .to_vec(),
             )),
@@ -765,7 +776,7 @@ mod tests {
     }
 
     impl Backend for GatedDevices {
-        fn status(&self) -> Status {
+        fn status(&self) -> AppStatus {
             Tunable::default().status()
         }
         fn poll_interval(&self) -> Duration {
@@ -988,13 +999,13 @@ mod tests {
     }
 
     impl Backend for Scripted {
-        fn status(&self) -> Status {
-            Status {
+        fn status(&self) -> AppStatus {
+            AppStatus {
                 backend: BackendKind::None,
                 available: true,
                 can_set_volume: true,
                 can_mute: false,
-                permission: Permission::NotRequired,
+                permission: Permission::Granted,
                 message: String::new(),
             }
         }
@@ -1089,18 +1100,19 @@ mod tests {
                 is_default: true,
                 can_set_volume: true,
                 can_mute: true,
+                emulated: false,
             }])
         }
         fn set_device_volume(&mut self, _: &str, _: DeviceKind, volume: f32) -> Result<(), Error> {
             self.set_volume("a", volume)
         }
-        fn status(&self) -> Status {
-            Status {
+        fn status(&self) -> AppStatus {
+            AppStatus {
                 backend: BackendKind::None,
                 available: true,
                 can_set_volume: true,
                 can_mute: false,
-                permission: Permission::NotRequired,
+                permission: Permission::Granted,
                 message: String::new(),
             }
         }
@@ -1134,6 +1146,92 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(2);
+
+    /// Records every write and holds it until released.
+    struct Ordered {
+        calls: Arc<Mutex<Vec<String>>>,
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Ordered {
+        fn write(&mut self, call: String) -> Result<(), Error> {
+            lock(&self.calls).push(call);
+            self.entered.send(()).expect("write entered");
+            self.release.recv().expect("release write");
+            Ok(())
+        }
+    }
+
+    impl Backend for Ordered {
+        fn status(&self) -> AppStatus {
+            Tunable::default().status()
+        }
+        fn poll_interval(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn snapshot(&mut self) -> Result<Vec<App>, Error> {
+            Ok(vec![app("a")])
+        }
+        fn devices(&mut self) -> Result<Vec<Device>, Error> {
+            Tunable::default().devices()
+        }
+        fn set_volume(&mut self, _: &str, volume: f32) -> Result<(), Error> {
+            self.write(format!("app {volume}"))
+        }
+        fn set_mute(&mut self, _: &str, _: bool) -> Result<(), Error> {
+            unreachable!("can_mute is false")
+        }
+        fn set_device_volume(&mut self, _: &str, _: DeviceKind, volume: f32) -> Result<(), Error> {
+            self.write(format!("device {volume}"))
+        }
+    }
+
+    #[test]
+    fn writes_are_applied_in_the_order_they_were_accepted() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let backend = Ordered {
+            calls: Arc::clone(&calls),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let mut engine = Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
+        // Long enough that no write in this test times out.
+        engine.command_timeout = Duration::from_secs(10);
+        let issued = |engine: &Engine| lock(&engine.shared.requests).issued;
+        let writes = [
+            Command::AppVolume("a".into(), 0.1),
+            Command::DeviceVolume("device".into(), DeviceKind::Output, 0.2),
+            Command::AppVolume("a".into(), 0.3),
+            Command::DeviceVolume("device".into(), DeviceKind::Output, 0.4),
+        ];
+        std::thread::scope(|scope| {
+            let mut requests = Vec::new();
+            for (n, write) in writes.into_iter().enumerate() {
+                let engine = &engine;
+                requests.push(scope.spawn(move || engine.command(write)));
+                // The next write is only started once this one was accepted.
+                wait_until(|| issued(engine) == n as u64 + 1);
+                if n == 0 {
+                    entered
+                        .recv_timeout(WAIT)
+                        .expect("first write holds the worker");
+                }
+            }
+            for _ in 0..4 {
+                release.send(()).expect("release a write");
+            }
+            for request in requests {
+                assert_eq!(request.join().expect("request"), Ok(()));
+            }
+        });
+        assert_eq!(
+            *lock(&calls),
+            ["app 0.1", "device 0.2", "app 0.3", "device 0.4"]
+        );
+    }
 
     #[test]
     fn shutdown_is_bounded_idempotent_and_stops_service() {
@@ -1337,7 +1435,7 @@ mod tests {
     }
 
     impl Backend for TwoGates {
-        fn status(&self) -> Status {
+        fn status(&self) -> AppStatus {
             Tunable::default().status()
         }
         fn poll_interval(&self) -> Duration {
@@ -1567,7 +1665,7 @@ mod tests {
         let engine = Engine::start(
             BackendKind::WindowsCoreAudio,
             Box::new(|_| {
-                Err(Status::unavailable(
+                Err(AppStatus::unavailable(
                     BackendKind::WindowsCoreAudio,
                     "no endpoint",
                 ))
