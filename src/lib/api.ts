@@ -177,6 +177,8 @@ export interface PushToTalkSettings {
 export interface AudioSettings {
   /** null = system default device */
   outputDevice: string | null;
+  /** Experimental macOS process taps; persisted opt-in, default false. */
+  macosAppVolume: boolean;
 }
 
 export interface ObsSettings {
@@ -520,6 +522,9 @@ export interface AudioStatus {
   available: boolean;
   /** apps can be listed (and, with the permission, controlled) */
   appsAvailable: boolean;
+  /** Listing alone does not imply either app control is supported. */
+  canSetAppVolume: boolean;
+  canMuteApps: boolean;
   permission: AudioPermission;
   /** why something is unavailable */
   message: string | null;

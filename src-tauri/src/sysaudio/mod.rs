@@ -34,6 +34,8 @@ mod macos_taps;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(test)]
+pub(crate) use engine::{AppStatus as TestAppStatus, Backend};
 pub use engine::{BackendKind, Error, ErrorKind, Permission};
 pub use hub::{Changes, Subscription};
 pub use model::{App, Device, DeviceKind};
@@ -41,10 +43,7 @@ pub use model::{App, Device, DeviceKind};
 use engine::{AppStatus, Command, Engine, MakeBackend};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::{Arc, Weak};
-
-/// Tauri event carrying an [`AudioState`] whenever devices, apps or the status change.
-pub const EVENT_AUDIO_STATE: &str = "audio:state";
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -149,6 +148,23 @@ pub struct SystemAudio {
 }
 
 impl SystemAudio {
+    #[cfg(test)]
+    pub(crate) fn with_test_backend(
+        make: impl FnOnce() -> Box<dyn Backend> + Send + 'static,
+        config_dir: Option<&Path>,
+    ) -> Self {
+        let make: MakeBackend = Box::new(move |_| Ok(make()));
+        Self {
+            engine: Arc::new(Engine::start(
+                BackendKind::None,
+                emulation::wrap(make, config_dir.map(Path::to_path_buf)),
+            )),
+        }
+    }
+    /// Apply options on this service's existing worker. Disabling drops tap resources.
+    pub fn configure(&self, options: Options) -> Result<(), Error> {
+        self.engine.command(Command::Configure(options))
+    }
     /// Starts the platform backend. Waits for the first snapshot (normally
     /// milliseconds, at most 5 s). Never fails: an unavailable backend is
     /// reported through [`SystemAudio::status`] and errors.
@@ -262,34 +278,6 @@ impl SystemAudio {
     /// Waits at most 2 s. Every later call reports the service as stopped.
     pub fn shutdown(&self) {
         self.engine.shutdown();
-    }
-
-    fn downgrade(&self) -> Weak<Engine> {
-        Arc::downgrade(&self.engine)
-    }
-}
-
-/// Emits [`EVENT_AUDIO_STATE`] to the window on every change, from a thread of
-/// its own. The thread does not keep the service alive.
-pub fn forward_to_window(audio: &SystemAudio, app: tauri::AppHandle) {
-    use tauri::Emitter;
-    let subscription = audio.subscribe();
-    let engine = audio.downgrade();
-    let spawned = std::thread::Builder::new()
-        .name("lunchpad-sysaudio-events".into())
-        .spawn(move || {
-            while subscription.recv().is_some() {
-                let Some(engine) = engine.upgrade() else {
-                    break;
-                };
-                let state = SystemAudio { engine }.state();
-                if let Err(e) = app.emit(EVENT_AUDIO_STATE, state) {
-                    tracing::debug!(error = %e, "audio state not delivered to the window");
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "audio state events could not be started");
     }
 }
 

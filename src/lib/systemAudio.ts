@@ -7,7 +7,7 @@ export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "de
 export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null) {
   if (!target || !status) return null;
   if (target.type === "app") {
-    if (!status.appsAvailable || status.permission === "denied" || status.permission === "unconfirmed") return null;
+    if (!status.appsAvailable) return null;
     return status.apps.find((a) => a.id === target.app.id && a.present) ?? null;
   }
   if (!status.available) return null;
@@ -19,11 +19,12 @@ export function audioState(target: AudioTarget | null | undefined, status: Audio
 
 export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume") {
   const state = audioState(target, status);
+  if (target.type === "app") return !!state && !!status && (control === "volume" ? status.canSetAppVolume : status.canMuteApps);
   return !!state && (!("canSetVolume" in state) || (control === "volume" ? state.canSetVolume : state.canMute || state.emulated));
 }
 
 export function audioFader(fader: Fader, status: AudioStatus | null): Fader {
   if (!fader.bound) return fader;
-  const state = audioState(fader.bound, status);
+  const state = audioControllable(fader.bound, status) ? audioState(fader.bound, status) : null;
   return { ...fader, value: state && !state.muted ? fader.min + (fader.max - fader.min) * state.volume : fader.min };
 }

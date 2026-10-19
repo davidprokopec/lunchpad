@@ -343,7 +343,7 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
             let device = device.as_deref().map(|d| ctx.expand(d));
             // Through the system audio backend when there is one (real mute, or the shared
             // emulation for devices without one); the one-shot tools otherwise.
-            match services.system_audio.as_ref().filter(|sa| sa.available()) {
+            match services.system_audio.as_ref().filter(|sa| !sa.legacy_volume_fallback()) {
                 Some(sa) => {
                     let kind = match target {
                         SystemVolumeTarget::Output => AudioDeviceKind::Output,

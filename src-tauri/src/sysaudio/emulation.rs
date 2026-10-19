@@ -235,6 +235,9 @@ impl Emulated {
 }
 
 impl Backend for Emulated {
+    fn configure(&mut self, options: super::Options) -> Result<(), Error> {
+        self.backend.configure(options)
+    }
     fn status(&self) -> AppStatus {
         self.backend.status()
     }

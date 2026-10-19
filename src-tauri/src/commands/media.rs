@@ -97,14 +97,65 @@ pub async fn stop_all_sounds(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn set_audio_settings(config: AudioSettings, app: AppHandle, state: State<'_, AppState>) -> CmdResult<Settings> {
-    let settings = {
-        let mut st = state.settings.lock();
-        st.settings.audio = config;
-        st.save().map_err(err)?;
-        st.settings.clone()
-    };
+    let _write = state.audio_settings_write.lock().await;
+    let applied = update_audio_settings(&state.settings, &state.system_audio, config).await;
+    let settings = state.settings.lock().settings.clone();
     let _ = app.emit(super::settings::EVENT_SETTINGS, &settings);
+    applied?;
     Ok(settings)
+}
+
+async fn update_audio_settings(settings: &crate::config::SharedSettings, audio: &crate::system_audio::SystemAudio, config: AudioSettings) -> CmdResult<()> {
+    let enabled = {
+        let mut st = settings.lock();
+        let before = st.settings.audio.clone();
+        st.settings.audio = config;
+        if let Err(e) = st.save() {
+            st.settings.audio = before;
+            return Err(err(e));
+        }
+        st.settings.audio.macos_app_volume
+    };
+    audio.run(move |port| port.configure(enabled)).await
+}
+
+#[cfg(test)]
+mod audio_settings_tests {
+    use super::*;
+    use crate::config::SettingsStore;
+    use crate::system_audio::{AudioControl, SystemAudio};
+    use crate::system_audio_adapter::{NativeAudio, tests::fixture};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn persisted_opt_in_defaults_off_and_applies_to_the_same_service() {
+        let dir = std::env::temp_dir().join(format!("lunchpad-audio-settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = Arc::new(Mutex::new(SettingsStore::load(&dir)));
+        assert!(!settings.lock().settings.audio.macos_app_volume);
+        let old: AudioSettings = serde_json::from_str(r#"{"outputDevice":null}"#).unwrap();
+        assert!(!old.macos_app_volume);
+        let (service, state) = fixture(Some(&dir));
+        let port = Arc::new(NativeAudio::new(service.clone()));
+        let audio = SystemAudio::new(port.clone(), Default::default());
+        update_audio_settings(&settings, &audio, old).await.unwrap();
+        assert_eq!(state.lock().configurations, vec![false], "default settings never opt in");
+        let enabled = AudioSettings { output_device: Some("speaker".into()), macos_app_volume: true };
+        update_audio_settings(&settings, &audio, enabled.clone()).await.unwrap();
+        assert_eq!(SettingsStore::load(&dir).settings.audio, enabled);
+        assert_eq!(serde_json::to_value(&settings.lock().settings).unwrap()["audio"]["macosAppVolume"], true);
+        assert!(port.status().can_set_app_volume);
+        port.set_app_muted("music", true).unwrap();
+        update_audio_settings(&settings, &audio, AudioSettings { macos_app_volume: false, ..enabled }).await.unwrap();
+        assert!(!SettingsStore::load(&dir).settings.audio.macos_app_volume);
+        assert_eq!(state.lock().configurations, vec![false, true, false]);
+        assert_eq!(state.lock().writes, 1, "settings only reconfigure, never issue audio setters");
+        assert!(!port.apps().unwrap()[0].muted, "disable tears down the mock control on the same service");
+        assert!(!port.status().can_mute_apps && port.status().apps_available);
+        service.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 /// Basename of a path, for labels.

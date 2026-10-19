@@ -337,6 +337,16 @@ pub fn make(options: Options) -> MakeBackend {
 }
 
 impl Backend for MacBackend {
+    fn configure(&mut self, options: Options) -> Result<(), Error> {
+        if !options.macos_taps {
+            // Drop all controls on their owning worker; leave listing enabled.
+            self.taps = None;
+        } else if self.taps.is_none() && self.process_available {
+            // Taps::new creates no native tap. Only an explicit setter probes.
+            self.taps = Some(Taps::new());
+        }
+        Ok(())
+    }
     fn devices(&mut self) -> Result<Vec<Device>, Error> {
         self.devices.snapshot()
     }

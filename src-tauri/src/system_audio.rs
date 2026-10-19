@@ -75,6 +75,8 @@ pub struct AudioStatus {
     pub available: bool,
     /// Apps can be listed (and, with the permission, controlled).
     pub apps_available: bool,
+    pub can_set_app_volume: bool,
+    pub can_mute_apps: bool,
     pub permission: AudioPermission,
     /// Why something is unavailable.
     pub message: Option<String>,
@@ -83,6 +85,14 @@ pub struct AudioStatus {
 /// The port a platform backend implements. Calls may block briefly; Lunchpad
 /// makes them from its own threads, never from the async runtime. Volumes are 0..1.
 pub trait AudioControl: Send + Sync + 'static {
+    /// Only platforms without a native service may use the old one-shot tools.
+    /// Temporary unavailability must never bypass native FIFO/timeout fences.
+    fn legacy_volume_fallback(&self) -> bool {
+        false
+    }
+    fn configure(&self, _macos_app_volume: bool) -> Result<(), String> {
+        Ok(())
+    }
     fn status(&self) -> AudioStatus;
     /// Every device in both directions; `present` is true for all of them.
     fn devices(&self) -> Result<Vec<AudioDevice>, String>;
@@ -96,13 +106,39 @@ pub trait AudioControl: Send + Sync + 'static {
     fn set_app_muted(&self, id: &str, muted: bool) -> Result<(), String>;
     /// One message per change of devices, apps or status (bursts are fine; the
     /// bridge coalesces them). The channel closing ends the subscription.
-    fn subscribe(&self) -> Receiver<()>;
+    fn subscribe(&self) -> AudioSubscription;
+}
+
+/// The native subscription is consumed directly: no forwarding thread or service
+/// handle is retained. Dropping this value unsubscribes from the native hub.
+pub enum AudioSubscription {
+    Channel(Receiver<()>),
+    Native(crate::sysaudio::Subscription),
+}
+
+impl AudioSubscription {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<(), std::sync::mpsc::RecvTimeoutError> {
+        match self {
+            Self::Native(subscription) => subscription.recv_timeout(timeout).map(|_| ()),
+            Self::Channel(rx) => rx.recv_timeout(timeout).map_err(|e| match e {
+                crossbeam_channel::RecvTimeoutError::Timeout => {
+                    std::sync::mpsc::RecvTimeoutError::Timeout
+                }
+                crossbeam_channel::RecvTimeoutError::Disconnected => {
+                    std::sync::mpsc::RecvTimeoutError::Disconnected
+                }
+            }),
+        }
+    }
 }
 
 /// The port when no backend is wired in: nothing is available.
 pub struct NoAudio;
 
 impl AudioControl for NoAudio {
+    fn legacy_volume_fallback(&self) -> bool {
+        true
+    }
     fn status(&self) -> AudioStatus {
         AudioStatus {
             message: Some("system audio is not available in this build".into()),
@@ -127,9 +163,9 @@ impl AudioControl for NoAudio {
     fn set_app_muted(&self, _: &str, _: bool) -> Result<(), String> {
         Err("system audio is not available".into())
     }
-    fn subscribe(&self) -> Receiver<()> {
+    fn subscribe(&self) -> AudioSubscription {
         // The sender is gone at once: the subscription ends after the first look.
-        unbounded().1
+        AudioSubscription::Channel(unbounded().1)
     }
 }
 
@@ -138,6 +174,8 @@ impl AudioControl for NoAudio {
 pub struct SystemAudioState {
     pub available: bool,
     pub apps_available: bool,
+    pub can_set_app_volume: bool,
+    pub can_mute_apps: bool,
     pub devices: Vec<AudioDevice>,
     pub apps: Vec<AudioApp>,
 }
@@ -203,8 +241,8 @@ impl SystemAudioState {
                     },
                     volume: found.volume,
                     muted: found.muted,
-                    can_mute: true,
-                    can_set_volume: true,
+                    can_mute: self.can_mute_apps,
+                    can_set_volume: self.can_set_app_volume,
                     emulated: false,
                 })
             }
@@ -228,6 +266,8 @@ pub fn read_state(port: &dyn AudioControl) -> SystemAudioState {
     SystemAudioState {
         available: devices.is_some(),
         apps_available: apps.is_some(),
+        can_set_app_volume: apps.is_some() && status.can_set_app_volume,
+        can_mute_apps: apps.is_some() && status.can_mute_apps,
         devices: devices.unwrap_or_default(),
         apps: apps.unwrap_or_default(),
     }
@@ -239,6 +279,8 @@ pub fn read_state(port: &dyn AudioControl) -> SystemAudioState {
 pub struct AudioReport {
     pub available: bool,
     pub apps_available: bool,
+    pub can_set_app_volume: bool,
+    pub can_mute_apps: bool,
     pub permission: AudioPermission,
     pub message: Option<String>,
     pub devices: Vec<AudioDevice>,
@@ -290,6 +332,8 @@ pub fn report(status: AudioStatus, state: &SystemAudioState, profile: &Profile) 
     AudioReport {
         available: state.available,
         apps_available: state.apps_available,
+        can_set_app_volume: state.can_set_app_volume,
+        can_mute_apps: state.can_mute_apps,
         permission: status.permission,
         message: status.message,
         devices,
@@ -337,7 +381,8 @@ pub fn saved_targets(profile: &Profile) -> Vec<AudioTarget> {
 fn set_muted(port: &dyn AudioControl, key: &Resolved, muted: bool) -> Result<(), String> {
     match key {
         Resolved::Device { id, kind } => port.set_device_muted(id, *kind, muted),
-        Resolved::App { id } => port.set_app_muted(id, muted),
+        Resolved::App { id } if port.status().can_mute_apps => port.set_app_muted(id, muted),
+        Resolved::App { .. } => Err("app mute is not available".into()),
     }
 }
 
@@ -349,7 +394,8 @@ fn set_volume(port: &dyn AudioControl, key: &Resolved, volume: f32) -> Result<()
     };
     match key {
         Resolved::Device { id, kind } => port.set_device_volume(id, *kind, volume),
-        Resolved::App { id } => port.set_app_volume(id, volume),
+        Resolved::App { id } if port.status().can_set_app_volume => port.set_app_volume(id, volume),
+        Resolved::App { .. } => Err("app volume is not available".into()),
     }
 }
 
@@ -476,9 +522,8 @@ impl SystemAudio {
         &self.port
     }
 
-    /// Devices can be controlled right now.
-    pub fn available(&self) -> bool {
-        self.port.status().available
+    pub fn legacy_volume_fallback(&self) -> bool {
+        self.port.legacy_volume_fallback()
     }
 
     /// The target as the last change event left it (what the LEDs show).
@@ -719,6 +764,8 @@ impl FakeAudio {
             st.status = AudioStatus {
                 available: true,
                 apps_available: true,
+                can_set_app_volume: true,
+                can_mute_apps: true,
                 permission: AudioPermission::Granted,
                 message: None,
             };
@@ -862,10 +909,10 @@ impl AudioControl for FakeAudio {
         self.notify();
         Ok(())
     }
-    fn subscribe(&self) -> Receiver<()> {
+    fn subscribe(&self) -> AudioSubscription {
         let (tx, rx) = unbounded();
         self.subscribers.lock().push(tx);
-        rx
+        AudioSubscription::Channel(rx)
     }
 }
 

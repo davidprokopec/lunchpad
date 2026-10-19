@@ -9,7 +9,6 @@ pub mod macros;
 pub mod media;
 pub mod profile;
 pub mod settings;
-pub mod sysaudio;
 
 use crate::audio::AudioHandle;
 use crate::config::SharedSettings;
@@ -37,6 +36,8 @@ pub struct AppState {
     pub sysaudio: crate::sysaudio::SystemAudio,
     pub hub: crate::hub::HubHandle,
     pub system_audio: crate::system_audio::SystemAudio,
+    pub audio_bridge: Mutex<Option<crate::system_audio_bridge::BridgeHandle>>,
+    pub audio_settings_write: tokio::sync::Mutex<()>,
     /// Profiles before each edit made from the UI, newest last (undo).
     pub history: Mutex<Vec<crate::profile::Profile>>,
     /// Profiles undone, newest last (redo); cleared by the next edit.
@@ -58,4 +59,3 @@ pub use macros::*;
 pub use media::*;
 pub use profile::*;
 pub use settings::*;
-pub use sysaudio::*;

@@ -8,6 +8,10 @@ use crate::live::LiveHandle;
 use crate::macros::MacroEngine;
 use crate::profile::SharedProfile;
 use crate::system_audio::{read_state, report, AudioReport, SystemAudio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -25,24 +29,59 @@ pub struct Bridge {
     pub app: Option<AppHandle>,
 }
 
+pub struct BridgeHandle {
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for BridgeHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl Bridge {
     /// Follow the backend on a thread of its own until its subscription ends.
-    pub fn spawn(self) {
+    pub fn spawn(self) -> BridgeHandle {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let changes = self.audio.port().subscribe();
         let spawned = std::thread::Builder::new()
             .name("lunchpad-system-audio".into())
             .spawn(move || {
-                let changes = self.audio.port().subscribe();
                 self.refresh();
-                while changes.recv().is_ok() {
+                while !stopping.load(Ordering::Acquire) {
+                    match changes.recv_timeout(COALESCE) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                     let until = Instant::now() + COALESCE;
-                    while changes.recv_deadline(until).is_ok() {}
+                    while changes
+                        .recv_timeout(until.saturating_duration_since(Instant::now()))
+                        .is_ok()
+                    {
+                        if Instant::now() >= until {
+                            break;
+                        }
+                    }
                     self.refresh();
                 }
+                // Native shutdown closes its hub; publish the terminal unavailable state.
+                self.refresh();
                 tracing::debug!("system audio subscription ended");
             });
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "the system audio bridge could not start");
-        }
+        let worker = match spawned {
+            Ok(worker) => Some(worker),
+            Err(e) => {
+                tracing::warn!(error = %e, "the system audio bridge could not start");
+                None
+            }
+        };
+        BridgeHandle { stop, worker }
     }
 
     /// Take one fresh look at the system and pass it on.

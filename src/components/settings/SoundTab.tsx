@@ -18,8 +18,7 @@ export function SoundTab() {
   const status = useMediaStore((s) => s.systemAudio);
   const refresh = useMediaStore((s) => s.loadSystemAudio);
   const [error, setError] = useState<string | null>(null);
-  // The control remains disabled until the backend exposes and persists this key.
-  const audio = settings?.audio as (NonNullable<typeof settings>["audio"] & { macosAppVolume?: boolean }) | undefined;
+  const audio = settings?.audio;
   const supported = typeof audio?.macosAppVolume === "boolean";
 
   useEffect(() => {
@@ -36,7 +35,7 @@ export function SoundTab() {
             { value: SYSTEM_DEFAULT, label: audioDevices?.default ? `${t("settings.systemDefaultDevice")} (${audioDevices.default})` : t("settings.systemDefaultDevice") },
             ...(audioDevices?.devices ?? []).map((d) => ({ value: d, label: d })),
           ]}
-          onChange={(v) => void setAudio({ ...settings?.audio, outputDevice: v === SYSTEM_DEFAULT ? null : v })}
+          onChange={(v) => { if (audio) void setAudio({ ...audio, outputDevice: v === SYSTEM_DEFAULT ? null : v }); }}
         />
         <Button size="sm" onClick={() => void loadAudioDevices()}>
           {t("settings.refreshDevices")}

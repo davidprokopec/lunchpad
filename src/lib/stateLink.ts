@@ -1,5 +1,5 @@
 import type { AudioStatus, ObsState, SlobsState, StateLink } from "./api";
-import { audioState } from "./systemAudio";
+import { audioControllable, audioState } from "./systemAudio";
 
 /**
  * Whether a button's "active while" link currently holds. Mirrors
@@ -7,7 +7,7 @@ import { audioState } from "./systemAudio";
  */
 export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null): boolean {
   if (!link) return false;
-  if (link.provider === "system") return link.kind === "audioMuted" && !!audioState(link.target, audio)?.muted;
+  if (link.provider === "system") return link.kind === "audioMuted" && !!link.target && audioControllable(link.target, audio, "mute") && !!audioState(link.target, audio)?.muted;
   const p =
     link.provider === "obs"
       ? obs && {

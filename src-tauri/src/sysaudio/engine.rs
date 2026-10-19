@@ -112,6 +112,9 @@ impl AppStatus {
 
 /// A platform backend. Constructed and used only on the engine's worker thread.
 pub trait Backend {
+    fn configure(&mut self, _options: super::Options) -> Result<(), Error> {
+        Ok(())
+    }
     fn status(&self) -> AppStatus;
     /// How often to refresh without a `Dirty` notification.
     fn poll_interval(&self) -> Duration;
@@ -146,6 +149,7 @@ pub trait Backend {
 }
 
 pub enum Command {
+    Configure(super::Options),
     AppVolume(String, f32),
     AppMute(String, bool),
     DeviceVolume(String, DeviceKind, f32),
@@ -493,9 +497,11 @@ impl Engine {
         let capable = match command {
             Command::AppVolume(..) => status.can_set_volume,
             Command::AppMute(..) => status.can_mute,
-            Command::DeviceVolume(..) | Command::DeviceMute(..) => true,
+            Command::DeviceVolume(..) | Command::DeviceMute(..) | Command::Configure(..) => true,
         };
-        if (!status.available && !command.is_device()) || !capable {
+        if (!status.available && !command.is_device() && !matches!(command, Command::Configure(..)))
+            || !capable
+        {
             let why = if status.message.is_empty() {
                 "the audio backend cannot change this setting".to_string()
             } else {
@@ -630,6 +636,7 @@ fn run_worker(
                     continue;
                 }
                 let device_command = command.is_device();
+                let configuration = matches!(command, Command::Configure(..));
                 let result = execute(&shared, backend.as_mut(), command);
                 lock(&shared.requests).handled = id;
                 let applied = result.is_ok();
@@ -640,6 +647,16 @@ fn run_worker(
                     refresh_devices(&shared, backend.as_mut(), applied, Some(id))
                 } else {
                     refresh_apps(&shared, backend.as_mut(), applied)
+                };
+                let readback = if configuration
+                    && readback
+                        .as_ref()
+                        .is_err_and(|e| e.kind == ErrorKind::Unsupported)
+                {
+                    // Options can be applied even on systems without app listing.
+                    Ok(())
+                } else {
+                    readback
                 };
                 let _ = reply.send(result.and(readback));
                 if device_command {
@@ -672,6 +689,7 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
 
 fn execute(shared: &Shared, backend: &mut dyn Backend, command: Command) -> Result<(), Error> {
     let (target, result) = match command {
+        Command::Configure(options) => return backend.configure(options),
         Command::AppVolume(app, volume) => {
             ensure_known(shared, &app)?;
             let result = backend.set_volume(&app, volume);

@@ -3289,7 +3289,7 @@ mod tests {
             let r = rig(false, false);
             bound_fader(&r.profile, mic());
             let before = r.fake.reads();
-            r.bridge.clone().spawn();
+            let _bridge = r.bridge.clone().spawn();
             until("the first look", || r.fake.reads() > before).await;
             let start = r.fake.reads();
             for i in 0..20 {

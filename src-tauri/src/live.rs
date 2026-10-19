@@ -83,7 +83,7 @@ impl StateLink {
             LinkProvider::Slobs => &live.slobs,
             // Muted and there; a missing device or app (or no audio at all) is not lit.
             LinkProvider::System => {
-                return self.kind == LinkKind::AudioMuted && self.target.as_ref().and_then(|t| live.system.resolve(t)).is_some_and(|s| s.muted);
+                return self.kind == LinkKind::AudioMuted && self.target.as_ref().and_then(|t| live.system.resolve(t)).is_some_and(|s| s.can_mute && s.muted);
             }
         };
         if !p.connected {
@@ -144,7 +144,7 @@ mod tests {
         assert!(!mic.is_active(&live));
         let mut device = FakeAudio::device("m", AudioDeviceKind::Input, true, 0.5);
         device.muted = true;
-        live.system = SystemAudioState { available: true, apps_available: false, devices: vec![device], apps: vec![] };
+        live.system = SystemAudioState { available: true, devices: vec![device], ..Default::default() };
         assert!(mic.is_active(&live));
         // The muted device is not the default any more: the default input is absent, not lit.
         live.system.devices[0].is_default = false;

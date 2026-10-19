@@ -52,7 +52,7 @@ pub struct AudioSettings {
     pub output_device: Option<String>,
     /// macOS: per-app volume and mute through Core Audio process taps. Needs the
     /// System Audio Recording permission, so it stays off unless turned on.
-    /// Read at start-up.
+    /// Applied to the same worker at start-up and when changed.
     #[serde(default)]
     pub macos_app_volume: bool,
 }

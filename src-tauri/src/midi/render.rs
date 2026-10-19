@@ -217,7 +217,7 @@ mod tests {
         // No system audio: unavailable, only the first pad (dimmed; 0 % here = off).
         assert_eq!(lit(&build_frame(&layout, &inputs)), 0);
         let mut mic = FakeAudio::device("m", AudioDeviceKind::Input, true, 1.0);
-        inputs.live.lock().system = SystemAudioState { available: true, apps_available: false, devices: vec![mic.clone()], apps: vec![] };
+        inputs.live.lock().system = SystemAudioState { available: true, devices: vec![mic.clone()], ..Default::default() };
         assert_eq!(lit(&build_frame(&layout, &inputs)), 4, "full level");
         mic.muted = true;
         inputs.live.lock().system.devices = vec![mic];
