@@ -34,6 +34,7 @@ pub struct AppState {
     pub slobs: SlobsHandle,
     pub home_assistant: crate::homeassistant::HaHandle,
     pub hub: crate::hub::HubHandle,
+    pub system_audio: crate::system_audio::SystemAudio,
     /// Profiles before each edit made from the UI, newest last (undo).
     pub history: Mutex<Vec<crate::profile::Profile>>,
     /// Profiles undone, newest last (redo); cleared by the next edit.

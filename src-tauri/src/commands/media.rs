@@ -27,6 +27,32 @@ pub async fn list_system_audio_devices(target: crate::macros::SystemVolumeTarget
     crate::audio_devices::list(target).await
 }
 
+/// The system audio as a fresh look sees it, plus what the profile names that is not there.
+async fn audio_report(state: &State<'_, AppState>) -> CmdResult<crate::system_audio::AudioReport> {
+    let port = state.system_audio.port().clone();
+    let (status, now) = tauri::async_runtime::spawn_blocking(move || (port.status(), crate::system_audio::read_state(port.as_ref()))).await.map_err(err)?;
+    let store = state.profile.lock();
+    Ok(crate::system_audio::report(status, &now, &store.profile))
+}
+
+/// Devices for the fader and action pickers (both directions; `present: false` for saved ones not connected).
+#[tauri::command]
+pub async fn audio_list_devices(state: State<'_, AppState>) -> CmdResult<Vec<crate::system_audio::AudioDevice>> {
+    Ok(audio_report(&state).await?.devices)
+}
+
+/// Apps with audio for the pickers (`present: false` for saved ones not running).
+#[tauri::command]
+pub async fn audio_list_apps(state: State<'_, AppState>) -> CmdResult<Vec<crate::system_audio::AudioApp>> {
+    Ok(audio_report(&state).await?.apps)
+}
+
+/// What the system audio can do, with the devices and apps (the `system-audio:changed` payload).
+#[tauri::command]
+pub async fn audio_status(state: State<'_, AppState>) -> CmdResult<crate::system_audio::AudioReport> {
+    audio_report(&state).await
+}
+
 #[tauri::command]
 pub async fn analyze_audio(path: String, buckets: Option<usize>) -> CmdResult<AudioInfo> {
     let path = PathBuf::from(path);

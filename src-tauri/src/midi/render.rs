@@ -123,7 +123,7 @@ pub fn build_frame(layout: &Layout, inputs: &RenderInputs) -> HashMap<(u8, u8), 
             PadShape::Logo => LOGO_COLOR,
             _ => {
                 if let Some((fader, step)) = page.and_then(|p| p.fader_at(pad.x, pad.y)) {
-                    let [r, g, b] = fader.pad_rgb(step);
+                    let [r, g, b] = fader.render_rgb(step, &live);
                     frame.insert((pad.x, pad.y), if r == 0 && g == 0 && b == 0 { LedColor::Off } else { LedColor::Rgb(Color::new(r, g, b)) });
                     continue;
                 }
@@ -202,5 +202,36 @@ mod tests {
         let frame = build_frame(&layout, &inputs);
         assert_eq!(frame[&(0, 0)], LedColor::Palette(21));
         assert_eq!(frame[&(1, 0)], LedColor::Rgb(PRESS_COLOR), "held empty pad shows press feedback");
+    }
+
+    #[test]
+    fn a_bound_fader_shows_muted_as_empty_and_missing_as_unavailable() {
+        use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef, Fader};
+        use crate::system_audio::{FakeAudio, SystemAudioState};
+        let inputs = inputs();
+        let fader = Fader { id: "mic".into(), x: 0, y: 0, length: 4, min: 0.0, max: 100.0, value: 100.0, dim: 0, bound: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }), ..Fader::default() };
+        inputs.profile.lock().profile.pages.first_mut().unwrap().set_fader(fader.clone());
+        let layout = driver_for(LaunchpadModel::LaunchpadMk2).layout();
+        let lit = |frame: &HashMap<(u8, u8), LedColor>| (0..4u8).filter(|y| frame[&(0, *y)] != LedColor::Off).count();
+
+        // No system audio: unavailable, only the first pad (dimmed; 0 % here = off).
+        assert_eq!(lit(&build_frame(&layout, &inputs)), 0);
+        let mut mic = FakeAudio::device("m", AudioDeviceKind::Input, true, 1.0);
+        inputs.live.lock().system = SystemAudioState { available: true, apps_available: false, devices: vec![mic.clone()], apps: vec![] };
+        assert_eq!(lit(&build_frame(&layout, &inputs)), 4, "full level");
+        mic.muted = true;
+        inputs.live.lock().system.devices = vec![mic];
+        assert_eq!(lit(&build_frame(&layout, &inputs)), 1, "muted shows the minimum");
+        assert_eq!(inputs.profile.lock().profile.pages[0].faders[0].value, 100.0, "the value is kept");
+
+        // Unavailable with a visible dim: the first pad only, at the dim level.
+        let dimmed = Fader { dim: 50, ..fader };
+        let empty = crate::live::LiveStatus::default();
+        assert_eq!(dimmed.render_value(&empty), None);
+        assert_eq!(dimmed.render_rgb(0, &empty), [0, 48, 128]);
+        assert_eq!(dimmed.render_rgb(1, &empty), [0, 0, 0]);
+        // An unbound fader ignores the system audio.
+        let plain = Fader { bound: None, value: 30.0, ..dimmed };
+        assert_eq!(plain.render_value(&empty), Some(30.0));
     }
 }

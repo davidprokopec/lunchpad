@@ -4,6 +4,8 @@
 //! (`x` from the left, `y` from the bottom). Only the active page is painted
 //! on the device.
 
+use super::audio::AudioTarget;
+use crate::live::LiveStatus;
 use crate::midi::palette::palette_color;
 use crate::macros::Action;
 use crate::midi::types::Color;
@@ -274,6 +276,10 @@ pub struct Fader {
     /// counts as let go after resting a moment), with the last value it touched.
     #[serde(default)]
     pub on_release: Vec<Action>,
+    /// Follow and set the volume of a device or an app: the system's level is the value
+    /// (0 % = `min`, 100 % = `max`); left out of the file when unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<AudioTarget>,
 }
 
 /// A second scale the fader's value is shown in, mapped linearly from the range.
@@ -323,6 +329,7 @@ impl Default for Fader {
             on_change: Vec::new(),
             on_touch: Vec::new(),
             on_release: Vec::new(),
+            bound: None,
         }
     }
 }
@@ -406,13 +413,58 @@ impl Fader {
 
     /// What a pad shows: its blend up to the level, dimmed above it.
     pub fn pad_rgb(&self, step: usize) -> [u8; 3] {
+        self.pad_rgb_at(step, self.value)
+    }
+
+    /// What a pad shows for the level `value`.
+    fn pad_rgb_at(&self, step: usize, value: f64) -> [u8; 3] {
         let c = self.color_at(step);
-        if step <= self.level_step() {
+        let span = self.max - self.min;
+        let fraction = if span.abs() < f64::EPSILON { 0.0 } else { ((value - self.min) / span).clamp(0.0, 1.0) };
+        if step <= (fraction * (self.steps() - 1) as f64).round() as usize {
             c
         } else {
-            let k = self.dim.min(100) as f64 / 100.0;
-            [(c[0] as f64 * k).round() as u8, (c[1] as f64 * k).round() as u8, (c[2] as f64 * k).round() as u8]
+            self.dimmed(c)
         }
+    }
+
+    fn dimmed(&self, c: [u8; 3]) -> [u8; 3] {
+        let k = self.dim.min(100) as f64 / 100.0;
+        [(c[0] as f64 * k).round() as u8, (c[1] as f64 * k).round() as u8, (c[2] as f64 * k).round() as u8]
+    }
+
+    /// The level the pads show. An unbound fader shows its value; a bound one shows its
+    /// value while the target is there, the minimum while it is muted (the value is kept
+    /// for when it comes back), and `None` ("unavailable") while the target is missing.
+    pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
+        let Some(target) = &self.bound else { return Some(self.value) };
+        let state = live.system.resolve(target)?;
+        Some(if state.muted { self.min } else { self.value })
+    }
+
+    /// What a pad shows with the live state (see [`Fader::render_value`]). An unavailable
+    /// fader lights only its first pad, dimmed.
+    pub fn render_rgb(&self, step: usize, live: &LiveStatus) -> [u8; 3] {
+        match self.render_value(live) {
+            Some(value) => self.pad_rgb_at(step, value),
+            None if step == 0 => self.dimmed(self.color_at(0)),
+            None => [0, 0, 0],
+        }
+    }
+
+    /// The system volume (0..1) that stands for `value`.
+    pub fn volume_of(&self, value: f64) -> f32 {
+        let span = self.max - self.min;
+        if span.abs() < f64::EPSILON {
+            0.0
+        } else {
+            ((value - self.min) / span).clamp(0.0, 1.0) as f32
+        }
+    }
+
+    /// The value that stands for the system volume `volume` (0..1).
+    pub fn value_of(&self, volume: f32) -> f64 {
+        self.min + (self.max - self.min) * (volume.clamp(0.0, 1.0) as f64)
     }
 
     /// The value on the display scale (the real value when there is none).
@@ -443,6 +495,8 @@ impl Fader {
 pub enum LinkProvider {
     Obs,
     Slobs,
+    /// The system's audio (devices and apps), see `StateLink::target`
+    System,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,9 +511,11 @@ pub enum LinkKind {
     Streaming,
     Recording,
     ReplayBuffer,
+    /// `target` is muted (System audio)
+    AudioMuted,
 }
 
-/// "Active while …" binding of a button to the state of OBS or Streamlabs.
+/// "Active while …" binding of a button to the state of OBS, Streamlabs or the system audio.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateLink {
@@ -469,6 +525,9 @@ pub struct StateLink {
     pub scene: String,
     #[serde(default)]
     pub source: String,
+    /// The device or app a System link watches; left out of the file when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<AudioTarget>,
 }
 
 impl Default for Button {
@@ -571,6 +630,52 @@ mod tests {
         assert_eq!((&json["runMode"], &json["queueSize"]), (&serde_json::json!("queue"), &serde_json::json!(3)));
     }
 
+    /// A profile written before audio targets existed loads, and saves back exactly as it was.
+    #[test]
+    fn a_profile_from_before_audio_targets_round_trips_unchanged() {
+        let old = serde_json::json!({
+            "version": 1,
+            "activePage": "default",
+            "pages": [{
+                "id": "default",
+                "name": "Default",
+                "buttons": [{
+                    "x": 1, "y": 2,
+                    "look": { "type": "text", "caption": "MIC", "size": 16, "face": "sans", "color": "#ffffff" },
+                    "color": { "mode": "palette", "index": 21 },
+                    "activeColor": { "mode": "palette", "index": 5 },
+                    "loop": false,
+                    "down": [{ "id": "a", "wait": true, "type": "setSystemVolume", "target": "input", "mode": "toggleMute", "volume": 0.0, "volumeFrom": null, "device": null }],
+                    "up": [], "hold": [], "holdMs": 500, "holdWait": true,
+                    "stateLink": { "provider": "obs", "kind": "sourceMuted", "scene": "", "source": "Mic" },
+                    "description": "", "runMode": "parallel", "queueSize": 1
+                }],
+                "faders": [{
+                    "id": "f", "name": "Mic", "variable": "", "x": 0, "y": 0, "direction": "up", "length": 4,
+                    "colorA": [0, 96, 255], "colorB": [255, 64, 32], "dim": 12, "min": 0.0, "max": 100.0,
+                    "unit": "%", "decimals": 0, "value": 40.0, "display": null,
+                    "onChange": [], "onTouch": [], "onRelease": []
+                }]
+            }]
+        });
+        let profile: Profile = serde_json::from_value(old.clone()).unwrap();
+        let page = &profile.pages[0];
+        assert!(page.faders[0].bound.is_none());
+        assert!(page.buttons[0].button.state_link.as_ref().unwrap().target.is_none());
+        assert_eq!(serde_json::to_value(&profile).unwrap(), old);
+
+        // The new fields, when set, are saved and read back.
+        use super::super::audio::{AudioTarget, DeviceRef};
+        let mut bound = profile.clone();
+        bound.pages[0].faders[0].bound = Some(AudioTarget::Device { device: DeviceRef::DefaultInput });
+        bound.pages[0].buttons[0].button.state_link = Some(StateLink { provider: LinkProvider::System, kind: LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }) });
+        let json = serde_json::to_value(&bound).unwrap();
+        assert_eq!(json["pages"][0]["faders"][0]["bound"], serde_json::json!({ "type": "device", "device": { "type": "defaultInput" } }));
+        assert_eq!(json["pages"][0]["buttons"][0]["stateLink"]["provider"], "system");
+        assert_eq!(json["pages"][0]["buttons"][0]["stateLink"]["kind"], "audioMuted");
+        assert_eq!(serde_json::from_value::<Profile>(json).unwrap(), bound);
+    }
+
     #[test]
     fn page_swap_and_remove() {
         let mut page = Page::new("p", "P");
@@ -601,7 +706,7 @@ mod tests {
             kind: ActionKind::PlaySound { file: "a.wav".into(), volume: 0.5, start: 0.1, end: 0.9, output_device: Some("Speakers".into()), volume_from_velocity: true },
         });
         button.hold_ms = 800;
-        button.state_link = Some(StateLink { provider: LinkProvider::Obs, kind: LinkKind::Scene, scene: "Game".into(), source: String::new() });
+        button.state_link = Some(StateLink { provider: LinkProvider::Obs, kind: LinkKind::Scene, scene: "Game".into(), source: String::new(), target: None });
         let json = serde_json::to_string(&button).unwrap();
         let back: Button = serde_json::from_str(&json).unwrap();
         assert_eq!(back, button);

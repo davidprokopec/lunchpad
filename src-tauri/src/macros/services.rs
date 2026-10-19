@@ -25,4 +25,6 @@ pub struct Services {
     pub config_dir: Option<PathBuf>,
     /// The app, for actions that open windows (the debug action).
     pub app: Option<tauri::AppHandle>,
+    /// Device and app volume / mute (`SetAudio`, bound faders, `SetSystemVolume`).
+    pub system_audio: Option<crate::system_audio::SystemAudio>,
 }

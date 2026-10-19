@@ -1,9 +1,11 @@
 //! Live state of the streaming integrations that button colours can follow.
 //! A button with a [`StateLink`] shows its active colour while the linked
 //! condition holds (its scene is live, its source is visible, the stream is
-//! on, …). The integrations write here; the LED renderer and the window read.
+//! on, the microphone is muted, …). The integrations write here; the LED
+//! renderer and the window read.
 
 use crate::profile::{LinkKind, LinkProvider, StateLink};
+use crate::system_audio::SystemAudioState;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,10 +22,12 @@ pub struct ProviderStatus {
     pub replay_buffer: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LiveStatus {
     pub obs: ProviderStatus,
     pub slobs: ProviderStatus,
+    /// Devices and apps as the system audio bridge last saw them.
+    pub system: SystemAudioState,
 }
 
 pub type SharedLive = Arc<Mutex<LiveStatus>>;
@@ -47,10 +51,24 @@ impl LiveHandle {
             let slot = match provider {
                 LinkProvider::Obs => &mut st.obs,
                 LinkProvider::Slobs => &mut st.slobs,
+                // The system audio has its own shape; see `update_system`.
+                LinkProvider::System => return,
             };
             let before = slot.clone();
             f(slot);
             *slot != before
+        };
+        if changed {
+            (self.on_change)();
+        }
+    }
+
+    pub fn update_system(&self, f: impl FnOnce(&mut SystemAudioState)) {
+        let changed = {
+            let mut st = self.status.lock();
+            let before = st.system.clone();
+            f(&mut st.system);
+            st.system != before
         };
         if changed {
             (self.on_change)();
@@ -63,6 +81,10 @@ impl StateLink {
         let p = match self.provider {
             LinkProvider::Obs => &live.obs,
             LinkProvider::Slobs => &live.slobs,
+            // Muted and there; a missing device or app (or no audio at all) is not lit.
+            LinkProvider::System => {
+                return self.kind == LinkKind::AudioMuted && self.target.as_ref().and_then(|t| live.system.resolve(t)).is_some_and(|s| s.muted);
+            }
         };
         if !p.connected {
             return false;
@@ -77,6 +99,7 @@ impl StateLink {
             LinkKind::Streaming => p.streaming,
             LinkKind::Recording => p.recording,
             LinkKind::ReplayBuffer => p.replay_buffer,
+            LinkKind::AudioMuted => false,
         }
     }
 }
@@ -86,7 +109,7 @@ mod tests {
     use super::*;
 
     fn link(provider: LinkProvider, kind: LinkKind, scene: &str, source: &str) -> StateLink {
-        StateLink { provider, kind, scene: scene.into(), source: source.into() }
+        StateLink { provider, kind, scene: scene.into(), source: source.into(), target: None }
     }
 
     #[test]
@@ -109,6 +132,43 @@ mod tests {
         assert!(!link(LinkProvider::Obs, LinkKind::Recording, "", "").is_active(&live));
         // Streamlabs is not connected: nothing lights up.
         assert!(!link(LinkProvider::Slobs, LinkKind::Streaming, "", "").is_active(&live));
+    }
+
+    #[test]
+    fn a_system_link_lights_while_its_target_is_muted() {
+        use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef};
+        use crate::system_audio::FakeAudio;
+        let mic = StateLink { provider: LinkProvider::System, kind: LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }) };
+        let mut live = LiveStatus::default();
+        // No system audio at all: not lit.
+        assert!(!mic.is_active(&live));
+        let mut device = FakeAudio::device("m", AudioDeviceKind::Input, true, 0.5);
+        device.muted = true;
+        live.system = SystemAudioState { available: true, apps_available: false, devices: vec![device], apps: vec![] };
+        assert!(mic.is_active(&live));
+        // The muted device is not the default any more: the default input is absent, not lit.
+        live.system.devices[0].is_default = false;
+        assert!(!mic.is_active(&live));
+        live.system.devices[0].is_default = true;
+        live.system.available = false;
+        assert!(!mic.is_active(&live), "unavailable is not lit");
+        live.system.available = true;
+        // A link without a target, or with an OBS kind, never lights.
+        assert!(!StateLink { target: None, ..mic.clone() }.is_active(&live));
+        assert!(!StateLink { kind: LinkKind::Streaming, ..mic.clone() }.is_active(&live));
+        // An OBS link with the System kind does not either.
+        live.obs.connected = true;
+        assert!(!StateLink { provider: LinkProvider::Obs, ..mic.clone() }.is_active(&live));
+        // A change repaints, the same snapshot again does not.
+        let repaints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = repaints.clone();
+        let handle = LiveHandle::new(Arc::new(Mutex::new(LiveStatus::default())), Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let snapshot = live.system.clone();
+        handle.update_system(|s| *s = snapshot.clone());
+        handle.update_system(|s| *s = snapshot.clone());
+        assert_eq!(repaints.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::model::*;
 use super::services::Services;
 use super::sink::EngineSink;
 use crate::midi::types::{ButtonEvent, ControlEvent, ControlKind, PressureEvent};
-use crate::profile::{self, Fader, PadColor, Profile, RunMode, SharedProfile, MAX_QUEUE_SIZE};
+use crate::profile::{self, AudioTarget, Fader, PadColor, Profile, RunMode, SharedProfile, MAX_QUEUE_SIZE};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -212,6 +212,12 @@ impl MacroEngine {
         *self.inner.device.lock() = device;
     }
 
+    /// Pretend a pad went down (and up) at these instants, as `on_button` records them.
+    #[cfg(test)]
+    pub fn set_press_for_test(&self, x: u8, y: u8, down: Instant, up: Option<Instant>) {
+        self.inner.presses.lock().insert((x, y), PadPress { down, up });
+    }
+
     #[cfg(test)]
     pub fn globals_mut_for_test(&self, f: impl FnOnce(&mut HashMap<String, String>)) {
         f(&mut self.inner.globals.lock());
@@ -234,7 +240,7 @@ impl MacroEngine {
             let Some((f, _)) = page.fader_at(event.x, event.y) else { return };
             let mut at = f.clone();
             at.value = f.min + (f.max - f.min) * event.value.clamp(0.0, 1.0) as f64;
-            let hit = FaderHit { id: f.id.clone(), key: f.variable_key(), step: at.level_step(), steps: at.steps(), value: at.value, min: f.min, max: f.max, decimals: f.decimals, display: at.display_text() };
+            let hit = FaderHit { id: f.id.clone(), key: f.variable_key(), step: at.level_step(), steps: at.steps(), value: at.value, min: f.min, max: f.max, decimals: f.decimals, display: at.display_text(), bound: f.bound.clone().map(Arc::new) };
             (page.id.clone(), hit)
         };
         let id = hit.id.clone();
@@ -365,7 +371,7 @@ impl MacroEngine {
             let fader = page.fader_at(event.x, event.y).map(|(f, step)| {
                 let mut at = f.clone();
                 at.value = f.value_at_step(step);
-                FaderHit { id: f.id.clone(), key: f.variable_key(), step, steps: f.steps(), value: at.value, min: f.min, max: f.max, decimals: f.decimals, display: at.display_text() }
+                FaderHit { id: f.id.clone(), key: f.variable_key(), step, steps: f.steps(), value: at.value, min: f.min, max: f.max, decimals: f.decimals, display: at.display_text(), bound: f.bound.clone().map(Arc::new) }
             });
             (page.id.clone(), hold, loops, fader)
         };
@@ -493,14 +499,69 @@ impl MacroEngine {
             max: fader.max,
             decimals: fader.decimals,
             display: at.display_text(),
+            bound: fader.bound.clone().map(Arc::new),
         };
         self.fader_pressed(&page_id, fader.x, fader.y, hit, 127, run_actions.then_some(ActionList::Fader));
         true
     }
 
+    /// The system audio changed: every bound fader on any page takes its target's level.
+    /// Nothing runs and nothing is written back; a muted or missing target keeps the value
+    /// (the LEDs show it as muted or unavailable), and a level within a thousandth of the
+    /// range of the current one is the echo of a press and changes nothing.
+    pub fn follow_system_audio(&self, state: &crate::system_audio::SystemAudioState) {
+        let bound: Vec<(String, Fader)> = {
+            let store = self.inner.profile.lock();
+            store.profile.pages.iter().flat_map(|p| p.faders.iter().filter(|f| f.bound.is_some()).map(|f| (p.id.clone(), f.clone()))).collect()
+        };
+        for (page_id, fader) in bound {
+            let Some(target) = &fader.bound else { continue };
+            let Some(st) = state.resolve(target) else { continue };
+            if st.muted {
+                continue;
+            }
+            let value = fader.value_of(st.volume);
+            if (fader.value - value).abs() <= (fader.max - fader.min).abs() / 1000.0 {
+                continue;
+            }
+            let mut at = fader.clone();
+            at.value = value;
+            let hit = FaderHit {
+                id: fader.id.clone(),
+                key: fader.variable_key(),
+                step: at.level_step(),
+                steps: at.steps(),
+                value,
+                min: fader.min,
+                max: fader.max,
+                decimals: fader.decimals,
+                display: at.display_text(),
+                bound: fader.bound.clone().map(Arc::new),
+            };
+            self.fader_pressed_from(&page_id, fader.x, fader.y, hit, 127, None, FaderOrigin::Os);
+        }
+    }
+
     /// Persist a fader's new level, expose it as `fader.<name>` and run its actions.
     /// Apply a fader's value (LEDs, level, variables) and run one of its lists, if any.
     fn fader_pressed(&self, page_id: &str, x: u8, y: u8, hit: FaderHit, velocity: u8, run: Option<ActionList>) {
+        self.fader_pressed_from(page_id, x, y, hit, velocity, run, FaderOrigin::User);
+    }
+
+    /// A bound fader moved by the user sets its target's volume (and unmutes it); one whose
+    /// target is missing ignores the press. Moved by the system it only shows the level.
+    #[allow(clippy::too_many_arguments)]
+    fn fader_pressed_from(&self, page_id: &str, x: u8, y: u8, hit: FaderHit, velocity: u8, run: Option<ActionList>, origin: FaderOrigin) {
+        let audio = match (&hit.bound, origin) {
+            (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| sa.cached(target).is_some()) {
+                Some(sa) => Some((sa.clone(), AudioTarget::clone(target))),
+                None => {
+                    tracing::debug!(fader = %hit.id, "the fader's audio target is not available, press ignored");
+                    return;
+                }
+            },
+            _ => None,
+        };
         let page_for = page_id.to_string();
         let id_for = hit.id.clone();
         let value = hit.value;
@@ -532,6 +593,9 @@ impl MacroEngine {
             globals.clone()
         };
         self.inner.sink.variables_changed(&snapshot);
+        if let Some((sa, target)) = audio {
+            sa.set_level(target, fraction as f32);
+        }
         if let Some(list) = run {
             let _ = self.start_with(page_id, x, y, list, velocity, 0, None, Some(Arc::new(Mutex::new(locals))));
         }
@@ -821,6 +885,17 @@ impl RunContext {
             .map(|press| press.up.unwrap_or_else(Instant::now).duration_since(press.down).as_millis() as u64)
             .unwrap_or(0);
         builtins::Press { velocity: self.velocity, pressure, x: self.x, y: self.y, trigger: self.list.as_str(), held_ms, page_id: self.page_id.clone(), page_name, caption }
+    }
+
+    /// When the pad of this run last went down, as `on_button` recorded it.
+    pub(crate) fn pad_down(&self) -> Option<Instant> {
+        self.inner.presses.lock().get(&(self.x, self.y)).map(|p| p.down)
+    }
+
+    /// The hold time of the button this run belongs to (the default for anything else).
+    pub(crate) fn hold_ms(&self) -> u64 {
+        let store = self.inner.profile.lock();
+        store.profile.page(&self.page_id).and_then(|p| p.get(self.x, self.y)).map(|b| b.hold_ms).unwrap_or_else(profile::default_hold_ms)
     }
 
     /// What surrounds the run: the streaming apps' state, the device and the folders.
@@ -1118,6 +1193,17 @@ struct FaderHit {
     decimals: u8,
     /// The value as the pad shows it (display scale)
     display: String,
+    /// The device or app the fader follows
+    /// (Shared: the hit is copied around the control worker, which keeps it small.)
+    bound: Option<Arc<crate::profile::AudioTarget>>,
+}
+
+/// Who moved a fader: someone at the pads or in the window (the system follows), or the
+/// system itself (the fader follows, nothing runs and nothing is written back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaderOrigin {
+    User,
+    Os,
 }
 
 /// A loop's progress while its body repeats, kept per start marker so loops can nest.
@@ -1483,6 +1569,7 @@ pub(super) async fn execute(ctx: &RunContext, action: &Action) {
         | ActionKind::HomeAssistantSetValue { .. }
         | ActionKind::HomeAssistantCallService { .. }
         | ActionKind::SetSystemVolume { .. }
+        | ActionKind::SetAudio { .. }
         | ActionKind::StopAllSounds
         | ActionKind::SetAudioDevice { .. }
         | ActionKind::AddToVariable { .. }
@@ -2606,6 +2693,258 @@ mod tests {
             let runs = MAX_DEPTH as usize + 1;
             assert_eq!(engine.globals().get("depth").map(String::as_str), Some(runs.to_string().as_str()), "{run_mode:?}: every nested run started");
             assert_eq!(seq(&engine), "x".repeat(runs), "{run_mode:?}: every nested run finished");
+        }
+    }
+
+    /// The system audio around an engine: a fake backend, the live cache and the bridge.
+    mod system_audio {
+        use super::*;
+        use crate::live::{LiveHandle, SharedLive};
+        use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef};
+        use crate::system_audio::{AudioControl, FakeAudio, FakeWrite, SystemAudio};
+        use crate::system_audio_bridge::Bridge;
+
+        struct Rig {
+            engine: MacroEngine,
+            profile: SharedProfile,
+            fake: Arc<FakeAudio>,
+            bridge: Bridge,
+        }
+
+        fn rig(mic_muted: bool, emulated: bool) -> Rig {
+            let mut mic = FakeAudio::device("mic", AudioDeviceKind::Input, true, 0.6);
+            mic.muted = mic_muted;
+            mic.emulated = emulated;
+            mic.can_mute = !emulated;
+            let fake = Arc::new(FakeAudio::new(vec![mic, FakeAudio::device("spk", AudioDeviceKind::Output, true, 0.4)], vec![]));
+            let live: SharedLive = Default::default();
+            let audio = SystemAudio::new(fake.clone(), live.clone());
+            let dir = std::env::temp_dir().join(format!("lunchpad-engine-{}", uuid::Uuid::new_v4()));
+            let profile: SharedProfile = Arc::new(Mutex::new(ProfileStore::load(&dir)));
+            let services = Services { system_audio: Some(audio.clone()), ..Services::default() };
+            let engine = MacroEngine::new(profile.clone(), Arc::new(Mutex::new(HashSet::new())), Arc::new(NullSink), services, Handle::current());
+            let bridge = Bridge { audio, live: LiveHandle::new(live, Arc::new(|| {})), engine: engine.clone(), profile: profile.clone(), app: None };
+            bridge.refresh();
+            Rig { engine, profile, fake, bridge }
+        }
+
+        fn mic() -> AudioTarget {
+            AudioTarget::Device { device: DeviceRef::DefaultInput }
+        }
+
+        fn mic_state(fake: &FakeAudio) -> (bool, f32) {
+            let d = fake.devices().unwrap().into_iter().find(|d| d.id == "mic").unwrap();
+            (d.muted, d.volume)
+        }
+
+        async fn until(what: &str, f: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !f() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        fn bound_fader(profile: &SharedProfile, target: AudioTarget) {
+            profile.lock().profile.page_mut(DEFAULT_PAGE_ID).unwrap().set_fader(Fader {
+                id: "mf".into(),
+                name: "mic".into(),
+                x: 0,
+                y: 0,
+                length: 5,
+                min: 0.0,
+                max: 100.0,
+                value: 60.0,
+                on_change: vec![a(ActionKind::AddToVariable { name: "runs".into(), amount: "1".into(), scope: VarScope::Global })],
+                bound: Some(target),
+                ..Fader::default()
+            });
+        }
+
+        fn fader_value(profile: &SharedProfile) -> f64 {
+            profile.lock().profile.page(DEFAULT_PAGE_ID).unwrap().faders[0].value
+        }
+
+        fn press(engine: &MacroEngine, y: u8) {
+            engine.on_button(&ButtonEvent { x: 0, y, pressed: true, note: 0, cc: false, value: 100 });
+            engine.on_button(&ButtonEvent { x: 0, y, pressed: false, note: 0, cc: false, value: 0 });
+        }
+
+        #[tokio::test]
+        async fn the_system_moves_a_bound_fader_without_running_or_writing_anything() {
+            let r = rig(false, false);
+            bound_fader(&r.profile, mic());
+            r.fake.change(|d, _| d[0].volume = 0.25);
+            r.bridge.refresh();
+            assert_eq!(fader_value(&r.profile), 25.0, "the fader follows the system");
+            assert_eq!(r.engine.globals().get("fader.mic").map(String::as_str), Some("25"));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert!(!r.engine.globals().contains_key("runs"), "no actions for a change from the system");
+            assert!(r.fake.writes().is_empty(), "nothing is written back");
+
+            // A press: one volume write, and the actions run.
+            press(&r.engine, 4);
+            until("the volume write", || !r.fake.writes().is_empty()).await;
+            assert_eq!(fader_value(&r.profile), 100.0);
+            assert_eq!(r.fake.writes(), vec![FakeWrite::Volume("mic".into(), 1.0)]);
+            until("the fader's actions", || r.engine.globals().get("runs").map(String::as_str) == Some("1")).await;
+
+            // The echo of that write (the system reporting it back, a hair off) changes nothing.
+            r.fake.change(|d, _| d[0].volume = 0.9995);
+            r.bridge.refresh();
+            assert_eq!(fader_value(&r.profile), 100.0, "the echo is swallowed");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(r.fake.writes().len(), 1, "still one write");
+            assert_eq!(r.engine.globals().get("runs").map(String::as_str), Some("1"), "still one run");
+        }
+
+        #[tokio::test]
+        async fn a_muted_bound_fader_keeps_its_value_and_a_press_unmutes() {
+            let r = rig(false, false);
+            bound_fader(&r.profile, mic());
+            r.fake.change(|d, _| d[0].muted = true);
+            r.bridge.refresh();
+            assert_eq!(fader_value(&r.profile), 60.0, "muting keeps the value");
+            // Pressing the middle pad sets 50 % and unmutes.
+            press(&r.engine, 2);
+            until("unmute and volume", || r.fake.writes().len() == 2).await;
+            assert_eq!(r.fake.writes(), vec![FakeWrite::Muted("mic".into(), false), FakeWrite::Volume("mic".into(), 0.5)]);
+            assert_eq!(mic_state(&r.fake), (false, 0.5));
+            assert_eq!(fader_value(&r.profile), 50.0);
+        }
+
+        #[tokio::test]
+        async fn a_fader_whose_target_is_missing_ignores_presses_and_keeps_its_value() {
+            let r = rig(false, false);
+            bound_fader(&r.profile, AudioTarget::Device { device: DeviceRef::Named { id: "usb".into(), kind: AudioDeviceKind::Input, label: "USB".into() } });
+            r.bridge.refresh();
+            press(&r.engine, 1);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(fader_value(&r.profile), 60.0);
+            assert!(r.fake.writes().is_empty());
+            assert!(!r.engine.globals().contains_key("runs"));
+            // The device comes back: the fader follows it again.
+            r.fake.change(|d, _| {
+                let mut usb = FakeAudio::device("usb", AudioDeviceKind::Input, false, 0.3);
+                usb.name = "USB".into();
+                d.push(usb);
+            });
+            r.bridge.refresh();
+            assert!((fader_value(&r.profile) - 30.0).abs() < 1e-4);
+        }
+
+        fn mute_button(profile: &SharedProfile) {
+            let hold = || a(ActionKind::SetAudio { target: mic(), mode: SetAudioMode::HoldMute, volume: 0.0, volume_from: None });
+            let mut store = profile.lock();
+            store.profile.page_mut(DEFAULT_PAGE_ID).unwrap().set(3, 3, Button { down: vec![hold()], up: vec![hold()], hold_ms: 500, ..Default::default() });
+        }
+
+        /// One press of the mute button held for `held_ms`, with made-up instants (no waiting).
+        async fn press_mute(r: &Rig, held_ms: u64) {
+            let down = Instant::now();
+            r.engine.set_press_for_test(3, 3, down, None);
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Down, 127, 0, None).unwrap()).await;
+            assert!(mic_state(&r.fake).0, "the press mutes at once");
+            r.engine.set_press_for_test(3, 3, down, Some(down + Duration::from_millis(held_ms)));
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Up, 127, 0, None).unwrap()).await;
+        }
+
+        #[tokio::test]
+        async fn the_mute_button_toggles_on_a_tap_and_restores_after_a_hold() {
+            for emulated in [false, true] {
+                // Tap while unmuted: muted.
+                let r = rig(false, emulated);
+                mute_button(&r.profile);
+                press_mute(&r, 120).await;
+                assert!(mic_state(&r.fake).0, "emulated={emulated}: a tap mutes");
+                // Tap while muted: unmuted, and the level comes back.
+                press_mute(&r, 120).await;
+                assert_eq!(mic_state(&r.fake), (false, 0.6), "emulated={emulated}: a tap unmutes");
+                // Hold while unmuted: muted only while held.
+                press_mute(&r, 800).await;
+                assert_eq!(mic_state(&r.fake), (false, 0.6), "emulated={emulated}: a hold restores unmuted");
+
+                // Hold while muted: stays muted.
+                let r = rig(true, emulated);
+                mute_button(&r.profile);
+                press_mute(&r, 800).await;
+                assert!(mic_state(&r.fake).0, "emulated={emulated}: a hold on a muted mic leaves it muted");
+                assert!(r.fake.writes().is_empty(), "emulated={emulated}: nothing to write");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_hold_overwrites_a_change_made_meanwhile() {
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            let down = Instant::now();
+            r.engine.set_press_for_test(3, 3, down, None);
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Down, 127, 0, None).unwrap()).await;
+            r.fake.change(|d, _| d[0].muted = false);
+            r.fake.change(|d, _| d[0].muted = true);
+            r.engine.set_press_for_test(3, 3, down, Some(down + Duration::from_millis(900)));
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Up, 127, 0, None).unwrap()).await;
+            assert!(!mic_state(&r.fake).0, "the release restores the state before the press");
+        }
+
+        #[tokio::test]
+        async fn a_release_that_overtakes_its_press_waits_for_it() {
+            let r = rig(true, false);
+            mute_button(&r.profile);
+            let down = Instant::now();
+            r.engine.set_press_for_test(3, 3, down, Some(down + Duration::from_millis(100)));
+            let release = r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Up, 127, 0, None).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(mic_state(&r.fake).0, "nothing happens before the press");
+            let pressed = r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Down, 127, 0, None).unwrap();
+            wait_done(pressed).await;
+            wait_done(release).await;
+            assert!(!mic_state(&r.fake).0, "a tap on a muted mic unmutes it, in the right order");
+
+            // A release whose press never comes gives up after a while and writes nothing.
+            let r = rig(false, false);
+            mute_button(&r.profile);
+            let started = Instant::now();
+            r.engine.set_press_for_test(3, 3, started, Some(started));
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 3, 3, ActionList::Up, 127, 0, None).unwrap()).await;
+            assert!(started.elapsed() >= Duration::from_millis(900) && started.elapsed() < Duration::from_secs(3));
+            assert!(r.fake.writes().is_empty());
+        }
+
+        #[tokio::test]
+        async fn set_audio_and_system_volume_go_through_the_backend() {
+            let r = rig(false, false);
+            set_button(
+                &r.profile,
+                0,
+                0,
+                vec![
+                    a(ActionKind::SetAudio { target: AudioTarget::Device { device: DeviceRef::DefaultOutput }, mode: SetAudioMode::SetVolume, volume: 20.0, volume_from: None }),
+                    a(ActionKind::SetSystemVolume { target: SystemVolumeTarget::Input, mode: SystemVolumeMode::ToggleMute, volume: 0.0, volume_from: None, device: None }),
+                ],
+                vec![],
+                false,
+            );
+            wait_done(r.engine.start(DEFAULT_PAGE_ID, 0, 0, ActionList::Down, 127, 0, None).unwrap()).await;
+            assert_eq!(r.fake.writes(), vec![FakeWrite::Volume("spk".into(), 0.2), FakeWrite::Muted("mic".into(), true)]);
+        }
+
+        /// A burst of changes from the system turns into one or two looks, not one per change.
+        #[tokio::test]
+        async fn the_bridge_coalesces_bursts() {
+            let r = rig(false, false);
+            bound_fader(&r.profile, mic());
+            let before = r.fake.reads();
+            r.bridge.clone().spawn();
+            until("the first look", || r.fake.reads() > before).await;
+            let start = r.fake.reads();
+            for i in 0..20 {
+                r.fake.change(|d, _| d[0].volume = i as f32 / 100.0);
+            }
+            until("the newest level", || (fader_value(&r.profile) - 19.0).abs() < 1e-4).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let looks = r.fake.reads() - start;
+            assert!((1..=3).contains(&looks), "20 changes, {looks} looks");
         }
     }
 }

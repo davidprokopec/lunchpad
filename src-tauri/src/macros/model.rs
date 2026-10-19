@@ -4,6 +4,7 @@
 //!
 //! JSON shape: `{ "id": "…", "wait": true, "type": "delay", "ms": 500 }`.
 
+use crate::profile::audio::AudioTarget;
 use crate::profile::model::PadColor;
 pub use crate::homeassistant::{HaPower, HaValueKind};
 use serde::{Deserialize, Serialize};
@@ -484,6 +485,21 @@ pub enum ActionKind {
         #[serde(default)]
         device: Option<String>,
     },
+    /// Volume or mute of a device (the default microphone or speakers, or one by id) or an app.
+    /// `volume` is the level (0-100 %) for `SetVolume`, the step for `AdjustVolume`, unused
+    /// for the mutes. `HoldMute` goes in both the pressed and the released list: a tap
+    /// toggles the mute, a press held for the button's `hold_ms` mutes only while held.
+    #[serde(rename_all = "camelCase")]
+    SetAudio {
+        target: AudioTarget,
+        #[serde(default)]
+        mode: SetAudioMode,
+        #[serde(default = "default_audio_volume")]
+        volume: f32,
+        /// Variable or placeholder that overrides `volume` when it holds a number
+        #[serde(default)]
+        volume_from: Option<String>,
+    },
     SlobsToggleFilter {
         source: String,
         filter: String,
@@ -930,6 +946,38 @@ pub enum SystemVolumeMode {
     ToggleMute,
 }
 
+fn default_audio_volume() -> f32 {
+    50.0
+}
+
+/// What a `SetAudio` action does to its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SetAudioMode {
+    /// Set the level
+    #[default]
+    SetVolume,
+    /// Change the level by the amount (negative = quieter)
+    AdjustVolume,
+    Mute,
+    Unmute,
+    ToggleMute,
+    /// In the pressed and the released list: a tap toggles, a hold mutes until released
+    HoldMute,
+}
+
+impl From<SystemVolumeMode> for SetAudioMode {
+    fn from(mode: SystemVolumeMode) -> Self {
+        match mode {
+            SystemVolumeMode::Set => SetAudioMode::SetVolume,
+            SystemVolumeMode::Adjust => SetAudioMode::AdjustVolume,
+            SystemVolumeMode::Mute => SetAudioMode::Mute,
+            SystemVolumeMode::Unmute => SetAudioMode::Unmute,
+            SystemVolumeMode::ToggleMute => SetAudioMode::ToggleMute,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SystemVolumeTarget {
@@ -1084,6 +1132,29 @@ mod tests {
                 assert!(reuse);
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn set_audio_json_shape() {
+        use crate::profile::audio::{AppRef, DeviceRef};
+        let a: Action = serde_json::from_str(r#"{"id":"m","type":"setAudio","target":{"type":"device","device":{"type":"defaultInput"}},"mode":"holdMute"}"#).unwrap();
+        assert_eq!(a.kind, ActionKind::SetAudio { target: AudioTarget::Device { device: DeviceRef::DefaultInput }, mode: SetAudioMode::HoldMute, volume: 50.0, volume_from: None });
+        let b = Action {
+            id: "v".into(),
+            wait: true,
+            kind: ActionKind::SetAudio { target: AudioTarget::App { app: AppRef { id: "com.spotify.client".into(), name: "Spotify".into() } }, mode: SetAudioMode::AdjustVolume, volume: -5.0, volume_from: Some("value".into()) },
+        };
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "id": "v", "wait": true, "type": "setAudio", "target": { "type": "app", "app": { "id": "com.spotify.client", "name": "Spotify" } }, "mode": "adjustVolume", "volume": -5.0, "volumeFrom": "value" })
+        );
+        assert_eq!(serde_json::from_value::<Action>(json).unwrap(), b);
+        let bare: Action = serde_json::from_str(r#"{"id":"s","type":"setAudio","target":{"type":"device","device":{"type":"defaultOutput"}}}"#).unwrap();
+        assert!(matches!(bare.kind, ActionKind::SetAudio { mode: SetAudioMode::SetVolume, .. }));
+        for (old, new) in [(SystemVolumeMode::Set, SetAudioMode::SetVolume), (SystemVolumeMode::ToggleMute, SetAudioMode::ToggleMute)] {
+            assert_eq!(SetAudioMode::from(old), new);
         }
     }
 

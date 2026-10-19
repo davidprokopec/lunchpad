@@ -1,10 +1,11 @@
 //! Execution of actions that talk to the outside world: sound, speech,
 //! keyboard, processes, OBS and Streamlabs. Pure engine actions live in `engine.rs`.
 
-use super::engine::RunContext;
+use super::engine::{ActionList, RunContext};
 use super::model::*;
 use crate::audio::PlayRequest;
 use crate::http::{self, HttpSpec};
+use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef};
 use crate::script::{self, ScriptInput};
 use crate::speech::SpeakRequest;
 use std::collections::HashMap;
@@ -340,7 +341,43 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
         ActionKind::SetSystemVolume { target, mode, volume, volume_from, device } => {
             let amount = number_from(ctx, volume_from, *volume);
             let device = device.as_deref().map(|d| ctx.expand(d));
-            report(action, "System volume", crate::system_volume::apply(*target, *mode, amount, device.as_deref()).await);
+            // Through the system audio backend when there is one (real mute, or the shared
+            // emulation for devices without one); the one-shot tools otherwise.
+            match services.system_audio.as_ref().filter(|sa| sa.available()) {
+                Some(sa) => {
+                    let kind = match target {
+                        SystemVolumeTarget::Output => AudioDeviceKind::Output,
+                        SystemVolumeTarget::Input => AudioDeviceKind::Input,
+                    };
+                    let device = match device.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+                        Some(name) => DeviceRef::Named { id: String::new(), kind, label: name.to_string() },
+                        None if kind == AudioDeviceKind::Input => DeviceRef::DefaultInput,
+                        None => DeviceRef::DefaultOutput,
+                    };
+                    report(action, "System volume", sa.apply(AudioTarget::Device { device }, (*mode).into(), amount).await);
+                }
+                None => report(action, "System volume", crate::system_volume::apply(*target, *mode, amount, device.as_deref()).await),
+            }
+        }
+        ActionKind::SetAudio { target, mode, volume, volume_from } => {
+            let Some(sa) = &services.system_audio else { return unavailable(action) };
+            let result = match mode {
+                SetAudioMode::HoldMute => {
+                    let key = (ctx.page_id.clone(), ctx.x, ctx.y);
+                    let down = ctx.pad_down();
+                    if matches!(ctx.list, ActionList::Up | ActionList::FaderRelease) {
+                        let tapped = ctx.press().held_ms < ctx.hold_ms();
+                        tokio::select! {
+                            result = sa.hold_release(key, down, tapped, target.clone()) => result,
+                            _ = ctx.token.cancelled() => Ok(()),
+                        }
+                    } else {
+                        sa.hold_press(key, down, target.clone()).await
+                    }
+                }
+                other => sa.apply(target.clone(), *other, number_from(ctx, volume_from, *volume)).await,
+            };
+            report(action, "System audio", result);
         }
         ActionKind::SlobsToggleFilter { source, filter, enabled } => {
             let Some(slobs) = &services.slobs else { return unavailable(action) };

@@ -26,6 +26,8 @@ pub mod hub;
 pub mod secrets;
 pub mod slobs;
 pub mod speech;
+pub mod system_audio;
+pub mod system_audio_bridge;
 pub mod system_volume;
 pub mod tray;
 
@@ -255,7 +257,10 @@ pub fn run() {
                 let m = manager.lock();
                 (m.running_pads(), m.render_slot(), m.live())
             };
-            // State-linked button colours: repaint the LEDs whenever OBS / Streamlabs change.
+            // Device and app volume / mute. No platform backend is wired in yet: the port
+            // reports itself unavailable and everything behaves as before.
+            let system_audio = system_audio::SystemAudio::new(Arc::new(system_audio::NoAudio), shared_live.clone());
+            // State-linked button colours: repaint the LEDs whenever OBS / Streamlabs / the system audio change.
             let live = {
                 let render_slot = render_slot.clone();
                 live::LiveHandle::new(
@@ -268,7 +273,7 @@ pub fn run() {
                 )
             };
             let obs = obs::ObsHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime, Some(live.clone()));
-            let slobs = slobs::SlobsHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime, Some(live));
+            let slobs = slobs::SlobsHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime, Some(live.clone()));
             let home_assistant = homeassistant::HaHandle::spawn(Some(app.handle().clone()), settings.clone(), &runtime);
             let hub = hub::HubHandle::spawn(app.handle().clone(), settings.clone());
 
@@ -290,6 +295,7 @@ pub fn run() {
                 downloads: Some(http::download_dir(app.handle())),
                 config_dir: Some(config_dir.clone()),
                 app: Some(app.handle().clone()),
+                system_audio: Some(system_audio.clone()),
             };
             let engine = MacroEngine::new(profile.clone(), running_pads, sink, services, runtime);
             // Shared variables survive restarts.
@@ -314,8 +320,10 @@ pub fn run() {
                 engine.set_device(manager.lock().state().device);
             }
 
+            system_audio_bridge::Bridge { audio: system_audio.clone(), live, engine: engine.clone(), profile: profile.clone(), app: Some(app.handle().clone()) }.spawn();
+
             let window_settings = settings.lock().settings.window.clone();
-            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, hub, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
+            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, hub, system_audio, history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
             if let Err(e) = tray::setup(app.handle(), &window_settings) {
                 tracing::warn!(error = %e, "tray icon could not be created");
             }
@@ -404,6 +412,9 @@ pub fn run() {
             // media
             list_audio_devices,
             list_system_audio_devices,
+            audio_list_devices,
+            audio_list_apps,
+            audio_status,
             analyze_audio,
             preview_sound,
             stop_sound,
