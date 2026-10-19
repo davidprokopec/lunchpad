@@ -17,6 +17,7 @@ import { ObsEditor } from "./ObsEditors";
 import { SoundEditor } from "./SoundEditor";
 import { SpeechEditor } from "./SpeechEditor";
 import { SystemVolumeEditor } from "./SystemVolumeEditor";
+import { SetAudioEditor } from "./SetAudioEditor";
 import { SetFaderEditor } from "./SetFaderEditor";
 import { AudioDeviceEditor } from "./AudioDeviceEditor";
 
@@ -110,6 +111,8 @@ export function ActionEditor({ action, onChange, pages, layout, button }: Props)
       return <SpeechEditor action={action} onChange={onChange} button={button} />;
     case "setSystemVolume":
       return <SystemVolumeEditor action={action} onChange={onChange} button={button} />;
+    case "setAudio":
+      return <SetAudioEditor action={action} onChange={onChange} button={button} />;
     case "setAudioDevice":
       return <AudioDeviceEditor action={action} onChange={onChange} />;
     case "launchApplication":

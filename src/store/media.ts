@@ -1,7 +1,10 @@
 import { create } from "zustand";
-import { api, events, type AudioDevices, type HaState, type ObsState, type SlobsState, type VoiceInfo } from "../lib/api";
+import { api, events, type AudioDevices, type AudioStatus, type HaState, type ObsState, type SlobsState, type VoiceInfo } from "../lib/api";
 
 interface MediaStore {
+  systemAudio: AudioStatus | null;
+  systemAudioError: string | null;
+  loadSystemAudio: () => Promise<void>;
   audioDevices: AudioDevices | null;
   voices: VoiceInfo[] | null;
   obs: ObsState | null;
@@ -31,7 +34,21 @@ interface MediaStore {
   homeAssistantRefresh: () => Promise<void>;
 }
 
+let systemAudioRevision = 0;
+
 export const useMediaStore = create<MediaStore>((set, get) => ({
+  systemAudio: null,
+  systemAudioError: null,
+  loadSystemAudio: async () => {
+    const revision = ++systemAudioRevision;
+    try {
+      const status = await api.audioStatus();
+      const [devices, apps] = await Promise.all([api.audioListDevices().catch(() => status.devices), api.audioListApps().catch(() => status.apps)]);
+      if (revision === systemAudioRevision) set({ systemAudio: { ...status, devices, apps }, systemAudioError: null });
+    } catch (error) {
+      if (revision === systemAudioRevision) set({ systemAudio: null, systemAudioError: String(error) });
+    }
+  },
   audioDevices: null,
   voices: null,
   obs: null,
@@ -46,10 +63,15 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
       events.onObsState((obs) => set({ obs })),
       events.onSlobsState((slobs) => set({ slobs })),
       events.onHomeAssistantState((homeAssistant) => set({ homeAssistant })),
+      events.onSystemAudio((systemAudio) => {
+        systemAudioRevision++;
+        set({ systemAudio, systemAudioError: null });
+      }),
     ]);
     void get().loadObs();
     void get().loadSlobs();
     void get().loadHomeAssistant();
+    void get().loadSystemAudio();
     return () => unlisten.forEach((fn) => fn());
   },
 

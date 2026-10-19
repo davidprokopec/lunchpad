@@ -1,11 +1,13 @@
-import type { ObsState, SlobsState, StateLink } from "./api";
+import type { AudioStatus, ObsState, SlobsState, StateLink } from "./api";
+import { audioState } from "./systemAudio";
 
 /**
  * Whether a button's "active while" link currently holds. Mirrors
  * `StateLink::is_active` in src-tauri/src/live.rs, which drives the LEDs.
  */
-export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null): boolean {
+export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null): boolean {
   if (!link) return false;
+  if (link.provider === "system") return link.kind === "audioMuted" && !!audioState(link.target, audio)?.muted;
   const p =
     link.provider === "obs"
       ? obs && {

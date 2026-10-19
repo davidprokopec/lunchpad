@@ -6,6 +6,9 @@ import { faderVariable, faderPadRgb, faderPads, formatFaderValue, hexToRgb, isCo
 import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useVariablesStore } from "../store/variables";
+import { useMediaStore } from "../store/media";
+import { audioControllable, audioFader, audioState } from "../lib/systemAudio";
+import { AudioTargetField } from "./AudioTargetField";
 import { ActionsTab } from "./actions/ActionsTab";
 import { RgbField } from "./RgbField";
 import { Select } from "./Select";
@@ -142,6 +145,9 @@ function FaderForm({
 }) {
   const { t } = useTranslation();
   const [fader, setFader] = useState<Fader>(initial);
+  const audio = useMediaStore((s) => s.systemAudio);
+  const shown = audioFader(fader, audio);
+  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio);
   const dirty = JSON.stringify(fader) !== JSON.stringify(initial);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
   const [tab, setTab] = useState<"fader" | "actions">("fader");
@@ -172,7 +178,7 @@ function FaderForm({
   const actionCount = fader.onChange.length + (strip ? (fader.onTouch?.length ?? 0) + (fader.onRelease?.length ?? 0) : 0);
   const setDirection = (direction: FaderDirection) => setFader({ ...fader, direction, length: Math.min(fader.length, maxFaderLength(layout, fader.x, fader.y, direction)) });
   const control = isControlCell(layout, fader.x, fader.y);
-  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max;
+  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max && (fader.bound?.type !== "app" || !!fader.bound.app.id);
 
   return (
     <>
@@ -243,15 +249,23 @@ function FaderForm({
 
         {control && <p className="text-xs text-stage-500">{t("fader.controlHint")}</p>}
 
+        <section className="flex flex-col gap-2">
+          <AudioTargetField manual value={fader.bound} onChange={(bound) => setFader({ ...fader, bound })} />
+          {fader.bound && <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-stage-500">{t("audio.rangeHint")}</p>
+            <UiButton size="sm" onClick={() => setFader({ ...fader, min: 0, max: 100, unit: "%", decimals: 0, display: null })}>{t("audio.percentRange")}</UiButton>
+          </div>}
+        </section>
+
         {!control && (
         <section className="flex flex-col gap-2">
           <div className="text-xs text-stage-400">{t("fader.preview")}</div>
           <div className="flex gap-1">
             {pads.map(([x, y], i) => {
-              const [r, g, b] = faderPadRgb(fader, i);
+              const [r, g, b] = unavailable ? (i === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shown, i);
               return <div key={`${x},${y}`} className="h-8 flex-1 rounded-md" style={{ backgroundColor: `rgb(${r}, ${g}, ${b})` }} title={`${x + 1}, ${y + 1}`} />;
             })}
-            <div className="ml-2 self-center text-xs text-stage-400">{formatFaderValue(fader)}</div>
+            <div className="ml-2 self-center text-xs text-stage-400">{unavailable ? t("audio.unavailableShort") : formatFaderValue(shown)}</div>
           </div>
           {overlaps && <p className="text-xs text-danger">{t("fader.overlap")}</p>}
           {covered > 0 && <p className="text-xs text-warn">{t("fader.covered", { count: covered })}</p>}
@@ -352,7 +366,7 @@ function FaderForm({
         </div>
         <div className="flex gap-2">
           <UiButton onClick={onCancel}>{t("common.cancel")}</UiButton>
-          <UiButton variant="primary" onClick={() => onSave(fader)} disabled={!valid}>
+          <UiButton variant="primary" onClick={() => onSave(fader.bound && !unavailable && !audioState(fader.bound, audio)?.muted ? shown : fader)} disabled={!valid}>
             {t("common.save")}
           </UiButton>
         </div>

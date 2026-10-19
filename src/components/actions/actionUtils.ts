@@ -450,6 +450,13 @@ export function summarize(t: TFunction, action: Action, pages: Page[]): string {
       if (action.mode === "adjust") return `${device} · ${action.volumeFrom ? `±{{${action.volumeFrom}}}` : `${action.volume >= 0 ? "+" : ""}${Math.round(action.volume)} %`}`;
       return `${device} · ${t(`volume.modes.${action.mode}`)}`;
     }
+    case "setAudio": {
+      const target = action.target;
+      const name = target.type === "app" ? target.app.name || t("audio.chooseApp") : target.device.type === "named" ? target.device.label : t(`audio.${target.device.type}`);
+      const mode = t(`audio.modes.${action.mode}`);
+      const volume = action.volumeFrom ? `{{${action.volumeFrom}}}` : `${action.mode === "adjustVolume" && action.volume >= 0 ? "+" : ""}${Math.round(action.volume)} %`;
+      return `${name} · ${mode}${action.mode === "setVolume" || action.mode === "adjustVolume" ? ` ${volume}` : ""}`;
+    }
     case "homeAssistantTurn":
       return `${action.entity || "…"} · ${t(`ha.modes.${action.mode}`)}`;
     case "homeAssistantSetValue": {

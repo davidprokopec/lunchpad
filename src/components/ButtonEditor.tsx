@@ -21,6 +21,10 @@ import { ConfirmPrompt } from "./ConfirmPrompt";
 import { Button as UiButton, IconClose, Segmented, Toggle } from "./ui";
 import { Tooltip } from "./Tooltip";
 import { StateLinkField } from "./StateLinkField";
+import { muteButton } from "../lib/buttonPresets";
+import { useMediaStore } from "../store/media";
+import { isLinkActive } from "../lib/stateLink";
+import { AudioTargetField } from "./AudioTargetField";
 
 const NO_PAGES: Page[] = [];
 
@@ -131,22 +135,29 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
   const [button, setButton] = useState<Button>(() => initial ?? randomNewButton());
   const [tab, setTab] = useState<Tab>("appearance");
   const [previewActive, setPreviewActive] = useState(false);
+  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio));
   const pad = layout?.pads.find((p) => p.x === x && p.y === y);
   const ledKind = pad?.led ?? "rgb";
   /** A tap-only button (Arp, Scale): the device reports no release, so only the pressed list. */
   const momentary = pad?.momentary ?? false;
   const [imageError, setImageError] = useState<string | null>(null);
   const dirty = JSON.stringify(button) !== JSON.stringify(initial);
+  const mutePreset = button.down.length === 1 && button.up.length === 1 && button.hold.length === 0
+    && button.down[0].type === "setAudio" && button.down[0].mode === "holdMute"
+    && button.up[0].type === "setAudio" && button.up[0].mode === "holdMute"
+    && button.stateLink?.provider === "system" && button.stateLink.kind === "audioMuted";
+  const valid = [...button.down, ...button.up, ...button.hold].every((a) => a.type !== "setAudio" || a.target.type !== "app" || !!a.target.app.id)
+    && (button.stateLink?.target?.type !== "app" || !!button.stateLink.target.app.id);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onCancel();
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) onSave(button);
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && valid) onSave(button);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [button, onCancel, onSave]);
+  }, [button, onCancel, onSave, valid]);
 
   const setLook = (look: Look) => setButton({ ...button, look });
   const textLook = button.look.type === "text" ? button.look : null;
@@ -202,9 +213,10 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
             onPointerUp={() => setPreviewActive(false)}
             onPointerLeave={() => setPreviewActive(false)}
           >
-            <PadFace button={button} cell={144} active={previewActive} corners={cornersOf(pad?.shape)} limited={limited} noLed={ledKind === "none"} mask={pad?.mask ?? false} symbol={pad?.label ?? null} />
+            <PadFace button={button} cell={144} active={previewActive || linked} corners={cornersOf(pad?.shape)} limited={limited} noLed={ledKind === "none"} mask={pad?.mask ?? false} symbol={pad?.label ?? null} />
           </div>
           <p className="text-center text-xs text-stage-400">{t("editor.previewHint")}</p>
+          {!initial && !momentary && <UiButton size="sm" onClick={() => setButton(muteButton(t("audio.micCaption")))}>{t("audio.mutePreset")}</UiButton>}
         </div>
 
         {/* Form */}
@@ -215,6 +227,14 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
           </div>
         ) : (
         <div className="flex flex-col gap-6">
+          {mutePreset && <section className="flex flex-col gap-3">
+            <h3 className="text-sm font-medium text-stage-100">{t("audio.mutePreset")}</h3>
+            <AudioTargetField control="mute" value={button.stateLink?.target} onChange={(target) => {
+              if (!target || !button.stateLink) return;
+              setButton({ ...button, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target } });
+            }} />
+            <p className="text-xs text-stage-500">{t("audio.presetHint", { ms: button.holdMs })}</p>
+          </section>}
           <section className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-medium text-stage-100">{t("editor.label")}</h3>
@@ -352,7 +372,7 @@ function EditorForm({ pageId, x, y, initial, limited, pages, layout, onCancel, o
         </div>
         <div className="flex gap-2">
           <UiButton onClick={onCancel}>{t("common.cancel")}</UiButton>
-          <UiButton variant="primary" onClick={() => onSave(button)}>
+          <UiButton variant="primary" disabled={!valid} onClick={() => onSave(button)}>
             {t("common.save")}
           </UiButton>
         </div>
