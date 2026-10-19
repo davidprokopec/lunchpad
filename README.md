@@ -76,7 +76,7 @@ bun run build                                  # type check and interface build
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Settings and pages are stored in the platform config directory (`~/Library/Application Support/com.lunchpad.app` on macOS, `%APPDATA%\com.lunchpad.app` on Windows). Novation's programmer reference manuals are in `docs/novation/`, hardware test tools in `src-tauri/examples/`.
+Settings and pages are stored in the platform config directory (`~/Library/Application Support/com.davidprokopec.lunchpad` on macOS, `%APPDATA%\com.davidprokopec.lunchpad` on Windows). Novation's programmer reference manuals are in `docs/novation/`, hardware test tools in `src-tauri/examples/`.
 
 ### Documentation
 

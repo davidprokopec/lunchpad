@@ -11,7 +11,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.lunchpad.app");
+    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.davidprokopec.lunchpad");
     let settings = Arc::new(Mutex::new(SettingsStore::load(&dir)));
     let obs = ObsHandle::spawn(None, settings, &tokio::runtime::Handle::current(), None);
     obs.connect().await.expect("connect");

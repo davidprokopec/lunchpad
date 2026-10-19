@@ -13,7 +13,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().with_env_filter("lunchpad_lib=debug").init();
-    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.lunchpad.app");
+    let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/com.davidprokopec.lunchpad");
     let settings = Arc::new(Mutex::new(SettingsStore::load(&dir)));
     let slobs = SlobsHandle::spawn(None, settings, &tokio::runtime::Handle::current(), None);
     slobs.connect().await.expect("connect");

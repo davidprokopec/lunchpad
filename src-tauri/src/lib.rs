@@ -137,6 +137,10 @@ impl EngineSink for TauriSink {
     }
 }
 
+/// The bundle identifier from `tauri.conf.json`, for the places that need it
+/// before the app exists (log folder) or outside Tauri's path API (keychain).
+pub(crate) const APP_IDENTIFIER: &str = "com.davidprokopec.lunchpad";
+
 /// Where the log files go: the platform's log folder for the app identifier
 /// (the same place Tauri's `app_log_dir` resolves to), computed before the app
 /// exists so the earliest lines are captured too.
@@ -144,18 +148,18 @@ fn log_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/com.lunchpad.app"))
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs").join(APP_IDENTIFIER))
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("com.lunchpad.app").join("logs"))
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(APP_IDENTIFIER).join("logs"))
     }
     #[cfg(target_os = "linux")]
     {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .map(|d| d.join("com.lunchpad.app/logs"))
+            .map(|d| d.join(APP_IDENTIFIER).join("logs"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
@@ -213,7 +217,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // The window comes back where and how it was left: size, position and whether it was
         // maximized. Visibility is not part of it; "start hidden" decides that.
