@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useMediaStore } from "../../store/media";
 import { useSettingsStore } from "../../store/settings";
@@ -17,8 +17,9 @@ export function SoundTab() {
   const loadAudioDevices = useMediaStore((s) => s.loadAudioDevices);
   const status = useMediaStore((s) => s.systemAudio);
   const refresh = useMediaStore((s) => s.loadSystemAudio);
-  const [error, setError] = useState<string | null>(null);
-  const audio = settings?.audio;
+  const error = useSettingsStore((s) => s.audioError);
+  const desired = useSettingsStore((s) => s.audioDesired);
+  const audio = desired ?? settings?.audio;
   const supported = typeof audio?.macosAppVolume === "boolean";
 
   useEffect(() => {
@@ -30,12 +31,12 @@ export function SoundTab() {
       <div className="flex max-w-lg items-center gap-2">
         <Select
           className="flex-1"
-          value={settings?.audio.outputDevice ?? SYSTEM_DEFAULT}
+          value={audio?.outputDevice ?? SYSTEM_DEFAULT}
           options={[
             { value: SYSTEM_DEFAULT, label: audioDevices?.default ? `${t("settings.systemDefaultDevice")} (${audioDevices.default})` : t("settings.systemDefaultDevice") },
             ...(audioDevices?.devices ?? []).map((d) => ({ value: d, label: d })),
           ]}
-          onChange={(v) => { if (audio) void setAudio({ ...audio, outputDevice: v === SYSTEM_DEFAULT ? null : v }); }}
+          onChange={(v) => { if (audio) void setAudio({ outputDevice: v === SYSTEM_DEFAULT ? null : v }).catch(() => undefined); }}
         />
         <Button size="sm" onClick={() => void loadAudioDevices()}>
           {t("settings.refreshDevices")}
@@ -45,9 +46,7 @@ export function SoundTab() {
     {isMac && <Section title={t("audio.macTitle")} description={t("audio.macHint")}>
       <Toggle checked={audio?.macosAppVolume ?? false} disabled={!supported} label={t("audio.macToggle")} hint={!supported ? t("audio.macUnavailable") : undefined} onChange={(macosAppVolume) => {
         if (!audio || !supported) return;
-        const config = { ...audio, macosAppVolume };
-        setError(null);
-        void setAudio(config).then(refresh).catch((reason) => setError(String(reason)));
+        void setAudio({ macosAppVolume }).then(refresh).catch(() => undefined);
       }} />
       <div className="mt-3 flex items-start justify-between gap-3">
         <div className="flex flex-col gap-1 text-xs text-stage-400" role="status">
@@ -56,7 +55,7 @@ export function SoundTab() {
           {error && <p className="text-danger">{error}</p>}
           <p className="text-stage-500">{t("audio.retryHint")}</p>
         </div>
-        <Button size="sm" onClick={() => void refresh()}>{t("audio.retry")}</Button>
+        <Button size="sm" onClick={() => { if (error) void setAudio({}).then(refresh).catch(() => undefined); else void refresh(); }}>{t("audio.retry")}</Button>
       </div>
     </Section>}</>
   );
