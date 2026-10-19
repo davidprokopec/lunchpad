@@ -255,14 +255,14 @@ impl Shared {
         serviced: Option<u64>,
         next: Result<Vec<Device>, Error>,
         applied: bool,
-    ) {
+    ) -> bool {
         let mut requests = lock(&self.requests);
         if let Some(id) = serviced {
             requests.refreshed = requests.refreshed.max(id);
         }
         if let Some(wedged_by) = requests.wedged_by {
             if requests.refreshed < wedged_by {
-                return;
+                return false;
             }
             requests.wedged_by = None;
         }
@@ -275,6 +275,7 @@ impl Shared {
         if changed || applied {
             self.hub.notify(Changes::DEVICES);
         }
+        true
     }
 
     fn publish_apps(&self, next: Vec<App>, applied: bool) {
@@ -542,16 +543,20 @@ fn run_worker(
                 let device_command = command.is_device();
                 let result = execute(&shared, backend.as_mut(), command);
                 let applied = result.is_ok();
-                // Answer before refreshing: a slow snapshot must not count
-                // against the caller's command timeout.
-                let _ = reply.send(result);
-                // A successful setter always publishes the state it produced,
-                // even when the OS value did not change.
-                let applied = Applied {
-                    devices: applied && device_command,
-                    apps: applied && !device_command,
+                // A successful reply guarantees an authoritative target read.
+                // Unrelated snapshots remain after the reply so a slow app
+                // enumeration cannot delay a device setter, and vice versa.
+                let readback = if device_command {
+                    refresh_devices(&shared, backend.as_mut(), applied, Some(id))
+                } else {
+                    refresh_apps(&shared, backend.as_mut(), applied)
                 };
-                refresh_with(&shared, backend.as_mut(), applied, Some(id));
+                let _ = reply.send(result.and(readback));
+                if device_command {
+                    let _ = refresh_apps(&shared, backend.as_mut(), false);
+                } else {
+                    let _ = refresh_devices(&shared, backend.as_mut(), false, Some(id));
+                }
             }
             Ok(Msg::Dirty) => {
                 pending.store(false, Ordering::Release);
@@ -630,37 +635,53 @@ fn ensure_known(shared: &Shared, app: &str) -> Result<(), Error> {
     }
 }
 
-/// Which snapshot a successful setter changed.
-#[derive(Clone, Copy, Default)]
-struct Applied {
-    devices: bool,
-    apps: bool,
-}
-
 /// Takes fresh snapshots and publishes what changed. A failed app snapshot
 /// keeps the previous list and reports the app side unavailable; the next poll
 /// tries again. The status is refreshed too (e.g. a Windows output device
 /// appearing or disappearing).
 fn refresh(shared: &Shared, backend: &mut dyn Backend) {
-    refresh_with(shared, backend, Applied::default(), None);
+    let _ = refresh_devices(shared, backend, false, None);
+    let _ = refresh_apps(shared, backend, false);
 }
 
-fn refresh_with(
+fn refresh_devices(
     shared: &Shared,
     backend: &mut dyn Backend,
-    applied: Applied,
+    applied: bool,
     serviced: Option<u64>,
-) {
+) -> Result<(), Error> {
     // The OS read happens before, never under, the publication locks.
     let next_devices = backend.devices();
-    shared.publish_devices(serviced, next_devices, applied.devices);
+    let result = next_devices.as_ref().map(|_| ()).map_err(Clone::clone);
+    if shared.publish_devices(serviced, next_devices, applied) {
+        result
+    } else {
+        Err(Error::new(
+            ErrorKind::Timeout,
+            "a later timed-out request still blocks device readback",
+        ))
+    }
+}
+
+fn refresh_apps(shared: &Shared, backend: &mut dyn Backend, applied: bool) -> Result<(), Error> {
     match backend.snapshot() {
         Ok(next) => {
-            shared.publish_apps(next, applied.apps);
-            shared.publish_status(backend.status());
+            shared.publish_apps(next, applied);
+            let status = backend.status();
+            let result = if status.available {
+                Ok(())
+            } else {
+                Err(Error::new(ErrorKind::Unsupported, status.message.clone()))
+            };
+            shared.publish_status(status);
+            result
         }
         Err(e) => {
-            shared.publish_status(AppStatus::unavailable(backend.status().backend, e.message))
+            shared.publish_status(AppStatus::unavailable(
+                backend.status().backend,
+                e.message.clone(),
+            ));
+            Err(e)
         }
     }
 }
@@ -1086,11 +1107,13 @@ mod tests {
     struct Tunable {
         set_delay: Arc<Mutex<Duration>>,
         snapshot_delay: Arc<Mutex<Duration>>,
+        device_delay: Arc<Mutex<Duration>>,
         panic_on_snapshot: Arc<AtomicBool>,
     }
 
     impl Backend for Tunable {
         fn devices(&mut self) -> Result<Vec<Device>, Error> {
+            std::thread::sleep(*lock(&self.device_delay));
             Ok(vec![Device {
                 id: "device".into(),
                 name: "Device".into(),
@@ -1146,6 +1169,197 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(2);
+
+    struct Readback {
+        gate: Arc<AtomicBool>,
+        fail_read: Arc<AtomicBool>,
+        device_target: bool,
+        entered: Sender<()>,
+        release: Receiver<()>,
+        volume: f32,
+        muted: bool,
+    }
+
+    impl Readback {
+        fn read(&self) -> Result<(), Error> {
+            if self.gate.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).expect("readback entered");
+                self.release.recv().expect("release readback");
+            }
+            if self.fail_read.load(Ordering::Acquire) {
+                Err(Error::new(ErrorKind::Native, "readback failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Backend for Readback {
+        fn status(&self) -> AppStatus {
+            AppStatus {
+                can_mute: true,
+                ..Tunable::default().status()
+            }
+        }
+        fn poll_interval(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn snapshot(&mut self) -> Result<Vec<App>, Error> {
+            if !self.device_target {
+                self.read()?;
+            }
+            Ok(vec![App {
+                volume: self.volume,
+                muted: self.muted,
+                ..app("a")
+            }])
+        }
+        fn devices(&mut self) -> Result<Vec<Device>, Error> {
+            if self.device_target {
+                self.read()?;
+            }
+            let mut devices = Tunable::default().devices()?;
+            devices[0].volume = self.volume;
+            devices[0].muted = self.muted;
+            Ok(devices)
+        }
+        fn set_volume(&mut self, _: &str, volume: f32) -> Result<(), Error> {
+            self.volume = (volume * 10.0).round() / 10.0; // authoritative OS quantisation, not the requested value
+            Ok(())
+        }
+        fn set_mute(&mut self, _: &str, muted: bool) -> Result<(), Error> {
+            self.muted = muted;
+            Ok(())
+        }
+        fn set_device_volume(&mut self, _: &str, _: DeviceKind, volume: f32) -> Result<(), Error> {
+            self.set_volume("a", volume)
+        }
+        fn set_device_mute(&mut self, _: &str, _: DeviceKind, muted: bool) -> Result<(), Error> {
+            self.set_mute("a", muted)
+        }
+    }
+
+    #[test]
+    fn setters_publish_authoritative_app_and_device_readback_before_success() {
+        for device_target in [false, true] {
+            let (entered, _rx) = mpsc::channel();
+            let (_tx, release) = mpsc::channel();
+            let fail_read = Arc::new(AtomicBool::new(false));
+            let backend = Readback {
+                gate: Arc::new(AtomicBool::new(false)),
+                fail_read: Arc::clone(&fail_read),
+                device_target,
+                entered,
+                release,
+                volume: 0.5,
+                muted: false,
+            };
+            let engine = Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
+            let volume = |v| {
+                if device_target {
+                    Command::DeviceVolume("device".into(), DeviceKind::Output, v)
+                } else {
+                    Command::AppVolume("a".into(), v)
+                }
+            };
+            let mute = |m| {
+                if device_target {
+                    Command::DeviceMute("device".into(), DeviceKind::Output, m)
+                } else {
+                    Command::AppMute("a".into(), m)
+                }
+            };
+            assert_eq!(engine.command(volume(0.27)), Ok(()));
+            assert_eq!(
+                if device_target {
+                    engine.list_devices().unwrap()[0].volume
+                } else {
+                    engine.list().unwrap()[0].volume
+                },
+                0.3
+            );
+            for muted in [true, false, true, false] {
+                assert_eq!(engine.command(mute(muted)), Ok(()));
+                assert_eq!(
+                    if device_target {
+                        engine.list_devices().unwrap()[0].muted
+                    } else {
+                        engine.list().unwrap()[0].muted
+                    },
+                    muted
+                );
+            }
+            fail_read.store(true, Ordering::Release);
+            assert_eq!(
+                engine.command(volume(0.8)).map_err(|e| e.kind),
+                Err(ErrorKind::Native)
+            );
+            assert!(if device_target {
+                engine.list_devices().is_err()
+            } else {
+                engine.list().is_err()
+            });
+        }
+    }
+
+    #[test]
+    fn blocked_target_readback_times_out_invalidates_and_recovers_without_optimism() {
+        for device_target in [false, true] {
+            let (entered, read_entered) = mpsc::channel();
+            let (release_read, release) = mpsc::channel();
+            let gate = Arc::new(AtomicBool::new(false));
+            let backend = Readback {
+                gate: Arc::clone(&gate),
+                fail_read: Arc::new(AtomicBool::new(false)),
+                device_target,
+                entered,
+                release,
+                volume: 0.5,
+                muted: false,
+            };
+            let mut engine =
+                Engine::start(BackendKind::None, Box::new(move |_| Ok(Box::new(backend))));
+            engine.command_timeout = Duration::from_millis(50);
+            gate.store(true, Ordering::Release);
+            std::thread::scope(|scope| {
+                let request = scope.spawn(|| {
+                    engine.command(if device_target {
+                        Command::DeviceVolume("device".into(), DeviceKind::Output, 0.27)
+                    } else {
+                        Command::AppVolume("a".into(), 0.27)
+                    })
+                });
+                read_entered
+                    .recv_timeout(WAIT)
+                    .expect("setter entered its readback");
+                assert_eq!(
+                    if device_target {
+                        engine.list_devices().unwrap()[0].volume
+                    } else {
+                        engine.list().unwrap()[0].volume
+                    },
+                    0.5,
+                    "no optimistic echo while readback is blocked"
+                );
+                assert_eq!(
+                    request.join().unwrap().map_err(|e| e.kind),
+                    Err(ErrorKind::Timeout)
+                );
+            });
+            assert!(engine.list_devices().is_err());
+            assert!(is_wedged(&engine));
+            release_read.send(()).unwrap();
+            wait_until(|| !is_wedged(&engine));
+            assert_eq!(
+                if device_target {
+                    engine.list_devices().unwrap()[0].volume
+                } else {
+                    engine.list().unwrap()[0].volume
+                },
+                0.3
+            );
+        }
+    }
 
     /// Records every write and holds it until released.
     struct Ordered {
@@ -1295,11 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_answered_before_the_refresh_that_follows_it() {
+    fn an_app_command_is_answered_before_the_unrelated_device_refresh() {
         let tunable = Tunable::default();
         let mut engine = start_tunable(&tunable);
         engine.command_timeout = Duration::from_millis(300);
-        *lock(&tunable.snapshot_delay) = Duration::from_millis(600);
+        *lock(&tunable.device_delay) = Duration::from_millis(600);
         let started = std::time::Instant::now();
         assert_eq!(set_a(&engine), Ok(()));
         assert!(started.elapsed() < Duration::from_millis(300));
@@ -1606,8 +1820,8 @@ mod tests {
         let (earlier, later) = (issue(&shared), issue(&shared));
         shared.time_out(later);
         assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
-        shared.publish_devices(None, devices(), true);
-        shared.publish_devices(Some(earlier), devices(), true);
+        assert!(!shared.publish_devices(None, devices(), true));
+        assert!(!shared.publish_devices(Some(earlier), devices(), true));
         assert!(wedged(&shared));
         assert_eq!(
             lock(&shared.devices).as_ref().map_err(|e| e.kind),
@@ -1621,9 +1835,9 @@ mod tests {
         shared.time_out(later);
         shared.time_out(last);
         assert_eq!(sub.try_recv(), Ok(Changes::default()));
-        shared.publish_devices(Some(later), devices(), false);
+        assert!(!shared.publish_devices(Some(later), devices(), false));
         assert!(wedged(&shared));
-        shared.publish_devices(Some(last), devices(), false);
+        assert!(shared.publish_devices(Some(last), devices(), false));
         assert!(!wedged(&shared));
         assert!(lock(&shared.devices).is_ok());
         assert_eq!(sub.try_recv(), Ok(Changes::DEVICES));
@@ -1636,8 +1850,15 @@ mod tests {
         assert!(engine.status().available);
         let sub = engine.subscribe();
         tunable.panic_on_snapshot.store(true, Ordering::Release);
-        // The reply comes first; the refresh after it panics.
-        assert_eq!(set_a(&engine), Ok(()));
+        // Device readback and reply come first; the unrelated app refresh panics.
+        assert_eq!(
+            engine.command(Command::DeviceVolume(
+                "device".into(),
+                DeviceKind::Output,
+                0.5
+            )),
+            Ok(())
+        );
         assert!(eventually(|| !engine.status().available));
         assert!(engine
             .status()

@@ -1,4 +1,5 @@
-//! System audio: live input/output devices and per-app volume, with real mute.
+//! System audio: live input/output devices and per-app volume, with native or
+//! persistently emulated mute.
 //!
 //! A [`SystemAudio`] handle fronts one worker thread that owns the platform
 //! backend (Core Audio on macOS, WASAPI/COM on Windows). OS notifications
@@ -6,7 +7,8 @@
 //! the worker to refresh; the worker keeps authoritative snapshots and tells
 //! subscribers what changed ([`SystemAudio::subscribe`]). Reads come from those
 //! snapshots and never block on the OS. Setters run on the worker, wait at
-//! most 3 s, and publish the resulting state afterwards. They block the calling
+//! most 3 s including authoritative target readback, and publish that state
+//! before returning success. They block the calling
 //! thread, so async callers should use `spawn_blocking`.
 //!
 //! Writes are serialised FIFO: the single worker executes commands in the
@@ -20,6 +22,7 @@
 //! its C ABI. Per-app volume on macOS needs process taps, which are off unless
 //! the `audio.macosAppVolume` setting enables them.
 
+mod emulation;
 mod engine;
 mod hub;
 mod model;
@@ -37,6 +40,7 @@ pub use model::{App, Device, DeviceKind};
 
 use engine::{AppStatus, Command, Engine, MakeBackend};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::{Arc, Weak};
 
 /// Tauri event carrying an [`AudioState`] whenever devices, apps or the status change.
@@ -147,14 +151,27 @@ impl SystemAudio {
     /// Starts the platform backend. Waits for the first snapshot (normally
     /// milliseconds, at most 5 s). Never fails: an unavailable backend is
     /// reported through [`SystemAudio::status`] and errors.
+    /// Mute restore levels are memory-only; use `start_in` in the application.
     pub fn start(options: Options) -> SystemAudio {
         let (kind, make) = platform(options);
         SystemAudio::with_backend(kind, make)
     }
 
+    /// Starts with persistent mute restore levels in the app config folder.
+    /// Use this entry point in the application; `start` uses memory only.
+    pub fn start_in(options: Options, config_dir: &Path) -> SystemAudio {
+        let (kind, make) = platform(options);
+        SystemAudio {
+            engine: Arc::new(Engine::start(
+                kind,
+                emulation::wrap(make, Some(config_dir.to_path_buf())),
+            )),
+        }
+    }
+
     fn with_backend(kind: BackendKind, make: MakeBackend) -> SystemAudio {
         SystemAudio {
-            engine: Arc::new(Engine::start(kind, make)),
+            engine: Arc::new(Engine::start(kind, emulation::wrap(make, None))),
         }
     }
 
@@ -209,16 +226,11 @@ impl SystemAudio {
             .command(Command::DeviceVolume(device.id, device.kind, volume))
     }
 
-    /// Mutes or unmutes a device with its real mute control (never by volume).
-    /// A device without one (`can_mute == false`) fails with `Unsupported`.
+    /// Uses the real mute control when available. Otherwise emulates mute
+    /// with volume zero and a persisted restore level (`emulated: true`).
     /// Blocks for at most 3 s.
     pub fn set_muted(&self, target: &DeviceRef, muted: bool) -> Result<(), Error> {
         let device = self.device(target)?;
-        // Seam for mute emulation (pending user decision 1): a device without a
-        // mute control would branch here to "volume 0, remember the level
-        // persistently, restore it on unmute", and the snapshot would report it
-        // muted with `emulated: true`. Not built yet, so the worker's
-        // capability check rejects such devices.
         self.engine
             .command(Command::DeviceMute(device.id, device.kind, muted))
     }
@@ -417,6 +429,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("volume {id} {kind:?} {volume}"));
+            for device in self
+                .devices
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .filter(|d| d.id == id && d.kind == kind)
+            {
+                device.volume = volume;
+            }
             Ok(())
         }
         fn set_device_mute(
@@ -634,6 +655,83 @@ mod tests {
             audio.app("not an id").map_err(|e| e.kind),
             Err(ErrorKind::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn rapid_taps_read_the_completed_mute_before_the_next_tap() {
+        for real_mute in [false, true] {
+            let raw = Arc::new(Mutex::new(vec![Device {
+                can_mute: real_mute,
+                ..device("mic", DeviceKind::Input, true)
+            }]));
+            let backend = Mock {
+                devices: Arc::clone(&raw),
+                calls: Arc::default(),
+            };
+            let audio = SystemAudio::with_backend(
+                BackendKind::None,
+                Box::new(move |_| Ok(Box::new(backend))),
+            );
+            for _ in 0..50 {
+                let before = audio.device(&DeviceRef::DefaultInput).unwrap();
+                audio
+                    .set_muted(&DeviceRef::DefaultInput, !before.muted)
+                    .unwrap();
+                let after = audio.device(&DeviceRef::DefaultInput).unwrap();
+                assert_eq!(
+                    after.muted, !before.muted,
+                    "setters must complete readback before returning"
+                );
+                assert_eq!(after.emulated, !real_mute);
+                assert_eq!(after.volume, 0.5);
+                assert_eq!(
+                    raw.lock().unwrap()[0].volume,
+                    if after.muted && !real_mute { 0.0 } else { 0.5 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_persisted_mute_survives_service_restart_and_keeps_the_new_restore_volume() {
+        let dir = std::env::temp_dir().join(format!("lunchpad-service-{}", uuid::Uuid::new_v4()));
+        let raw = Arc::new(Mutex::new(vec![Device {
+            can_mute: false,
+            ..device("mic", DeviceKind::Input, true)
+        }]));
+        let start = || {
+            let backend = Mock {
+                devices: Arc::clone(&raw),
+                calls: Arc::default(),
+            };
+            let make: MakeBackend = Box::new(move |_| Ok(Box::new(backend)));
+            SystemAudio {
+                engine: Arc::new(Engine::start(
+                    BackendKind::None,
+                    emulation::wrap(make, Some(dir.clone())),
+                )),
+            }
+        };
+        let audio = start();
+        audio.set_muted(&DeviceRef::DefaultInput, true).unwrap();
+        audio.set_volume(&DeviceRef::DefaultInput, 0.7).unwrap();
+        assert_eq!(
+            raw.lock().unwrap()[0].volume,
+            0.0,
+            "a volume set while muted only changes the restore level"
+        );
+        assert_eq!(audio.device(&DeviceRef::DefaultInput).unwrap().volume, 0.7);
+        drop(audio);
+        let restarted = start();
+        assert!(restarted.device(&DeviceRef::DefaultInput).unwrap().muted);
+        restarted
+            .set_muted(&DeviceRef::DefaultInput, false)
+            .unwrap();
+        assert_eq!(raw.lock().unwrap()[0].volume, 0.7);
+        assert!(!restarted.device(&DeviceRef::DefaultInput).unwrap().muted);
+        drop(restarted);
+        assert!(!start().device(&DeviceRef::DefaultInput).unwrap().muted);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

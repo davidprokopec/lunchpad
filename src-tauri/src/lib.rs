@@ -274,7 +274,8 @@ pub fn run() {
             let hub = hub::HubHandle::spawn(app.handle().clone(), settings.clone());
             // Devices and per-app volume, live. Taps (macOS per-app volume) only on request.
             let macos_taps = settings.lock().settings.audio.macos_app_volume;
-            let sysaudio = sysaudio::SystemAudio::start(sysaudio::Options { macos_taps });
+            let sysaudio =
+                sysaudio::SystemAudio::start_in(sysaudio::Options { macos_taps }, &config_dir);
             sysaudio::forward_to_window(&sysaudio, app.handle().clone());
 
             let sink = Arc::new(TauriSink {

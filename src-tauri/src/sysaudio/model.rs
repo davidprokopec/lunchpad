@@ -43,12 +43,10 @@ pub struct Device {
     pub muted: bool,
     pub is_default: bool,
     pub can_set_volume: bool,
-    /// The device has a real mute control (Core Audio mute property, endpoint
-    /// mute). `muted` reports that control.
+    /// A real or emulated mute control is available.
     pub can_mute: bool,
     /// Mute is emulated (volume 0 with the level remembered) because the device
-    /// has no mute control. Always false for now: emulation awaits a user
-    /// decision; see the seam in `SystemAudio::set_muted`.
+    /// has no mute control. While muted, `volume` is the remembered level.
     pub emulated: bool,
 }
 
