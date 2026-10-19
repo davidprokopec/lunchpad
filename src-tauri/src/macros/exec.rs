@@ -365,7 +365,7 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                 SetAudioMode::HoldMute => {
                     // Physical input already queued this gesture in event order. Macro
                     // cancellation must not remove its safety release.
-                    if ctx.physical_audio() {
+                    if ctx.physical_audio(&action.id) {
                         return;
                     }
                     let key = (ctx.page_id.clone(), ctx.x, ctx.y);

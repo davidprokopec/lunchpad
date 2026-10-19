@@ -672,6 +672,14 @@ impl SystemAudio {
 pub struct FakeAudio {
     state: Mutex<FakeState>,
     subscribers: Mutex<Vec<Sender<()>>>,
+    #[cfg(test)]
+    volume_gate: Mutex<Option<VolumeGate>>,
+}
+
+#[cfg(test)]
+struct VolumeGate {
+    entered: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Default)]
@@ -693,6 +701,17 @@ pub enum FakeWrite {
 }
 
 impl FakeAudio {
+    #[cfg(test)]
+    pub fn block_next_volume(&self) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, ready) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        *self.volume_gate.lock() = Some(VolumeGate {
+            entered,
+            release: blocked,
+        });
+        (ready, release)
+    }
+
     pub fn new(devices: Vec<AudioDevice>, apps: Vec<AudioApp>) -> FakeAudio {
         let fake = FakeAudio::default();
         {
@@ -772,6 +791,11 @@ impl AudioControl for FakeAudio {
         kind: AudioDeviceKind,
         volume: f32,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(gate) = self.volume_gate.lock().take() {
+            let _ = gate.entered.send(());
+            gate.release.recv().map_err(|e| e.to_string())?;
+        }
         {
             let mut st = self.state.lock();
             let d = st
