@@ -57,7 +57,7 @@ jobs:
             echo "Release $tag already exists, the build jobs will attach to it."
           else
             gh release create "$tag" --draft --title "Lunchpad $tag" --target "$GITHUB_SHA" \
-              --notes "Download the installer for your system below. Installed copies update themselves."
+              --notes "Download the installer for your system below. This build has no auto-updater."
             echo "Created draft release $tag."
           fi
       - uses: oven-sh/setup-bun@v2
@@ -180,14 +180,14 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "Lunchpad v__VERSION__"
-          releaseBody: "Download the installer for your system below. Installed copies update themselves."
+          releaseBody: "Download the installer for your system below. This build has no auto-updater."
           releaseDraft: true
           # Release candidates are published as normal releases on purpose: the updater reads
           # releases/latest/download/latest.json, and GitHub's "latest" skips pre-releases, so a
           # flagged rc would be invisible to installed copies. Semver ordering still holds:
           # 1.0.0-rc.1 updates 1.0.0-rc.0, and 1.0.0 updates every rc.
           prerelease: false
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Notarize and staple the DMG (only when the secrets exist)
