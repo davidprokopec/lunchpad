@@ -187,6 +187,67 @@ export interface WaveLinkSettings {
   port: number | null;
 }
 
+export interface FineTuneSettings {
+  enabled: boolean;
+  autoConnect: boolean;
+}
+
+export type FineTuneTarget =
+  | { type: "app"; appId: string }
+  | { type: "output"; deviceUid: string }
+  | { type: "input"; deviceUid: string };
+
+export type FineTuneRoutingRequest = { mode: "followDefault" } | { mode: "single"; deviceUID: string };
+export type FineTuneRouting = FineTuneRoutingRequest | { mode: "multi"; deviceUIDs: string[] };
+
+export interface FineTuneApp {
+  appId: string;
+  pids: number[];
+  name: string;
+  active: boolean;
+  volume: number;
+  boost: number;
+  muted: boolean;
+  routing: {
+    requested: FineTuneRouting;
+    appliedDeviceUIDs: string[] | null;
+    status: "unavailable" | "pending" | "applied" | "failed";
+    error: { code: string; message: string } | null;
+  };
+}
+
+export interface FineTuneDevice {
+  uid: string;
+  name: string;
+  direction: AudioDeviceKind;
+  isDefault: boolean;
+  volume: number | null;
+  muted: boolean | null;
+  volumeSource: "hardware" | "ddc" | "software" | null;
+  capabilities: { volumeReadable: boolean; muteReadable: boolean; selectable: boolean };
+}
+
+export interface FineTuneSnapshot {
+  apps: FineTuneApp[];
+  devices: FineTuneDevice[];
+  defaultOutput: string | null;
+  defaultInput: string | null;
+  inputPolicy: { lockEnabled: boolean; preferredDeviceUID: string | null; lockedDeviceUID: string | null };
+  permission: { audioCapture: "unknown" | "authorized" | "denied"; source: "preflight" | "assumed" };
+}
+
+export interface FineTuneState {
+  status: "disabled" | "disconnected" | "connecting" | "synchronizing" | "ready" | "unsupported" | "error";
+  connected: boolean;
+  error: string | null;
+  appVersion: string | null;
+  sessionId: string | null;
+  revision: number;
+  generation: number;
+  serverRevision: number | null;
+  snapshot: FineTuneSnapshot | null;
+}
+
 export type WaveLinkTarget =
   | { type: "channel"; channelId: string }
   | { type: "channelMix"; channelId: string; mixId: string }
@@ -415,6 +476,7 @@ export interface Settings {
   pushToTalk: PushToTalkSettings;
   audio: AudioSettings;
   waveLink: WaveLinkSettings;
+  fineTune: FineTuneSettings;
   obs: ObsSettings;
   slobs: SlobsSettings;
   homeAssistant: HomeAssistantSettings;
@@ -540,7 +602,7 @@ export interface AppRef {
   name: string;
 }
 /** A device, app or Wave Link control whose volume and mute Lunchpad follows or sets. */
-export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef } | { type: "waveLink"; target: WaveLinkTarget };
+export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef } | { type: "waveLink"; target: WaveLinkTarget } | { type: "fineTune"; target: FineTuneTarget };
 /** `holdMute` goes in both the pressed and the released list: a tap toggles, a hold (the button's holdMs) mutes only while held. */
 export type SetAudioMode = "setVolume" | "adjustVolume" | "mute" | "unmute" | "toggleMute" | "holdMute";
 export const SET_AUDIO_MODES: SetAudioMode[] = ["setVolume", "adjustVolume", "mute", "unmute", "toggleMute", "holdMute"];
@@ -639,6 +701,9 @@ export type ActionKind =
   | { type: "setSystemVolume"; target: SystemVolumeTarget; mode: SystemVolumeMode; volume: number; volumeFrom: string | null; device: string | null }
   | { type: "setAudio"; target: AudioTarget; mode: SetAudioMode; volume: number; volumeFrom: string | null }
   | { type: "waveLinkSetMainOutput"; outputDeviceId: string; outputId: string }
+  | { type: "fineTuneSetAppRouting"; appId: string; routing: FineTuneRoutingRequest }
+  | { type: "fineTuneSetDefaultOutput"; deviceUid: string }
+  | { type: "fineTuneSetPreferredInput"; deviceUid: string }
   | { type: "waveLinkSetMonitoredMix"; outputDeviceId: string; outputId: string; mixId: string }
   | { type: "stopAllSounds" }
   | { type: "setAudioDevice"; target: SystemVolumeTarget; device: string }
@@ -891,6 +956,9 @@ export const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set<ActionType>([
   "setSystemVolume",
   "setAudio",
   "waveLinkSetMainOutput",
+  "fineTuneSetAppRouting",
+  "fineTuneSetDefaultOutput",
+  "fineTuneSetPreferredInput",
   "waveLinkSetMonitoredMix",
   "stopAllSounds",
   "setAudioDevice",
@@ -939,9 +1007,9 @@ export interface RunningMacro {
   startedAtMs: number;
 }
 
-export type LinkProvider = "obs" | "slobs" | "system" | "waveLink";
+export type LinkProvider = "obs" | "slobs" | "system" | "waveLink" | "fineTune";
 /** `audioMuted` is the System provider's only kind. */
-export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer" | "audioMuted" | "waveLinkMainOutput" | "waveLinkMonitoredMix";
+export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer" | "audioMuted" | "waveLinkMainOutput" | "waveLinkMonitoredMix" | "fineTuneDefaultOutput" | "fineTunePreferredInput" | "fineTuneDefaultInput";
 export const LINK_KINDS: LinkKind[] = ["scene", "sourceVisible", "sourceMuted", "streaming", "recording", "replayBuffer"];
 
 /** "Active while …": the button shows its active colour while a streaming app is in this state. */
@@ -1178,6 +1246,11 @@ export const api = {
   stopAllSounds: () => invoke<void>("stop_all_sounds"),
   setAudioSettings: (config: AudioSettings) => invoke<Settings>("set_audio_settings", { config }),
   waveLinkState: () => invoke<WaveLinkState>("wave_link_state"),
+  fineTuneState: () => invoke<FineTuneState>("fine_tune_state"),
+  fineTuneConnect: () => invoke<FineTuneState>("fine_tune_connect"),
+  fineTuneDisconnect: () => invoke<FineTuneState>("fine_tune_disconnect"),
+  fineTuneRefresh: () => invoke<FineTuneState>("fine_tune_refresh"),
+  setFineTuneSettings: (config: FineTuneSettings) => invoke<Settings>("set_fine_tune_settings", { config }),
   waveLinkConnect: () => invoke<WaveLinkState>("wave_link_connect"),
   waveLinkDisconnect: () => invoke<WaveLinkState>("wave_link_disconnect"),
   waveLinkRefresh: () => invoke<WaveLinkState>("wave_link_refresh"),
@@ -1282,6 +1355,7 @@ export const events = {
   /** The system audio changed (coalesced); same payload as `audioStatus`. */
   onSystemAudio: (cb: (status: AudioStatus) => void): Promise<UnlistenFn> => listen<AudioStatus>("system-audio:changed", (e) => cb(e.payload)),
   onWaveLinkState: (cb: (state: WaveLinkState) => void): Promise<UnlistenFn> => listen<WaveLinkState>("wave-link:state", (e) => cb(e.payload)),
+  onFineTuneState: (cb: (state: FineTuneState) => void): Promise<UnlistenFn> => listen<FineTuneState>("fine-tune:state", (e) => cb(e.payload)),
   onObsState: (cb: (state: ObsState) => void): Promise<UnlistenFn> => listen<ObsState>("obs:state", (e) => cb(e.payload)),
   onSlobsState: (cb: (state: SlobsState) => void): Promise<UnlistenFn> => listen<SlobsState>("slobs:state", (e) => cb(e.payload)),
   onHomeAssistantState: (cb: (state: HaState) => void): Promise<UnlistenFn> => listen<HaState>("homeassistant:state", (e) => cb(e.payload)),

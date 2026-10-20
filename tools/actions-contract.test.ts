@@ -25,3 +25,21 @@ test("Wave Link routing action payloads use qualified output identities", () => 
   expect(data.actions.waveLinkSetMainOutput.wait).toBe(true);
   expect(data.actions.waveLinkSetMonitoredMix.wait).toBe(true);
 });
+
+test("FineTune target and routing metadata preserve frozen UID spelling", () => {
+  const data = contract();
+  expect(data.types.AudioTarget.variants?.find((variant) => variant.value === "fineTune")?.fields).toEqual([{ name: "target", type: "FineTuneTarget" }]);
+  expect(data.types.FineTuneTarget.tag).toBe("type");
+  expect(data.types.FineTuneTarget.variants?.map((variant) => [variant.value, variant.fields.map((field) => field.name)])).toEqual([
+    ["app", ["appId"]], ["output", ["deviceUid"]], ["input", ["deviceUid"]],
+  ]);
+  expect(data.types.FineTuneRoutingRequest.tag).toBe("mode");
+  expect(data.types.FineTuneRoutingRequest.variants?.map((variant) => [variant.value, variant.fields.map((field) => field.name)])).toEqual([
+    ["followDefault", []], ["single", ["deviceUID"]],
+  ]);
+  expect(data.payloads.fineTuneSetAppRouting.fields.map((field) => [field.name, field.type])).toEqual([["appId", "text"], ["routing", "FineTuneRoutingRequest"]]);
+  for (const type of ["fineTuneSetAppRouting", "fineTuneSetDefaultOutput", "fineTuneSetPreferredInput"]) {
+    expect(data.actions[type].menu).toBe(true);
+    expect(data.actions[type].wait).toBe(true);
+  }
+});

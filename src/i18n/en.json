@@ -691,6 +691,9 @@
         "name": "Wave Link main output",
         "desc": "Select a discovered Wave Link output without changing the system default."
       },
+      "fineTuneSetAppRouting": { "name": "FineTune app output", "desc": "Route an active FineTune app to the default output or one connected output." },
+      "fineTuneSetDefaultOutput": { "name": "FineTune default output", "desc": "Select a connected output through FineTune." },
+      "fineTuneSetPreferredInput": { "name": "FineTune preferred input", "desc": "Set FineTune's preferred input without changing its lock policy." },
       "waveLinkSetMonitoredMix": {
         "name": "Wave Link output mix",
         "desc": "Select a discovered mix on a qualified Wave Link output."

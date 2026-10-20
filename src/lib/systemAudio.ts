@@ -5,6 +5,7 @@ export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "def
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
 
 export function audioTargetConfigured(target: AudioTarget): boolean {
+  if (target.type === "fineTune") return target.target.type === "app" ? !!target.target.appId : !!target.target.deviceUid;
   if (target.type === "app") return !!target.app.id;
   if (target.type !== "waveLink") return true;
   const ref = target.target;
@@ -21,6 +22,8 @@ export function audioTargetConfigured(target: AudioTarget): boolean {
 export function audioActionConfigured(action: Action): boolean {
   switch (action.type) {
     case "setAudio": return audioTargetConfigured(action.target);
+    case "fineTuneSetAppRouting": return !!action.appId && (action.routing.mode === "followDefault" || !!action.routing.deviceUID);
+    case "fineTuneSetDefaultOutput": case "fineTuneSetPreferredInput": return !!action.deviceUid;
     case "waveLinkSetMainOutput": return !!action.outputDeviceId && !!action.outputId;
     case "waveLinkSetMonitoredMix": return !!action.outputDeviceId && !!action.outputId && !!action.mixId;
     default: return true;
@@ -30,6 +33,7 @@ export function audioActionConfigured(action: Action): boolean {
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
 export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null) {
   if (!target) return null;
+  if (target.type === "fineTune") return null;
   if (target.type === "waveLink") {
     if (waveLink?.status !== "ready") return null;
     const control = waveLinkControl(target.target, waveLink);

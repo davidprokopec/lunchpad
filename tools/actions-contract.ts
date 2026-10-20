@@ -89,6 +89,7 @@ const TYPE_SOURCES: Record<string, string> = {
   "src-tauri/src/profile/model.rs": "PadColor",
   "src-tauri/src/profile/audio.rs": "AudioTarget DeviceRef AppRef AudioDeviceKind",
   "src-tauri/src/wavelink/model.rs": "WaveLinkTarget",
+  "src-tauri/src/finetune/model.rs": "FineTuneTarget FineTuneRoutingRequest",
   "src-tauri/src/desktop/mod.rs": "TitleMatch",
   "src-tauri/src/input/mod.rs": "MouseButton",
   "src-tauri/src/homeassistant/mod.rs": "HaPower HaValueKind",
@@ -115,6 +116,7 @@ function parseFields(block: string): FieldInfo[] {
   const fields: FieldInfo[] = [];
   let doc: string[] = [];
   let defaulted = false;
+  let renamed: string | undefined;
   for (const raw of block.split("\n")) {
     const line = raw.trim();
     if (line.startsWith("///")) {
@@ -125,17 +127,22 @@ function parseFields(block: string): FieldInfo[] {
       defaulted = true;
       continue;
     }
-    if (line.startsWith("#[")) continue;
+    if (line.startsWith("#[")) {
+      const rename = /\brename\s*=\s*"([^"]+)"/.exec(line);
+      if (rename) renamed = rename[1];
+      continue;
+    }
     const m = /^(?:pub )?([a-z_0-9]+):\s*(.+?),?$/.exec(line);
     if (!m) continue;
     fields.push({
-      name: snakeToCamel(m[1]),
+      name: renamed ?? snakeToCamel(m[1]),
       ...fieldType(m[2].replace(/,$/, "").trim()),
       ...(defaulted ? { optional: true } : {}),
       ...(doc.length ? { doc: doc.join(" ") } : {}),
     });
     doc = [];
     defaulted = false;
+    renamed = undefined;
   }
   return fields;
 }

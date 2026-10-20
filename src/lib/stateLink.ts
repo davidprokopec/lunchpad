@@ -7,6 +7,7 @@ import { audioControllable, audioState } from "./systemAudio";
  */
 export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null): boolean {
   if (!link) return false;
+  if (link.provider === "fineTune") return false;
   if (link.provider === "waveLink") {
     if (waveLink?.status !== "ready" || link.target?.type !== "waveLink") return false;
     if (link.kind === "audioMuted") return audioControllable(link.target, audio, "mute", waveLink) && audioState(link.target, audio, waveLink)?.muted === true;

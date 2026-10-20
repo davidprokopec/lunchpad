@@ -45,7 +45,7 @@ const MENU_GROUPS: { group: string; types: ActionType[]; submenu?: boolean }[] =
   { group: "media", types: ["playSound", "textToSpeech", "setSystemVolume", "setAudioDevice", "stopAllSounds"], submenu: true },
   { group: "general", types: ["delay", "switchPage", "runButton", "setColor", "setFader"], submenu: true },
   { group: "flow", types: ["ifStart", "loopStart", "flipFlopStart", "pushToTalkStart"], submenu: true },
-  { group: "system", types: ["setAudio", "waveLinkSetMainOutput", "waveLinkSetMonitoredMix", "launchApplication", "httpRequest", "runScript", "setVariable", "addToVariable", "debug"], submenu: true },
+  { group: "system", types: ["setAudio", "waveLinkSetMainOutput", "waveLinkSetMonitoredMix", "fineTuneSetAppRouting", "fineTuneSetDefaultOutput", "fineTuneSetPreferredInput", "launchApplication", "httpRequest", "runScript", "setVariable", "addToVariable", "debug"], submenu: true },
   { group: "input", types: ["hotkey", "mouse", "mousePosition"], submenu: true },
   { group: "window", types: ["getWindow", "setWindow", "getScreen"], submenu: true },
   { group: "stop", types: ["stopThisMacro", "restartThisMacro", "stopAllMacros"], submenu: true },
