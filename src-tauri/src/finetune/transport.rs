@@ -162,6 +162,8 @@ impl FineTune {
             *state = FineTuneState {
                 status: if shutdown || !desired.config.enabled {
                     FineTuneStatus::Disabled
+                } else if !cfg!(target_os = "macos") {
+                    FineTuneStatus::Unsupported
                 } else if desired.connect {
                     FineTuneStatus::Connecting
                 } else {
@@ -222,10 +224,12 @@ async fn supervise(
         if desired.shutdown {
             break;
         }
-        if !desired.config.enabled || !desired.connect {
+        if !desired.config.enabled || !desired.connect || !cfg!(target_os = "macos") {
             inner.publish(desired.epoch, |state| {
                 if !desired.config.enabled {
                     state.status = FineTuneStatus::Disabled;
+                } else if !cfg!(target_os = "macos") {
+                    state.status = FineTuneStatus::Unsupported;
                 } else if state.status != FineTuneStatus::Unsupported {
                     state.status = FineTuneStatus::Disconnected;
                 }
@@ -298,7 +302,38 @@ fn reject(command: Option<Command>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(target_os = "macos")))]
+#[tokio::test]
+async fn non_macos_configuration_never_enables_finetune() {
+    let client = FineTune::start_at(
+        FineTuneSettings {
+            enabled: true,
+            auto_connect: true,
+        },
+        Some(std::env::temp_dir().join("unsupported-finetune.sock")),
+    );
+    client.barrier().await;
+    assert_eq!(client.state().status, FineTuneStatus::Unsupported);
+    for auto_connect in [false, true] {
+        client.configure(FineTuneSettings {
+            enabled: true,
+            auto_connect,
+        });
+        assert_eq!(client.connect().status, FineTuneStatus::Unsupported);
+        client.refresh();
+        client.barrier().await;
+        let state = client.state();
+        assert_eq!(state.status, FineTuneStatus::Unsupported);
+        assert!(!state.connected);
+        assert!(state.snapshot.is_none());
+    }
+    client.configure(FineTuneSettings::default());
+    client.barrier().await;
+    assert_eq!(client.state().status, FineTuneStatus::Disabled);
+    client.shutdown();
+}
+
+#[cfg(not(target_os = "macos"))]
 async fn session(
     _: &Inner,
     _: u64,
@@ -387,7 +422,7 @@ impl Drop for Pending {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 async fn session(
     inner: &Inner,
     epoch: u64,
@@ -400,7 +435,7 @@ async fn session(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 async fn run_session(
     inner: &Inner,
     epoch: u64,

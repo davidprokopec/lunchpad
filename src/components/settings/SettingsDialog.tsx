@@ -19,6 +19,7 @@ import { SoundTab } from "./SoundTab";
 import { VariablesTab } from "./VariablesTab";
 import { WaveLinkTab } from "./WaveLinkTab";
 import { FineTuneTab } from "./FineTuneTab";
+import { platformOptionAvailable } from "../../lib/platform";
 
 export type SettingsTab = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "waveLink" | "fineTune" | "hub" | "pages" | "variables" | "secrets" | "about" | "diagnostics";
 
@@ -64,6 +65,7 @@ export function SettingsDialog({ open, onClose }: Props) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<SettingsTab>(lastTab);
   const select = (next: SettingsTab) => {
+    if (!platformOptionAvailable(next)) return;
     lastTab = next;
     setTab(next);
   };
@@ -101,7 +103,7 @@ export function SettingsDialog({ open, onClose }: Props) {
               {NAV.map((g) => (
                 <div key={g.group} className="mb-2.5 flex flex-col gap-0.5">
                   <div className="px-2 pb-1 text-[11px] text-stage-500">{t(`settings.groups.${g.group}`)}</div>
-                  {g.tabs.map((id) => (
+                  {g.tabs.filter((id) => platformOptionAvailable(id)).map((id) => (
                     <button
                       key={id}
                       type="button"

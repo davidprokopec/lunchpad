@@ -12,6 +12,7 @@ import { Tooltip } from "../Tooltip";
 import { useSettingsStore } from "../../store/settings";
 import { useUiStore } from "../../store/ui";
 import { NumberInput } from "../NumberInput";
+import { platformOptionAvailable } from "../../lib/platform";
 
 interface Props {
   button: Button;
@@ -164,7 +165,8 @@ export function ActionsTab({ button, onChange, pages, layout, lists = ["down", "
       items.push({ label: t("actions.paste", { count: clipboard.length }), onSelect: () => insertClones(key, clipboard, -1) }, "divider");
     }
     // Integrations that are switched off in the settings stay out of the menu.
-    const groups = MENU_GROUPS.filter((g) => (g.group === "obs" ? obsEnabled : g.group === "slobs" ? slobsEnabled : g.group === "homeAssistant" ? haEnabled : true));
+    const groups = MENU_GROUPS.filter((g) => (g.group === "obs" ? obsEnabled : g.group === "slobs" ? slobsEnabled : g.group === "homeAssistant" ? haEnabled : true))
+      .map((g) => ({ ...g, types: g.types.filter((type) => platformOptionAvailable(type)) }));
     groups.forEach((g, gi) => {
       const label = t(`actions.groups.${g.group}`);
       if (g.submenu) {

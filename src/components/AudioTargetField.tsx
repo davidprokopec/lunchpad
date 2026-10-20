@@ -8,6 +8,7 @@ import { Button } from "./ui";
 import { waveLinkControl, waveLinkKey } from "../lib/waveLink";
 import { FineTuneAppField } from "./FineTuneFields";
 import { fineTuneReason } from "../lib/fineTune";
+import { platformOptionAvailable } from "../lib/platform";
 
 type Source = "manual" | "device" | "app" | "waveLink" | "fineTune";
 const targetKey = (target: AudioTarget): string => target.type === "fineTune" ? `fineTune:${JSON.stringify(target.target)}` : target.type === "waveLink" ? waveLinkKey(target.target) : target.type === "app" ? `app:${target.app.id}` : target.device.type === "named" ? `device:${target.device.kind}:${target.device.id || target.device.label}` : target.device.type;
@@ -54,12 +55,12 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
       <div className="grid grid-cols-2 items-end gap-3">
         <div className="flex flex-col gap-1 text-xs text-stage-400">
           {t(manual ? "audio.source" : "audio.target")}
-          <Select<Source> size="sm" ariaLabel={t(manual ? "audio.source" : "audio.target")} value={source} options={[
+          <Select<Source> size="sm" ariaLabel={t(manual ? "audio.source" : "audio.target")} value={source} placeholder={source === "fineTune" ? `${t("fineTune.name")} · ${t("audio.unavailableShort")}` : undefined} options={[
             ...(manual ? [{ value: "manual" as const, label: t("audio.manual") }] : []),
             { value: "device", label: t(manual ? "audio.deviceVolume" : "volume.device") },
             { value: "app", label: t(manual ? "audio.appVolume" : "audio.app") },
             { value: "waveLink", label: t("waveLink.name") },
-            { value: "fineTune", label: t("fineTune.name") },
+            ...(platformOptionAvailable("fineTune") ? [{ value: "fineTune" as const, label: t("fineTune.name") }] : []),
           ]} onChange={(next) => { if (next === "fineTune") { void loadFineTune(); onChange({ type: "fineTune", target: { type: "app", appId: "" } }); } else if (next === "waveLink") { void loadWaveLink(); onChange({ type: "waveLink", target: { type: "channel", channelId: "" } }); } else onChange(next === "manual" ? null : next === "device" ? DEFAULT_OUTPUT : { type: "app", app: { id: "", name: "" } }); }} />
         </div>
         {source === "fineTune" ? <FineTuneAppField value={value?.type === "fineTune" && value.target.type === "app" ? value.target.appId : ""} onChange={(appId) => onChange({ type: "fineTune", target: { type: "app", appId } })} /> : source !== "manual" && <div className="flex min-w-0 flex-col gap-1 text-xs text-stage-400">

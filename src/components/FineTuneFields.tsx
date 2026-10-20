@@ -4,12 +4,14 @@ import type { Action } from "../lib/api";
 import { fineTuneApp, fineTuneReason } from "../lib/fineTune";
 import { useMediaStore } from "../store/media";
 import { Select } from "./Select";
+import { isMacOS } from "../lib/platform";
 
 export function FineTuneAppField({ value, onChange }: { value: string; onChange: (appId: string) => void }) {
   const { t } = useTranslation();
   const state = useMediaStore((s) => s.fineTune);
   const load = useMediaStore((s) => s.loadFineTune);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { if (isMacOS()) void load(); }, [load]);
+  if (!isMacOS()) return <p role="status">{value} · {t("fineTune.status.unsupported")}</p>;
   const apps = state?.status === "ready" ? state.snapshot?.apps ?? [] : [];
   const options = apps.map((app, index) => {
     const ambiguous = apps.filter((row) => row.appId === app.appId).length > 1;
@@ -32,7 +34,8 @@ export function FineTuneDeviceField({ value, direction, onChange, selection = tr
   const { t } = useTranslation();
   const state = useMediaStore((s) => s.fineTune);
   const load = useMediaStore((s) => s.loadFineTune);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { if (isMacOS()) void load(); }, [load]);
+  if (!isMacOS()) return <p role="status">{value} · {t("fineTune.status.unsupported")}</p>;
   const devices = state?.status === "ready" ? state.snapshot?.devices.filter((d) => d.direction === direction && (!selection || d.capabilities.selectable)) ?? [] : [];
   const options = devices.map((d) => ({ value: d.uid, label: d.name }));
   if (value && !options.some((option) => option.value === value)) options.push({ value, label: `${value} · ${t("audio.unavailableShort")}` });
@@ -47,6 +50,7 @@ export function FineTuneRoutingEditor({ action, onChange }: { action: Extract<Ac
   const { t } = useTranslation();
   const state = useMediaStore((s) => s.fineTune);
   const app = fineTuneApp(action.appId, state);
+  if (!isMacOS()) return <p role="status">{action.appId} · {t("fineTune.status.unsupported")}</p>;
   return <div className="flex flex-col gap-3">
     <FineTuneAppField value={action.appId} onChange={(appId) => onChange({ ...action, appId })} />
     <div className="flex flex-col gap-1 text-xs text-stage-400">{t("fineTune.routing")}
