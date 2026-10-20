@@ -45,6 +45,7 @@ type CFRef = *const c_void;
 const PROBE_WINDOW: Duration = Duration::from_millis(400);
 const FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
 const FORMAT_FLAG_IS_FLOAT: u32 = 1;
+const DIAGNOSTIC_INPUT_BUFFER_LIMIT: usize = 32;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -257,6 +258,8 @@ struct Gain {
     input_buffers: AtomicU32,
     first_input_channels: AtomicU32,
     output_buffers: AtomicU32,
+    input_peak_buffers: AtomicU32,
+    input_buffer_peak_bits: [AtomicU32; DIAGNOSTIC_INPUT_BUFFER_LIMIT],
 }
 
 impl Gain {
@@ -270,6 +273,8 @@ impl Gain {
             input_buffers: AtomicU32::new(0),
             first_input_channels: AtomicU32::new(0),
             output_buffers: AtomicU32::new(0),
+            input_peak_buffers: AtomicU32::new(0),
+            input_buffer_peak_bits: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
     fn set(&self, gain: f32) {
@@ -291,6 +296,18 @@ impl Gain {
             f32::from_bits(self.summary_input_bits.swap(0, Ordering::Relaxed)),
             f32::from_bits(self.summary_output_bits.swap(0, Ordering::Relaxed)),
         )
+    }
+
+    /// Worker-only snapshot; tuple indices refer to the IOProc input buffer list,
+    /// not necessarily the HAL stream list (non-interleaved streams can split).
+    fn take_input_buffer_peaks(&self) -> Vec<(usize, f32)> {
+        let count = self.input_peak_buffers.swap(0, Ordering::Relaxed) as usize;
+        self.input_buffer_peak_bits
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(index, peak)| (index, f32::from_bits(peak.swap(0, Ordering::Relaxed))))
+            .collect()
     }
 }
 
@@ -330,6 +347,28 @@ unsafe extern "C" fn io_proc(
         std::slice::from_raw_parts(b.data as *const f32, b.byte_size as usize / 4)
     });
     let peak = samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+    gain_state
+        .input_peak_buffers
+        .fetch_max(ins.len() as u32, Ordering::Relaxed);
+    for (index, (buffer, observed)) in ins
+        .iter()
+        .zip(&gain_state.input_buffer_peak_bits)
+        .enumerate()
+    {
+        let mut buffer_peak = 0f32;
+        if index == 0 {
+            buffer_peak = peak;
+        } else if !buffer.data.is_null() && buffer.channels > 0 {
+            for sample in 0..buffer.byte_size as usize / size_of::<f32>() {
+                // SAFETY: read only complete four-byte words within the HAL's
+                // buffer. Unaligned reads do not assume other streams' layouts;
+                // diagnostic peaks interpret their bytes as f32, like buffer 0.
+                let value = unsafe { buffer.data.cast::<f32>().add(sample).read_unaligned() };
+                buffer_peak = buffer_peak.max(value.abs());
+            }
+        }
+        observed.fetch_max(buffer_peak.to_bits(), Ordering::Relaxed);
+    }
     let mut output_peak = 0f32;
     for out in outs.iter().filter(|b| !b.data.is_null()) {
         // SAFETY: the output device is the f32 main sub-device; the HAL owns
@@ -606,6 +645,8 @@ impl TapSystem for CoreAudio {
                     input_buffers = probe.gain.input_buffers.load(Ordering::Relaxed),
                     first_input_channels = probe.gain.first_input_channels.load(Ordering::Relaxed),
                     output_buffers = probe.gain.output_buffers.load(Ordering::Relaxed),
+                    input_buffer_peaks_f32 = ?probe.gain.take_input_buffer_peaks(),
+                    input_buffer_peak_limit = DIAGNOSTIC_INPUT_BUFFER_LIMIT,
                     "app audio probe end: signal confirmed"
                 );
                 return Ok(());
@@ -621,6 +662,8 @@ impl TapSystem for CoreAudio {
             input_buffers = probe.gain.input_buffers.load(Ordering::Relaxed),
             first_input_channels = probe.gain.first_input_channels.load(Ordering::Relaxed),
             output_buffers = probe.gain.output_buffers.load(Ordering::Relaxed),
+            input_buffer_peaks_f32 = ?probe.gain.take_input_buffer_peaks(),
+            input_buffer_peak_limit = DIAGNOSTIC_INPUT_BUFFER_LIMIT,
             "app audio probe end: only silence"
         );
         Err(Error::new(ErrorKind::Permission, "the tap delivered only silence: Lunchpad probably lacks the System Audio Recording permission (silence cannot be told apart from denial)"))
@@ -804,6 +847,8 @@ impl Taps {
                         input_buffers = control.gain.input_buffers.load(Ordering::Relaxed),
                         first_input_channels = control.gain.first_input_channels.load(Ordering::Relaxed),
                         output_buffers = control.gain.output_buffers.load(Ordering::Relaxed),
+                        input_buffer_peaks_f32 = ?control.gain.take_input_buffer_peaks(),
+                        input_buffer_peak_limit = DIAGNOSTIC_INPUT_BUFFER_LIMIT,
                         running_output = ?producing, elapsed_ms = now.duration_since(control.last_summary).as_millis(),
                         "app audio control summary");
                     control.last_summary = now;
@@ -962,16 +1007,29 @@ mod tests {
 
     #[test]
     fn diagnostic_summary_resets_without_consuming_watchdog_peak() {
+        #[repr(C)]
+        struct TwoInputBuffers {
+            count: u32,
+            buffers: [AudioBuffer; 2],
+        }
         let gain = Gain::new(0.5);
         let samples = [0.8f32, -0.4];
+        let other_input = [0.95f32, -0.3];
         let mut rendered = [0f32; 2];
-        let input = AudioBufferList {
-            count: 1,
-            buffers: [AudioBuffer {
-                channels: 2,
-                byte_size: 8,
-                data: samples.as_ptr().cast_mut().cast(),
-            }],
+        let input = TwoInputBuffers {
+            count: 2,
+            buffers: [
+                AudioBuffer {
+                    channels: 2,
+                    byte_size: 8,
+                    data: samples.as_ptr().cast_mut().cast(),
+                },
+                AudioBuffer {
+                    channels: 2,
+                    byte_size: 8,
+                    data: other_input.as_ptr().cast_mut().cast(),
+                },
+            ],
         };
         let mut output = AudioBufferList {
             count: 1,
@@ -982,12 +1040,13 @@ mod tests {
             }],
         };
         // SAFETY: local f32 buffers and Gain outlive this synchronous callback;
+        // TwoInputBuffers matches the C variable-length AudioBufferList layout;
         // the unused timestamp arguments may be null. No HAL/audio is invoked.
         let status = unsafe {
             io_proc(
                 0,
                 std::ptr::null(),
-                &input,
+                std::ptr::from_ref(&input).cast(),
                 std::ptr::null(),
                 &mut output,
                 std::ptr::null(),
@@ -996,11 +1055,13 @@ mod tests {
         };
         assert_eq!(status, 0);
         assert_eq!(rendered, [0.4, -0.2]);
-        assert_eq!(gain.input_buffers.load(Ordering::Relaxed), 1);
+        assert_eq!(gain.input_buffers.load(Ordering::Relaxed), 2);
         assert_eq!(gain.first_input_channels.load(Ordering::Relaxed), 2);
         assert_eq!(gain.output_buffers.load(Ordering::Relaxed), 1);
         assert_eq!(gain.take_summary(), (1, 0.8, 0.4));
         assert_eq!(gain.take_summary(), (0, 0.0, 0.0));
+        assert_eq!(gain.take_input_buffer_peaks(), vec![(0, 0.8), (1, 0.95)]);
+        assert!(gain.take_input_buffer_peaks().is_empty());
         assert_eq!(gain.take_peak(), 0.8);
         assert_eq!(f32::from_bits(gain.gain_bits.load(Ordering::Relaxed)), 0.5);
     }
