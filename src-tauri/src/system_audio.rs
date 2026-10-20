@@ -474,12 +474,32 @@ struct HoldSlot {
     down: Option<Instant>,
     /// Muted before the press; `None` when the target could not be read.
     captured: Option<TargetState>,
+    /// Wave Link registers ownership before its queued press can execute.
+    pending: bool,
+    /// Terminal invalidation shared with that queued press; native holds have none.
+    wave_press: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct HoldMutes {
     slots: Mutex<HashMap<PadKey, HoldSlot>>,
     /// Bumped whenever a slot is stored, so a waiting release looks again.
     stored: watch::Sender<u64>,
+}
+
+impl HoldMutes {
+    fn invalidate_wave_press(&self, key: &PadKey, down: Option<Instant>) {
+        let mut slots = self.slots.lock();
+        if slots
+            .get(key)
+            .is_some_and(|slot| slot.down == down && slot.wave_press.is_some())
+        {
+            if let Some(slot) = slots.remove(key) {
+                if let Some(invalidated) = slot.wave_press {
+                    invalidated.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
 }
 
 struct Writer {
@@ -559,10 +579,14 @@ pub struct PhysicalMute {
     admission: Result<Option<u64>, String>,
     captured: Mutex<Option<TargetState>>,
     cancelled: std::sync::atomic::AtomicBool,
+    invalidated: std::sync::atomic::AtomicBool,
 }
 
 impl PhysicalMute {
     fn restore(&self, writer: &Writer, tapped: bool) -> Result<(), String> {
+        if self.invalidated.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         let captured = self.captured.lock().clone();
         let Some(state) = captured.as_ref() else {
             return Ok(());
@@ -699,6 +723,7 @@ impl SystemAudio {
             admission: self.generation(&target),
             captured: Mutex::new(None),
             cancelled: false.into(),
+            invalidated: false.into(),
         });
         let generation = match &press.admission {
             Ok(generation) => *generation,
@@ -712,11 +737,17 @@ impl SystemAudio {
         physical.push(Arc::downgrade(&press));
         let job = press.clone();
         self.enqueue(move |writer| {
+            if job.invalidated.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
             let state = writer.fresh(&target, generation)?;
             *job.captured.lock() = Some(state.clone());
             if state.muted {
                 Ok(())
             } else {
+                if job.invalidated.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
                 writer.set_muted(&state.key, true)
             }
         });
@@ -724,11 +755,17 @@ impl SystemAudio {
     }
 
     pub fn physical_release(&self, press: Arc<PhysicalMute>, tapped: bool) {
+        if press.invalidated.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         match &press.admission {
             Err(_) => return,
             Ok(Some(generation)) => match self.wave_link_generation() {
                 Ok(current) if current == *generation => {}
                 _ => {
+                    press
+                        .invalidated
+                        .store(true, std::sync::atomic::Ordering::Release);
                     tracing::warn!(
                         "physical Wave Link release ignored: session unavailable or changed"
                     );
@@ -884,21 +921,72 @@ impl SystemAudio {
                     HoldSlot {
                         down,
                         captured: None,
+                        pending: false,
+                        wave_press: None,
                     },
                 );
                 holds.stored.send_modify(|n| *n = n.wrapping_add(1));
                 return Err(error);
             }
         };
+        let wave_press = generation.map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        if let Some(invalidated) = &wave_press {
+            let previous = holds.slots.lock().insert(
+                key.clone(),
+                HoldSlot {
+                    down,
+                    captured: None,
+                    pending: true,
+                    wave_press: Some(invalidated.clone()),
+                },
+            );
+            if let Some(previous) = previous.and_then(|slot| slot.wave_press) {
+                previous.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         self.run_writer(move |writer| {
+            if wave_press
+                .as_ref()
+                .is_some_and(|invalidated| invalidated.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err("Wave Link hold press was invalidated by its release".into());
+            }
             let state = writer.fresh(&target, generation);
             let captured = state.as_ref().ok().cloned();
-            holds.slots.lock().insert(key, HoldSlot { down, captured });
+            if let Some(invalidated) = &wave_press {
+                let mut slots = holds.slots.lock();
+                let Some(slot) = slots.get_mut(&key).filter(|slot| {
+                    slot.down == down
+                        && slot
+                            .wave_press
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, invalidated))
+                }) else {
+                    return Err("Wave Link hold ownership ended before the press".into());
+                };
+                slot.captured = captured;
+                slot.pending = false;
+            } else {
+                holds.slots.lock().insert(
+                    key,
+                    HoldSlot {
+                        down,
+                        captured,
+                        pending: false,
+                        wave_press: None,
+                    },
+                );
+            }
             holds.stored.send_modify(|n| *n = n.wrapping_add(1));
             let state = state?;
             if state.muted {
                 Ok(())
             } else {
+                if wave_press.as_ref().is_some_and(|invalidated| {
+                    invalidated.load(std::sync::atomic::Ordering::Acquire)
+                }) {
+                    return Err("Wave Link hold press was invalidated by its release".into());
+                }
                 writer.set_muted(&state.key, true)
             }
         })
@@ -914,25 +1002,33 @@ impl SystemAudio {
         tapped: bool,
         target: AudioTarget,
     ) -> Result<(), String> {
-        self.generation(&target)?;
+        if let Err(error) = self.generation(&target) {
+            self.holds.invalidate_wave_press(&key, down);
+            return Err(error);
+        }
         let mut stored = self.holds.stored.subscribe();
         let deadline = tokio::time::Instant::now() + HOLD_SLOT_WAIT;
         let captured = loop {
             {
                 let mut slots = self.holds.slots.lock();
-                if slots.get(&key).is_some_and(|s| s.down == down) {
-                    break slots.remove(&key).and_then(|s| s.captured);
+                if slots
+                    .get(&key)
+                    .is_some_and(|s| s.down == down && !s.pending)
+                {
+                    break slots.remove(&key);
                 }
             }
             match tokio::time::timeout_at(deadline, stored.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => {
+                    self.holds.invalidate_wave_press(&key, down);
                     tracing::warn!(page = %key.0, x = key.1, y = key.2, "hold-to-mute release without its press, nothing to restore");
                     return Ok(());
                 }
             }
         };
-        let Some(captured) = captured else {
+        let wave_press = captured.as_ref().and_then(|slot| slot.wave_press.clone());
+        let Some(captured) = captured.and_then(|slot| slot.captured) else {
             // The press could not read the target and has said so.
             return Ok(());
         };
@@ -945,8 +1041,18 @@ impl SystemAudio {
             Resolved::WaveLink { generation, .. } => Some(generation),
             _ => None,
         };
-        if self.generation(&target)? != generation {
-            return Err("Wave Link hold session ended; not restoring into new session".into());
+        let admission = self.generation(&target).and_then(|current| {
+            if current == generation {
+                Ok(())
+            } else {
+                Err("Wave Link hold session ended; not restoring into new session".into())
+            }
+        });
+        if let Err(error) = admission {
+            if let Some(invalidated) = wave_press {
+                invalidated.store(true, std::sync::atomic::Ordering::Release);
+            }
+            return Err(error);
         }
         self.run_writer(move |writer| {
             let state = writer.fresh(&target, generation)?;
@@ -1311,6 +1417,179 @@ mod tests {
     #[tokio::test]
     async fn wave_link_admission_rejects_same_generation_resync_before_fifo() {
         unavailable_wave_link_admission(true).await;
+    }
+
+    async fn rejected_wave_link_release_invalidates_press(general: bool, cancel: bool) {
+        use crate::wavelink::{
+            tests::{catalog, until, Fixture},
+            WaveLinkStatus, WaveLinkTarget,
+        };
+        use serde_json::json;
+        use std::task::Poll;
+
+        let fixture = Fixture::new().await;
+        let wave = fixture.start(true);
+        let mut peer = fixture.ready(&wave).await;
+        let generation = wave.state().generation;
+        let live = SharedLive::default();
+        live.lock().wave_link = wave.state();
+        let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+        let audio = SystemAudio::with_wave_link(fake.clone(), live, Some(wave.clone()));
+        let (entered, barrier) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let writer = audio.clone();
+        let blocked_job = tokio::spawn(async move {
+            writer
+                .run(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        barrier.await.unwrap();
+        let target = AudioTarget::WaveLink {
+            target: WaveLinkTarget::Channel {
+                channel_id: "channel".into(),
+            },
+        };
+        let key = ("page".into(), 1, 1);
+        let down = Some(Instant::now());
+        let held = audio.hold_press(key.clone(), down, target.clone());
+        tokio::pin!(held);
+        let physical = if general {
+            assert!(matches!(futures_util::poll!(&mut held), Poll::Pending));
+            None
+        } else {
+            Some(audio.physical_press(target.clone()))
+        };
+        assert_eq!(
+            audio.jobs.len(),
+            1,
+            "Ready Down was admitted behind the writer barrier"
+        );
+        peer.notification("channelChanged", json!({"id":"channel","level":"invalid"}))
+            .await;
+        let resync = peer.request().await;
+        assert_eq!(resync["method"], "getChannels");
+        until(&wave, |state| state.status == WaveLinkStatus::Synchronizing).await;
+        if general {
+            assert!(audio
+                .hold_release(key, down, false, target)
+                .await
+                .unwrap_err()
+                .contains("unavailable"));
+        } else if cancel {
+            audio.cancel_physical();
+        } else {
+            audio.physical_release(physical.unwrap(), false);
+        }
+        assert_eq!(
+            audio.jobs.len(),
+            1,
+            "rejected release must not enqueue a restore"
+        );
+        peer.reply(&resync, catalog("getChannels")).await;
+        let ready = until(&wave, |state| state.status == WaveLinkStatus::Ready).await;
+        assert_eq!(ready.generation, generation);
+        release.send(()).unwrap();
+        blocked_job.await.unwrap().unwrap();
+        tokio::join!(
+            async {
+                if general {
+                    assert!(
+                        held.await.is_err(),
+                        "invalidated general Down must not execute"
+                    );
+                }
+                audio.run(|_| Ok(())).await.unwrap();
+            },
+            async {
+                for _ in 0..4 {
+                    peer.getter().await;
+                }
+            }
+        );
+        assert!(fake.writes().is_empty());
+        assert_eq!(
+            wave.state()
+                .control(&WaveLinkTarget::Channel {
+                    channel_id: "channel".into()
+                })
+                .unwrap()
+                .muted,
+            Some(false)
+        );
+        wave.shutdown();
+        peer.closed().await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_rejected_physical_release_invalidates_pending_press() {
+        rejected_wave_link_release_invalidates_press(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_rejected_cancel_invalidates_pending_press() {
+        rejected_wave_link_release_invalidates_press(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_rejected_general_release_invalidates_pending_press() {
+        rejected_wave_link_release_invalidates_press(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_general_release_waits_for_admitted_press_and_restores() {
+        use crate::wavelink::{tests::Fixture, WaveLinkTarget};
+        use std::task::Poll;
+
+        let fixture = Fixture::new().await;
+        let wave = fixture.start(true);
+        let mut peer = fixture.ready(&wave).await;
+        let audio = SystemAudio::with_wave_link(
+            Arc::new(FakeAudio::new(vec![], vec![])),
+            SharedLive::default(),
+            Some(wave.clone()),
+        );
+        let (entered, barrier) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let writer = audio.clone();
+        let blocked_job = tokio::spawn(async move {
+            writer
+                .run(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        barrier.await.unwrap();
+        let target = AudioTarget::WaveLink {
+            target: WaveLinkTarget::Channel {
+                channel_id: "channel".into(),
+            },
+        };
+        let key = ("page".into(), 1, 1);
+        let down = Some(Instant::now());
+        let pressed = audio.hold_press(key.clone(), down, target.clone());
+        let released = audio.hold_release(key, down, false, target);
+        tokio::pin!(pressed, released);
+        assert!(matches!(futures_util::poll!(&mut pressed), Poll::Pending));
+        assert!(matches!(futures_util::poll!(&mut released), Poll::Pending));
+        release.send(()).unwrap();
+        blocked_job.await.unwrap().unwrap();
+        tokio::join!(
+            async {
+                pressed.await.unwrap();
+                released.await.unwrap();
+            },
+            async {
+                peer.mutation_readback(true).await;
+                peer.mutation_readback(false).await;
+            }
+        );
+        assert!(audio.holds.slots.lock().is_empty());
+        wave.shutdown();
+        peer.closed().await;
     }
     use AudioDeviceKind::*;
 
