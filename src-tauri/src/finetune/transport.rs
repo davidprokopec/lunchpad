@@ -253,6 +253,7 @@ async fn supervise(
                 state.server_revision = None;
                 state.session_id = None;
                 state.app_version = None;
+                state.capabilities.clear();
                 state.status = if outcome.0 {
                     FineTuneStatus::Unsupported
                 } else {
@@ -485,6 +486,11 @@ async fn run_session(
     let capabilities = hello["capabilities"]
         .as_array()
         .ok_or_else(|| failure("Missing FineTune capabilities".into()))?;
+    let capabilities: Vec<String> = capabilities
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<_>>()
+        .ok_or_else(|| failure("Invalid FineTune capabilities".into()))?;
     for method in [
         "getState",
         "subscribe",
@@ -503,6 +509,7 @@ async fn run_session(
         state.connected = true;
         state.session_id = Some(session.clone());
         state.app_version = Some(app_version);
+        state.capabilities = capabilities;
         state.generation += 1;
         state.server_revision = None;
         state.snapshot = None;
@@ -625,11 +632,32 @@ fn apply_snapshot(inner: &Inner, epoch: u64, session: &str, frame: &Value) -> Re
         if app.app_id.is_empty()
             || app.pids.len() != 1
             || app.pids[0] == 0
+            || !app.active
             || !app.volume.is_finite()
             || !(0.0..=1.0).contains(&app.volume)
             || !app.boost.is_finite()
         {
             return Err("Invalid FineTune app state".into());
+        }
+    }
+    if inner.state.lock().supports_managed_apps() {
+        let rows = snapshot
+            .managed_apps
+            .as_ref()
+            .ok_or("Missing FineTune managedApps catalogue")?;
+        for row in rows {
+            let app = &row.app;
+            if app.app_id.is_empty()
+                || app.pids.len() > 1
+                || app.pids.contains(&0)
+                || row.running != (app.pids.len() == 1)
+                || (app.active && !row.running)
+                || !app.volume.is_finite()
+                || !(0.0..=1.0).contains(&app.volume)
+                || !app.boost.is_finite()
+            {
+                return Err("Invalid FineTune managedApps catalogue".into());
+            }
         }
     }
     inner.publish(epoch, |state| {
@@ -681,11 +709,11 @@ fn mutation_params(
                 Mutation::Volume(id, _) | Mutation::Mute(id, _) | Mutation::Routing(id, _) => id,
                 _ => unreachable!(),
             };
-            let app = state.app(app_id)?;
-            if snapshot.permission.audio_capture != FineTuneCapturePermission::Authorized {
-                return Err("FineTune audio capture permission is not authorized".into());
+            let app = state.writable_app(app_id)?;
+            let mut params = json!({"appId":app_id});
+            if app.active {
+                params["pid"] = json!(app.pids[0]);
             }
-            let mut params = json!({"appId":app_id, "pid":app.pids[0]});
             let method = match mutation {
                 Mutation::Volume(_, volume) => {
                     if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
@@ -699,6 +727,9 @@ fn mutation_params(
                     "setAppMute"
                 }
                 Mutation::Routing(_, routing) => {
+                    if !app.active {
+                        return Err("FineTune routing requires an active app".into());
+                    }
                     if matches!(app.routing.requested, FineTuneRouting::Multi { .. }) {
                         return Err("FineTune multi routing is read-only".into());
                     }

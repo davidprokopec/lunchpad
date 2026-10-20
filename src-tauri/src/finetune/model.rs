@@ -119,6 +119,14 @@ pub struct FineTuneApp {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FineTuneManagedApp {
+    #[serde(flatten)]
+    pub app: FineTuneApp,
+    pub running: bool,
+    pub manageable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FineTuneDeviceCapabilities {
     pub volume_readable: bool,
@@ -165,6 +173,8 @@ pub struct FineTunePermission {
 #[serde(rename_all = "camelCase")]
 pub struct FineTuneSnapshot {
     pub apps: Vec<FineTuneApp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_apps: Option<Vec<FineTuneManagedApp>>,
     pub devices: Vec<FineTuneDevice>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub default_output: Option<String>,
@@ -179,6 +189,7 @@ pub struct FineTuneSnapshot {
 pub struct FineTuneState {
     pub status: FineTuneStatus,
     pub connected: bool,
+    pub capabilities: Vec<String>,
     pub error: Option<String>,
     pub app_version: Option<String>,
     pub session_id: Option<String>,
@@ -191,18 +202,53 @@ pub struct FineTuneState {
 }
 
 impl FineTuneState {
+    pub fn supports_managed_apps(&self) -> bool {
+        self.capabilities.iter().any(|value| value == "managedApps")
+    }
+
+    pub fn app_catalogue(&self) -> impl Iterator<Item = &FineTuneApp> {
+        let managed = self.supports_managed_apps();
+        self.snapshot.iter().flat_map(move |snapshot| {
+            snapshot.apps.iter().filter(move |_| !managed).chain(
+                snapshot
+                    .managed_apps
+                    .iter()
+                    .flatten()
+                    .filter(move |_| managed)
+                    .map(|row| &row.app),
+            )
+        })
+    }
+
     pub fn app(&self, app_id: &str) -> Result<&FineTuneApp, String> {
         if self.status != FineTuneStatus::Ready {
             return Err("FineTune is not ready".into());
         }
-        let snapshot = self.snapshot.as_ref().ok_or("FineTune state unavailable")?;
-        let mut matches = snapshot.apps.iter().filter(|app| app.app_id == app_id);
+        self.snapshot.as_ref().ok_or("FineTune state unavailable")?;
+        let mut matches = self.app_catalogue().filter(|app| app.app_id == app_id);
         let app = matches.next().ok_or("FineTune app is missing")?;
-        if matches.next().is_some() || app.pids.len() != 1 {
+        if matches.next().is_some() {
             return Err("FineTune app is ambiguous".into());
         }
-        if !app.active {
+        if !self.supports_managed_apps() && !app.active {
             return Err("FineTune app is inactive".into());
+        }
+        Ok(app)
+    }
+
+    pub fn writable_app(&self, app_id: &str) -> Result<&FineTuneApp, String> {
+        let app = self.app(app_id)?;
+        let snapshot = self.snapshot.as_ref().ok_or("FineTune state unavailable")?;
+        if snapshot.permission.audio_capture != FineTuneCapturePermission::Authorized {
+            return Err("FineTune audio capture permission is not authorized".into());
+        }
+        if self.supports_managed_apps()
+            && !snapshot.managed_apps.as_ref().is_some_and(|rows| {
+                rows.iter()
+                    .any(|row| row.app.app_id == app_id && row.manageable)
+            })
+        {
+            return Err("FineTune app is not manageable (ignored or unavailable)".into());
         }
         Ok(app)
     }

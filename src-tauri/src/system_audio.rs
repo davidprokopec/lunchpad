@@ -526,8 +526,7 @@ pub(crate) fn fine_tune_state(
         return None;
     };
     let app = state.app(app_id).ok()?;
-    let permitted = state.snapshot.as_ref()?.permission.audio_capture
-        == crate::finetune::FineTuneCapturePermission::Authorized;
+    let permitted = state.writable_app(app_id).is_ok();
     Some(TargetState {
         key: Resolved::FineTune {
             app_id: app_id.clone(),

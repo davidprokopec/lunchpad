@@ -227,8 +227,14 @@ export interface FineTuneDevice {
   capabilities: { volumeReadable: boolean; muteReadable: boolean; selectable: boolean };
 }
 
+export interface FineTuneManagedApp extends FineTuneApp {
+  running: boolean;
+  manageable: boolean;
+}
+
 export interface FineTuneSnapshot {
   apps: FineTuneApp[];
+  managedApps?: FineTuneManagedApp[];
   devices: FineTuneDevice[];
   defaultOutput: string | null;
   defaultInput: string | null;
@@ -239,6 +245,7 @@ export interface FineTuneSnapshot {
 export interface FineTuneState {
   status: "disabled" | "disconnected" | "connecting" | "synchronizing" | "ready" | "unsupported" | "error";
   connected: boolean;
+  capabilities?: string[];
   error: string | null;
   appVersion: string | null;
   sessionId: string | null;
@@ -246,6 +253,13 @@ export interface FineTuneState {
   generation: number;
   serverRevision: number | null;
   snapshot: FineTuneSnapshot | null;
+}
+
+/** Older normalized states/servers retain the legacy active-only catalogue. */
+export function fineTuneAppCatalogue(state: FineTuneState): (FineTuneApp | FineTuneManagedApp)[] {
+  return state.capabilities?.includes("managedApps")
+    ? state.snapshot?.managedApps ?? []
+    : state.snapshot?.apps ?? [];
 }
 
 export type WaveLinkTarget =

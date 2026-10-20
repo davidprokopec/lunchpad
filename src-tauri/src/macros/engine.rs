@@ -591,7 +591,7 @@ impl MacroEngine {
                 state.resolve(target)
             };
             let Some(st) = resolved else { continue };
-            if st.muted || !st.can_set_volume {
+            if st.muted || (!st.can_set_volume && !matches!(target, AudioTarget::FineTune { .. })) {
                 continue;
             }
             let value = fader.value_of(st.volume);
@@ -3272,9 +3272,24 @@ mod tests {
         #[cfg(unix)]
         #[tokio::test]
         async fn fine_tune_canonical_rapid_taps_use_physical_order_and_snapshot_readback() {
+            fine_tune_rapid_taps(false).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_inactive_canonical_rapid_taps_use_fifo_and_managed_prestate() {
+            fine_tune_rapid_taps(true).await;
+        }
+
+        #[cfg(unix)]
+        async fn fine_tune_rapid_taps(managed: bool) {
             let fixture = crate::finetune::tests::Fixture::new().await;
             let fine = fixture.start(true);
-            let mut peer = fixture.ready(&fine).await;
+            let mut peer = if managed {
+                fixture.ready_managed(&fine).await
+            } else {
+                fixture.ready(&fine).await
+            };
             let (r, _bridge) = fine_rig(&fine);
             let (release, done) = block_writer(&r.bridge.audio).await;
             input(&r.engine, true);
@@ -3296,10 +3311,59 @@ mod tests {
         #[cfg(unix)]
         #[tokio::test]
         async fn fine_tune_canonical_hold_page_change_and_cancel_restore_original_state() {
+            fine_tune_hold(false).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_inactive_hold_restores_managed_state_after_page_change_and_cancel() {
+            fine_tune_hold(true).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_inactive_initially_muted_hold_and_tap_capture_published_state() {
+            let fixture = crate::finetune::tests::Fixture::new().await;
+            let fine = fixture.start(true);
+            let mut peer = fixture.ready_managed(&fine).await;
+            peer.snapshot["managedApps"][0]["muted"] = serde_json::json!(true);
+            peer.revision += 1;
+            peer.event().await;
+            crate::finetune::tests::until(&fine, |state| {
+                state.app("app").is_ok_and(|app| app.muted)
+            })
+            .await;
+            let (r, _bridge) = fine_rig(&fine);
+            let down = Instant::now();
+            *r.engine.inner.input_clock.lock() = Some(down);
+            input(&r.engine, true);
+            *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(800));
+            input(&r.engine, false);
+            finish_input(&r).await;
+            assert!(fine.state().app("app").unwrap().muted);
+            fine.refresh();
+            peer.getter().await;
+            *r.engine.inner.input_clock.lock() = Some(down + Duration::from_secs(1));
+            input(&r.engine, true);
+            *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(1100));
+            input(&r.engine, false);
+            tokio::join!(finish_input(&r), peer.mutation_readback(false));
+            assert!(!fine.state().app("app").unwrap().muted);
+            assert!(r.fake.writes().is_empty());
+            fine.shutdown();
+            peer.closed().await;
+        }
+
+        #[cfg(unix)]
+        async fn fine_tune_hold(managed: bool) {
             for cancel in [false, true] {
                 let fixture = crate::finetune::tests::Fixture::new().await;
                 let fine = fixture.start(true);
-                let mut peer = fixture.ready(&fine).await;
+                let mut peer = if managed {
+                    fixture.ready_managed(&fine).await
+                } else {
+                    fixture.ready(&fine).await
+                };
                 let (r, _bridge) = fine_rig(&fine);
                 let (release, done) = block_writer(&r.bridge.audio).await;
                 let down = Instant::now();
@@ -3332,9 +3396,24 @@ mod tests {
         #[cfg(unix)]
         #[tokio::test]
         async fn fine_tune_old_session_restore_is_rejected_and_fader_follow_never_writes_back() {
+            fine_tune_session_and_feedback(false).await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_inactive_session_fences_and_external_denied_readback_never_write() {
+            fine_tune_session_and_feedback(true).await;
+        }
+
+        #[cfg(unix)]
+        async fn fine_tune_session_and_feedback(managed: bool) {
             let fixture = crate::finetune::tests::Fixture::new().await;
             let fine = fixture.start(true);
-            let mut peer = fixture.ready(&fine).await;
+            let mut peer = if managed {
+                fixture.ready_managed(&fine).await
+            } else {
+                fixture.ready(&fine).await
+            };
             let (r, _bridge) = fine_rig(&fine);
             input(&r.engine, true);
             tokio::join!(finish_input(&r), peer.mutation_readback(true));
@@ -3343,16 +3422,32 @@ mod tests {
             fine.disconnect();
             peer.closed().await;
             fine.connect();
-            let mut peer = fixture.ready_session(&fine, "replacement").await;
+            let mut peer = if managed {
+                fixture.ready_managed(&fine).await
+            } else {
+                fixture.ready_session(&fine, "replacement").await
+            };
             release.send(()).unwrap();
             done.await.unwrap().unwrap();
             finish_input(&r).await;
+            if managed {
+                peer.snapshot["managedApps"][0]["volume"] = serde_json::json!(0.35);
+                peer.snapshot["permission"]["audioCapture"] = serde_json::json!("denied");
+                peer.snapshot["managedApps"][0]["manageable"] = serde_json::json!(false);
+                peer.revision += 1;
+                peer.event().await;
+                crate::finetune::tests::until(&fine, |state| {
+                    state.server_revision == Some(peer.revision)
+                })
+                .await;
+            }
             // Explicitly reconcile the current authoritative snapshot; bridge scheduling
             // is not a synchronization primitive for profile assertions.
             r.bridge.live.update_fine_tune(fine.state());
             bound_fader(&r.profile, fine_target());
             r.engine.reconcile_audio_bindings();
-            assert!((fader_value(&r.profile) - 70.0).abs() < 0.001);
+            let expected = if managed { 35.0 } else { 70.0 };
+            assert!((fader_value(&r.profile) - expected).abs() < 0.001);
             r.bridge.audio.run(|_| Ok(())).await.unwrap();
             assert!(!r.engine.globals().contains_key("runs"));
             fine.refresh();

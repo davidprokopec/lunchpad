@@ -69,10 +69,23 @@ impl Fixture {
         until(fine, |state| state.status == FineTuneStatus::Ready).await;
         peer
     }
+    pub async fn ready_managed(&self, fine: &FineTune) -> Peer {
+        let mut peer = self.accept().await;
+        peer.snapshot = managed_snapshot(false, false);
+        peer.hello_managed().await;
+        let request = peer.request().await;
+        assert_eq!(request["method"], "subscribe");
+        peer.snapshot_reply(&request).await;
+        until(fine, |state| state.status == FineTuneStatus::Ready).await;
+        peer
+    }
 }
 impl Peer {
     pub async fn hello(&mut self) {
         self.send(json!({"type":"hello","protocol":"finetune-control","version":1,"appVersion":"fixture","sessionId":self.session,"capabilities":["getState","subscribe","setAppVolume","setAppMute","setAppRouting","setDefaultOutput","setPreferredInput"]})).await;
+    }
+    pub async fn hello_managed(&mut self) {
+        self.send(json!({"type":"hello","protocol":"finetune-control","version":1,"appVersion":"fixture","sessionId":self.session,"capabilities":["getState","subscribe","setAppVolume","setAppMute","setAppRouting","setDefaultOutput","setPreferredInput","managedApps"]})).await;
     }
     pub async fn send(&mut self, frame: Value) {
         let mut bytes = serde_json::to_vec(&frame).unwrap();
@@ -108,14 +121,17 @@ impl Peer {
     pub async fn mutation_readback(&mut self, muted: bool) {
         let setter = self.request().await;
         assert_eq!(setter["method"], "setAppMute");
-        assert_eq!(
-            setter["params"],
+        let managed = self.snapshot.get("managedApps").is_some();
+        let expected = if managed {
+            json!({"appId":"app","muted":muted})
+        } else {
             json!({"appId":"app","pid":123,"muted":muted})
-        );
+        };
+        assert_eq!(setter["params"], expected);
         self.reply(&setter, json!({"accepted":true})).await;
         let getter = self.request().await;
         assert_eq!(getter["method"], "getState");
-        self.snapshot["apps"][0]["muted"] = json!(muted);
+        self.snapshot[if managed { "managedApps" } else { "apps" }][0]["muted"] = json!(muted);
         self.revision += 1;
         self.snapshot_reply(&getter).await;
     }
@@ -171,6 +187,229 @@ pub(crate) fn snapshot() -> Value {
         ],
         "defaultOutput":"out","defaultInput":"in","inputPolicy":{"lockEnabled":true,"preferredDeviceUID":"in","lockedDeviceUID":"in"},"permission":{"audioCapture":"authorized","source":"preflight"}
     })
+}
+
+fn managed_snapshot(active: bool, running: bool) -> Value {
+    let mut state = snapshot();
+    let mut app = state["apps"][0].clone();
+    app["active"] = json!(active);
+    app["running"] = json!(running);
+    app["manageable"] = json!(true);
+    app["pids"] = if running { json!([123]) } else { json!([]) };
+    if !active {
+        app["routing"] = json!({"requested":{"mode":"followDefault"},"appliedDeviceUIDs":null,"status":"unavailable","error":null});
+        state["apps"] = json!([]);
+    }
+    state["managedApps"] = json!([app]);
+    state
+}
+
+#[tokio::test]
+async fn managed_capability_requires_valid_catalogue_without_relaxing_legacy_apps() {
+    let mut missing = snapshot();
+    missing.as_object_mut().unwrap().remove("managedApps");
+    let mut missing_flag = managed_snapshot(false, false);
+    missing_flag["managedApps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("manageable");
+    let mut zero_pid = managed_snapshot(false, true);
+    zero_pid["managedApps"][0]["pids"] = json!([0]);
+    let mut inconsistent = managed_snapshot(true, true);
+    inconsistent["managedApps"][0]["running"] = json!(false);
+    let mut invalid_legacy = managed_snapshot(false, false);
+    invalid_legacy["apps"] = json!([invalid_legacy["managedApps"][0].clone()]);
+    let mut null_catalogue = snapshot();
+    null_catalogue["managedApps"] = Value::Null;
+    let mut invalid_catalogue = snapshot();
+    invalid_catalogue["managedApps"] = json!({});
+    for snapshot in [
+        missing,
+        missing_flag,
+        zero_pid,
+        inconsistent,
+        invalid_legacy,
+        null_catalogue,
+        invalid_catalogue,
+    ] {
+        let fixture = Fixture::new().await;
+        let fine = fixture.start(false);
+        fine.connect();
+        let mut peer = fixture.accept().await;
+        peer.snapshot = snapshot;
+        peer.hello_managed().await;
+        let request = peer.request().await;
+        peer.snapshot_reply(&request).await;
+        let failed = until(&fine, |state| state.status == FineTuneStatus::Disconnected).await;
+        assert!(failed.error.is_some());
+        assert!(failed.snapshot.is_none());
+        assert!(failed.capabilities.is_empty());
+        peer.closed().await;
+        fine.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn legacy_server_ignores_unadvertised_managed_catalogue() {
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.accept().await;
+    peer.snapshot = managed_snapshot(false, false);
+    peer.hello().await;
+    let request = peer.request().await;
+    peer.snapshot_reply(&request).await;
+    until(&fine, |state| state.status == FineTuneStatus::Ready).await;
+    assert!(!fine.state().supports_managed_apps());
+    assert!(fine.state().app("app").unwrap_err().contains("missing"));
+    let handle = fine.clone();
+    let generation = fine.state().generation;
+    assert!(tokio::task::spawn_blocking(
+        move || handle.write(generation, Mutation::Mute("app".into(), true))
+    )
+    .await
+    .unwrap()
+    .unwrap_err()
+    .contains("missing"));
+    fine.refresh();
+    peer.getter().await;
+    fine.shutdown();
+    peer.closed().await;
+}
+
+#[tokio::test]
+async fn managed_inactive_and_active_dispatch_use_authoritative_identity_and_readback() {
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.ready_managed(&fine).await;
+    assert!(fine.state().supports_managed_apps());
+    let generation = fine.state().generation;
+    for (active, running, pid) in [(false, false, 0), (false, true, 222), (true, true, 333)] {
+        peer.snapshot = managed_snapshot(active, running);
+        if running {
+            peer.snapshot["managedApps"][0]["pids"] = json!([pid]);
+        }
+        if active {
+            peer.snapshot["apps"][0]["pids"] = json!([pid]);
+        }
+        peer.revision += 1;
+        peer.event().await;
+        until(&fine, |state| state.server_revision == Some(peer.revision)).await;
+        for mute in [false, true] {
+            let handle = fine.clone();
+            let mutation = if mute {
+                Mutation::Mute("app".into(), true)
+            } else {
+                Mutation::Volume("app".into(), 0.25)
+            };
+            let write = tokio::task::spawn_blocking(move || handle.write(generation, mutation));
+            let setter = peer.request().await;
+            assert_eq!(setter["params"]["appId"], "app");
+            if active {
+                assert_eq!(setter["params"]["pid"], pid);
+            } else {
+                assert!(setter["params"].get("pid").is_none());
+            }
+            assert_eq!(
+                setter["method"],
+                if mute { "setAppMute" } else { "setAppVolume" }
+            );
+            assert_eq!(
+                setter["params"][if mute { "muted" } else { "volume" }],
+                if mute { json!(true) } else { json!(0.25) }
+            );
+            peer.reply(&setter, json!({"accepted":true})).await;
+            let readback = peer.request().await;
+            assert_eq!(readback["method"], "getState");
+            assert!(!fine.state().app("app").unwrap().muted);
+            assert_eq!(fine.state().app("app").unwrap().volume, 0.7);
+            peer.snapshot_reply(&readback).await;
+            write.await.unwrap().unwrap();
+        }
+    }
+    fine.disconnect();
+    assert!(fine.state().capabilities.is_empty());
+    peer.closed().await;
+    fine.connect();
+    let mut peer = fixture.ready(&fine).await;
+    assert!(!fine.state().supports_managed_apps());
+    let handle = fine.clone();
+    assert!(tokio::task::spawn_blocking(
+        move || handle.write(generation, Mutation::Mute("app".into(), true))
+    )
+    .await
+    .unwrap()
+    .is_err());
+    fine.refresh();
+    peer.getter().await;
+    fine.shutdown();
+    peer.closed().await;
+}
+
+#[tokio::test]
+async fn managed_readability_is_independent_of_write_and_routing_eligibility() {
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.ready_managed(&fine).await;
+    let generation = fine.state().generation;
+    for (kind, reason) in [
+        ("denied", "permission"),
+        ("ignored", "manageable"),
+        ("duplicate", "ambiguous"),
+        ("missing", "missing"),
+        ("inactive", "active"),
+    ] {
+        peer.snapshot = managed_snapshot(false, false);
+        match kind {
+            "denied" => peer.snapshot["permission"]["audioCapture"] = json!("denied"),
+            "ignored" => peer.snapshot["managedApps"][0]["manageable"] = json!(false),
+            "duplicate" => {
+                let app = peer.snapshot["managedApps"][0].clone();
+                peer.snapshot["managedApps"] = json!([app.clone(), app]);
+            }
+            "missing" => peer.snapshot["managedApps"] = json!([]),
+            _ => {}
+        }
+        peer.revision += 1;
+        peer.event().await;
+        let state = until(&fine, |state| state.server_revision == Some(peer.revision)).await;
+        if matches!(kind, "denied" | "ignored" | "inactive") {
+            assert_eq!(state.app("app").unwrap().volume, 0.7);
+            let readable = crate::system_audio::fine_tune_state(
+                &state,
+                &FineTuneTarget::App {
+                    app_id: "app".into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(readable.can_set_volume, kind == "inactive");
+            assert_eq!(readable.can_mute, kind == "inactive");
+        } else {
+            assert!(state.app("app").is_err());
+        }
+        let mutations = if kind == "inactive" {
+            vec![Mutation::Routing(
+                "app".into(),
+                FineTuneRoutingRequest::FollowDefault,
+            )]
+        } else {
+            vec![
+                Mutation::Volume("app".into(), 0.5),
+                Mutation::Mute("app".into(), true),
+            ]
+        };
+        for mutation in mutations {
+            let handle = fine.clone();
+            let error = tokio::task::spawn_blocking(move || handle.write(generation, mutation))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(error.contains(reason), "{kind}: {error}");
+        }
+        fine.refresh();
+        peer.getter().await;
+    }
+    fine.shutdown();
+    peer.closed().await;
 }
 
 #[tokio::test]
