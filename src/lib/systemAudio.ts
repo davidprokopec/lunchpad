@@ -1,4 +1,4 @@
-import type { AudioStatus, AudioTarget, Fader, WaveLinkState } from "./api";
+import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState } from "./api";
 import { waveLinkControl } from "./waveLink";
 
 export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "defaultInput" } };
@@ -14,6 +14,16 @@ export function audioTargetConfigured(target: AudioTarget): boolean {
     case "mix": return !!ref.mixId;
     case "output": return !!ref.outputDeviceId && !!ref.outputId;
     case "input": case "inputGain": return !!ref.inputDeviceId && !!ref.inputId;
+  }
+}
+
+/** Structural references only: saved offline targets must remain editable. */
+export function audioActionConfigured(action: Action): boolean {
+  switch (action.type) {
+    case "setAudio": return audioTargetConfigured(action.target);
+    case "waveLinkSetMainOutput": return !!action.outputDeviceId && !!action.outputId;
+    case "waveLinkSetMonitoredMix": return !!action.outputDeviceId && !!action.outputId && !!action.mixId;
+    default: return true;
   }
 }
 

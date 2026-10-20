@@ -7,7 +7,7 @@ import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useVariablesStore } from "../store/variables";
 import { useMediaStore } from "../store/media";
-import { audioControllable, audioFader, audioState, audioTargetConfigured } from "../lib/systemAudio";
+import { audioActionConfigured, audioControllable, audioFader, audioState, audioTargetConfigured } from "../lib/systemAudio";
 import { AudioTargetField } from "./AudioTargetField";
 import { ActionsTab } from "./actions/ActionsTab";
 import { RgbField } from "./RgbField";
@@ -179,7 +179,8 @@ function FaderForm({
   const actionCount = fader.onChange.length + (strip ? (fader.onTouch?.length ?? 0) + (fader.onRelease?.length ?? 0) : 0);
   const setDirection = (direction: FaderDirection) => setFader({ ...fader, direction, length: Math.min(fader.length, maxFaderLength(layout, fader.x, fader.y, direction)) });
   const control = isControlCell(layout, fader.x, fader.y);
-  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max && (!fader.bound || audioTargetConfigured(fader.bound));
+  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max && (!fader.bound || audioTargetConfigured(fader.bound))
+    && [...fader.onChange, ...(fader.onTouch ?? []), ...(fader.onRelease ?? [])].every(audioActionConfigured);
 
   return (
     <>

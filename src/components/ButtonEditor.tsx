@@ -22,7 +22,7 @@ import { Button as UiButton, IconClose, Segmented, Toggle } from "./ui";
 import { Tooltip } from "./Tooltip";
 import { StateLinkField } from "./StateLinkField";
 import { muteButton, muteCaption } from "../lib/buttonPresets";
-import { audioTargetConfigured, DEFAULT_INPUT } from "../lib/systemAudio";
+import { audioActionConfigured, audioTargetConfigured, DEFAULT_INPUT } from "../lib/systemAudio";
 import { useMediaStore } from "../store/media";
 import { isLinkActive } from "../lib/stateLink";
 import { AudioTargetField } from "./AudioTargetField";
@@ -151,7 +151,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
     && button.down[0].type === "setAudio" && button.down[0].mode === "holdMute"
     && button.up[0].type === "setAudio" && button.up[0].mode === "holdMute"
     && (button.stateLink?.provider === "system" || button.stateLink?.provider === "waveLink") && button.stateLink.kind === "audioMuted";
-  const valid = [...button.down, ...button.up, ...button.hold].every((a) => a.type !== "setAudio" || audioTargetConfigured(a.target))
+  const valid = [...button.down, ...button.up, ...button.hold].every(audioActionConfigured)
     && (!button.stateLink?.target || audioTargetConfigured(button.stateLink.target));
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 

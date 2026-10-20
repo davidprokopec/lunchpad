@@ -5,7 +5,6 @@ import { api, type WaveLinkSettings } from "../../lib/api";
 import { waveLinkKey } from "../../lib/waveLink";
 import { useMediaStore } from "../../store/media";
 import { useSettingsStore } from "../../store/settings";
-import { NumberInput } from "../NumberInput";
 import { Button, Toggle } from "../ui";
 import { fieldCls, Section } from "./SettingsDialog";
 
@@ -22,10 +21,19 @@ export function WaveLinkTab() {
   const load = useMediaStore((s) => s.loadWaveLink);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [portDraft, setPortDraft] = useState<string | null>(null);
   useEffect(() => { void load(); }, [load]);
   const config = desired ?? confirmed ?? { enabled: false, autoConnect: true, port: null };
   const disabled = pending || busy || !confirmed;
   const change = (value: Partial<WaveLinkSettings>) => { void save(value).catch(() => undefined); };
+  const draftPort = portDraft !== null && /^\d+$/.test(portDraft) ? Number(portDraft) : NaN;
+  const validPort = Number.isInteger(draftPort) && draftPort >= 1 && draftPort <= 65535;
+  const commitPort = async () => {
+    if (disabled || !validPort) return;
+    if (draftPort === confirmed?.port && !saveError) { setPortDraft(null); return; }
+    try { await save({ port: draftPort }); setPortDraft(null); }
+    catch { /* Keep the draft available for an explicit retry; the store shows the error. */ }
+  };
   const command = async (run: typeof api.waveLinkConnect) => {
     setBusy(true); setError(null);
     try { receive(await run()); } catch (e) { setError(String(e)); }
@@ -47,8 +55,14 @@ export function WaveLinkTab() {
     {config.enabled && <>
       <Section title={t("waveLink.connection")} description={t("waveLink.localOnly")}>
         <Toggle checked={config.autoConnect} disabled={disabled} onChange={(autoConnect) => change({ autoConnect })} label={t("waveLink.autoConnect")} />
-        <Toggle checked={config.port === null} disabled={disabled} onChange={(automatic) => change({ port: automatic ? null : 1884 })} label={t("waveLink.automaticPort")} hint={t("waveLink.portHint")} />
-        {config.port !== null && <fieldset disabled={disabled}><label className="flex max-w-36 flex-col gap-1 text-xs text-stage-400">{t("waveLink.port")}<NumberInput value={config.port} min={1} max={65535} onChange={(port) => change({ port })} className={fieldCls} /></label></fieldset>}
+        <Toggle checked={config.port === null} disabled={disabled} onChange={(automatic) => { setPortDraft(null); change({ port: automatic ? null : 1884 }); }} label={t("waveLink.automaticPort")} hint={t("waveLink.portHint")} />
+        {config.port !== null && <div className="flex flex-col gap-2">
+          <div className="flex items-end gap-2">
+            <label className="flex max-w-36 flex-col gap-1 text-xs text-stage-400">{t("waveLink.port")}<input type="text" inputMode="numeric" value={portDraft ?? String(config.port)} disabled={disabled} aria-invalid={portDraft !== null && !validPort} aria-describedby="wave-link-port-hint" onChange={(e) => setPortDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void commitPort(); } }} className={fieldCls} /></label>
+            <Button size="sm" disabled={disabled || !validPort} onClick={() => void commitPort()}>{t("waveLink.applyPort")}</Button>
+          </div>
+          <p id="wave-link-port-hint" role="status" className={"text-xs " + (portDraft !== null && !validPort ? "text-warn" : "text-stage-500")}>{t(portDraft !== null && !validPort ? "waveLink.invalidPort" : "waveLink.portDraftHint")}</p>
+        </div>}
       </Section>
       <Section title={t("waveLink.statusTitle")}>
         <div className="rounded-lg border border-stage-700 bg-stage-800/50 p-3">
