@@ -323,6 +323,10 @@ pub struct MacBackend {
 pub fn make(options: Options) -> MakeBackend {
     Box::new(move |notifier| {
         let process_available = get_ids(SYSTEM_OBJECT, HW_PROCESS_LIST).is_ok();
+        tracing::info!(requested_opt_in = options.macos_taps, taps_supported = process_available,
+            apps_available = process_available, can_set_app_volume = process_available && options.macos_taps,
+            can_mute_apps = process_available && options.macos_taps, permission = ?Permission::Unknown,
+            "app audio service start");
         Ok(Box::new(MacBackend {
             process_available,
             // SAFETY: getpid has no preconditions.
@@ -338,13 +342,22 @@ pub fn make(options: Options) -> MakeBackend {
 
 impl Backend for MacBackend {
     fn configure(&mut self, options: Options) -> Result<(), Error> {
+        tracing::info!(
+            requested_opt_in = options.macos_taps,
+            taps_supported = self.process_available,
+            "app audio configure requested"
+        );
         if !options.macos_taps {
+            tracing::info!("app audio configure off: removing tap manager and controls");
             // Drop all controls on their owning worker; leave listing enabled.
             self.taps = None;
         } else if self.taps.is_none() && self.process_available {
             // Taps::new creates no native tap. Only an explicit setter probes.
             self.taps = Some(Taps::new());
         }
+        let status = self.status();
+        tracing::info!(apps_available = status.available, can_set_app_volume = status.can_set_volume,
+            can_mute_apps = status.can_mute, permission = ?status.permission, "app audio configure applied");
         Ok(())
     }
     fn devices(&mut self) -> Result<Vec<Device>, Error> {
@@ -447,11 +460,13 @@ impl Backend for MacBackend {
     }
 
     fn set_volume(&mut self, app: &str, volume: f32) -> Result<(), Error> {
+        tracing::info!(app, requested_volume = volume, "app audio volume requested");
         let (taps, processes) = self.tap_target(app)?;
         autoreleasepool(|_| taps.set(app, &processes, Some(volume), None))
     }
 
     fn set_mute(&mut self, app: &str, muted: bool) -> Result<(), Error> {
+        tracing::info!(app, requested_mute = muted, "app audio mute requested");
         let (taps, processes) = self.tap_target(app)?;
         autoreleasepool(|_| taps.set(app, &processes, None, Some(muted)))
     }
@@ -460,6 +475,14 @@ impl Backend for MacBackend {
 impl MacBackend {
     fn tap_target(&mut self, app: &str) -> Result<(&mut Taps, Vec<ObjId>), Error> {
         let processes = self.members.get(app).cloned().unwrap_or_default();
+        tracing::info!(app, ?processes, "app audio setter resolved process objects");
+        for object in &processes {
+            let pid = get::<i32>(*object, PROC_PID);
+            let path = pid.as_ref().ok().and_then(|pid| pid_path(*pid));
+            let running_output = get::<u32>(*object, PROC_RUNNING_OUTPUT).map(|v| v != 0);
+            tracing::info!(app, object, ?pid, executable_path = ?path, ?running_output,
+                "app audio setter process identity");
+        }
         let taps = self
             .taps
             .as_mut()
@@ -475,6 +498,69 @@ impl MacBackend {
                 .map(|v| active || v != 0)
                 .map_err(|e| e.into_error(ErrorKind::Native))
         })
+    }
+}
+
+/// Diagnostic reads only: failures must not affect construction or routing.
+pub(super) fn log_aggregate_streams(object: ObjId) {
+    for (direction, scope) in [("input", SCOPE_INPUT), ("output", SCOPE_OUTPUT)] {
+        let address = PropAddr {
+            selector: DEV_STREAMS,
+            scope,
+            element: 0,
+        };
+        let mut size = 0;
+        // SAFETY: valid address and writable size, with no qualifier.
+        let result = check("diagnostic stream list size", unsafe {
+            AudioObjectGetPropertyDataSize(object, &address, 0, std::ptr::null(), &mut size)
+        })
+        .and_then(|_| {
+            let mut streams = vec![0u32; size as usize / size_of::<ObjId>()];
+            // SAFETY: the vector has space for the requested stream object ids.
+            check("diagnostic stream list", unsafe {
+                AudioObjectGetPropertyData(
+                    object,
+                    &address,
+                    0,
+                    std::ptr::null(),
+                    &mut size,
+                    streams.as_mut_ptr().cast(),
+                )
+            })?;
+            streams.truncate(size as usize / size_of::<ObjId>());
+            Ok(streams)
+        });
+        match result {
+            Ok(streams) => {
+                tracing::info!(
+                    aggregate = object,
+                    direction,
+                    ?streams,
+                    "app audio aggregate streams (HAL order)"
+                );
+                for (index, stream) in streams.into_iter().enumerate() {
+                    tracing::info!(aggregate = object, stream, direction, index,
+                        starting_channel = ?get::<u32>(stream, fcc(b"schn")), "app audio aggregate stream channel mapping");
+                    match get::<super::macos_taps::Asbd>(stream, fcc(b"sfmt")) {
+                        Ok(format) => format.log(stream, direction, index),
+                        Err(error) => tracing::warn!(
+                            aggregate = object,
+                            stream,
+                            direction,
+                            index,
+                            ?error,
+                            "app audio stream format unavailable"
+                        ),
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                aggregate = object,
+                direction,
+                ?error,
+                "app audio stream list unavailable"
+            ),
+        }
     }
 }
 

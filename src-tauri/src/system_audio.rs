@@ -382,7 +382,16 @@ fn set_muted(port: &dyn AudioControl, key: &Resolved, muted: bool) -> Result<(),
     match key {
         Resolved::Device { id, kind } => port.set_device_muted(id, *kind, muted),
         Resolved::App { id } if port.status().can_mute_apps => port.set_app_muted(id, muted),
-        Resolved::App { .. } => Err("app mute is not available".into()),
+        Resolved::App { id } => {
+            tracing::warn!(
+                app = id,
+                requested_mute = muted,
+                can_mute_apps = false,
+                reason = "app mute capability unavailable",
+                "app audio action rejected"
+            );
+            Err("app mute is not available".into())
+        }
     }
 }
 
@@ -395,14 +404,29 @@ fn set_volume(port: &dyn AudioControl, key: &Resolved, volume: f32) -> Result<()
     match key {
         Resolved::Device { id, kind } => port.set_device_volume(id, *kind, volume),
         Resolved::App { id } if port.status().can_set_app_volume => port.set_app_volume(id, volume),
-        Resolved::App { .. } => Err("app volume is not available".into()),
+        Resolved::App { id } => {
+            tracing::warn!(
+                app = id,
+                requested_volume = volume,
+                can_set_volume = false,
+                reason = "app volume capability unavailable",
+                "app audio action rejected"
+            );
+            Err("app volume is not available".into())
+        }
     }
 }
 
 fn fresh(port: &dyn AudioControl, target: &AudioTarget) -> Result<TargetState, String> {
-    read_state(port)
-        .resolve(target)
-        .ok_or_else(|| format!("{} is not available", describe(target)))
+    read_state(port).resolve(target).ok_or_else(|| {
+        tracing::warn!(
+            ?target,
+            resolved = false,
+            reason = "fresh target resolution failed",
+            "audio action rejected"
+        );
+        format!("{} is not available", describe(target))
+    })
 }
 
 fn describe(target: &AudioTarget) -> String {

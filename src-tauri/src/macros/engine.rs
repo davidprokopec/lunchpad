@@ -624,7 +624,16 @@ impl MacroEngine {
             (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)) {
                 Some(sa) => Some((sa.clone(), AudioTarget::clone(target))),
                 None => {
-                    tracing::debug!(fader = %hit.id, "the fader's audio target is not available, press ignored");
+                    tracing::warn!(fader = %hit.id, target = ?target,
+                        service_available = self.inner.services.system_audio.is_some(),
+                        resolved = self.inner.services.system_audio.as_ref().is_some_and(|sa| sa.cached(target).is_some()),
+                        present = self.inner.services.system_audio.as_ref().is_some_and(|sa| match target.as_ref() {
+                            AudioTarget::App { app } => sa.snapshot().apps.iter().any(|a| a.id == app.id && a.present),
+                            AudioTarget::Device { .. } => sa.cached(target).is_some(),
+                        }),
+                        can_set_volume = self.inner.services.system_audio.as_ref().is_some_and(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)),
+                        reason = "audio service missing, target unresolved/not present, or volume capability unavailable",
+                        "the fader's audio target is not available, press ignored");
                     return;
                 }
             },

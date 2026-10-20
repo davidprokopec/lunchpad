@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ const FORMAT_FLAG_IS_FLOAT: u32 = 1;
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
-struct Asbd {
+pub(super) struct Asbd {
     sample_rate: f64,
     format_id: u32,
     format_flags: u32,
@@ -58,6 +58,15 @@ struct Asbd {
     channels_per_frame: u32,
     bits_per_channel: u32,
     reserved: u32,
+}
+
+impl Asbd {
+    pub(super) fn log(&self, object: ObjId, direction: &str, index: usize) {
+        tracing::info!(object, direction, index, channels = self.channels_per_frame,
+            float = self.format_id == FORMAT_LINEAR_PCM && self.format_flags & FORMAT_FLAG_IS_FLOAT != 0,
+            interleaved = self.format_flags & (1 << 5) == 0, format = ?self,
+            "app audio stream format");
+    }
 }
 
 #[repr(C)]
@@ -160,6 +169,7 @@ impl Tap {
 
     fn is_float_format(&self) -> CaResult<bool> {
         let format: Asbd = get(self.id, TAP_FORMAT)?;
+        format.log(self.id, "tap", 0);
         Ok(format.format_id == FORMAT_LINEAR_PCM
             && format.format_flags & FORMAT_FLAG_IS_FLOAT != 0
             && format.bits_per_channel == 32)
@@ -168,8 +178,12 @@ impl Tap {
 
 impl Drop for Tap {
     fn drop(&mut self) {
+        tracing::info!(tap = self.id, "app audio tap destroying");
         // SAFETY: `id` is a tap this struct created and has not destroyed.
-        unsafe { AudioHardwareDestroyProcessTap(self.id) };
+        let status = unsafe { AudioHardwareDestroyProcessTap(self.id) };
+        if let Err(error) = check("AudioHardwareDestroyProcessTap", status) {
+            tracing::warn!(tap = self.id, ?error, "app audio tap teardown failed");
+        }
     }
 }
 
@@ -220,8 +234,16 @@ impl Aggregate {
 
 impl Drop for Aggregate {
     fn drop(&mut self) {
+        tracing::info!(aggregate = self.id, "app audio aggregate destroying");
         // SAFETY: `id` is an aggregate this struct created and has not destroyed.
-        unsafe { AudioHardwareDestroyAggregateDevice(self.id) };
+        let status = unsafe { AudioHardwareDestroyAggregateDevice(self.id) };
+        if let Err(error) = check("AudioHardwareDestroyAggregateDevice", status) {
+            tracing::warn!(
+                aggregate = self.id,
+                ?error,
+                "app audio aggregate teardown failed"
+            );
+        }
     }
 }
 
@@ -229,6 +251,12 @@ impl Drop for Aggregate {
 struct Gain {
     gain_bits: AtomicU32,
     peak_bits: AtomicU32,
+    callbacks: AtomicU64,
+    summary_input_bits: AtomicU32,
+    summary_output_bits: AtomicU32,
+    input_buffers: AtomicU32,
+    first_input_channels: AtomicU32,
+    output_buffers: AtomicU32,
 }
 
 impl Gain {
@@ -236,6 +264,12 @@ impl Gain {
         Gain {
             gain_bits: AtomicU32::new(gain.to_bits()),
             peak_bits: AtomicU32::new(0),
+            callbacks: AtomicU64::new(0),
+            summary_input_bits: AtomicU32::new(0),
+            summary_output_bits: AtomicU32::new(0),
+            input_buffers: AtomicU32::new(0),
+            first_input_channels: AtomicU32::new(0),
+            output_buffers: AtomicU32::new(0),
         }
     }
     fn set(&self, gain: f32) {
@@ -248,6 +282,15 @@ impl Gain {
     /// The loudest input since the last call.
     fn take_peak(&self) -> f32 {
         f32::from_bits(self.peak_bits.swap(0, Ordering::Relaxed))
+    }
+
+    /// Diagnostic windows are independent of the watchdog's input peak.
+    fn take_summary(&self) -> (u64, f32, f32) {
+        (
+            self.callbacks.swap(0, Ordering::Relaxed),
+            f32::from_bits(self.summary_input_bits.swap(0, Ordering::Relaxed)),
+            f32::from_bits(self.summary_output_bits.swap(0, Ordering::Relaxed)),
+        )
     }
 }
 
@@ -272,12 +315,22 @@ unsafe extern "C" fn io_proc(
         unsafe { (&*(client as *const Gain), buffers(input), buffers(output)) };
     let gain = f32::from_bits(gain_state.gain_bits.load(Ordering::Relaxed));
     let input = ins.first().filter(|b| !b.data.is_null() && b.channels > 0);
+    gain_state
+        .input_buffers
+        .store(ins.len() as u32, Ordering::Relaxed);
+    gain_state
+        .first_input_channels
+        .store(ins.first().map_or(0, |b| b.channels), Ordering::Relaxed);
+    gain_state
+        .output_buffers
+        .store(outs.len() as u32, Ordering::Relaxed);
     // SAFETY: the tap format was checked to be 32-bit float, so the input
     // buffer holds `byte_size / 4` f32 samples.
     let samples: &[f32] = input.map_or(&[], |b| unsafe {
         std::slice::from_raw_parts(b.data as *const f32, b.byte_size as usize / 4)
     });
     let peak = samples.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let mut output_peak = 0f32;
     for out in outs.iter().filter(|b| !b.data.is_null()) {
         // SAFETY: the output device is the f32 main sub-device; the HAL owns
         // the buffer for the duration of this callback.
@@ -290,6 +343,7 @@ unsafe extern "C" fn io_proc(
         for f in 0..frames {
             for c in 0..out_channels {
                 o[f * out_channels + c] = samples[f * in_channels + (c % in_channels)] * gain;
+                output_peak = output_peak.max(o[f * out_channels + c].abs());
             }
         }
         o[frames * out_channels..].fill(0.0);
@@ -299,6 +353,13 @@ unsafe extern "C" fn io_proc(
             .peak_bits
             .store(peak.to_bits(), Ordering::Relaxed);
     }
+    gain_state.callbacks.fetch_add(1, Ordering::Relaxed);
+    gain_state
+        .summary_input_bits
+        .fetch_max(peak.to_bits(), Ordering::Relaxed);
+    gain_state
+        .summary_output_bits
+        .fetch_max(output_peak.to_bits(), Ordering::Relaxed);
     0
 }
 
@@ -331,11 +392,29 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
+        tracing::info!(
+            aggregate = self.device,
+            "app audio IOProc stopping/destroying"
+        );
         // SAFETY: stop then destroy the IOProc this struct created; after
         // destroy the HAL no longer calls it, so the Arc may be released.
         unsafe {
-            AudioDeviceStop(self.device, self.id);
-            AudioDeviceDestroyIOProcID(self.device, self.id);
+            let status = AudioDeviceStop(self.device, self.id);
+            if let Err(error) = check("AudioDeviceStop", status) {
+                tracing::warn!(
+                    aggregate = self.device,
+                    ?error,
+                    "app audio IOProc stop failed"
+                );
+            }
+            let status = AudioDeviceDestroyIOProcID(self.device, self.id);
+            if let Err(error) = check("AudioDeviceDestroyIOProcID", status) {
+                tracing::warn!(
+                    aggregate = self.device,
+                    ?error,
+                    "app audio IOProc teardown failed"
+                );
+            }
         }
     }
 }
@@ -427,6 +506,7 @@ struct Control {
     processes: Vec<ObjId>,
     output: Output,
     silence: SilenceWatch,
+    last_summary: Instant,
 }
 
 fn build_control(
@@ -436,6 +516,7 @@ fn build_control(
     output: &Output,
 ) -> Result<Control, Error> {
     let tap = Tap::create(processes, muted_tap)?;
+    tracing::info!(tap = tap.id, ?processes, muted_tap, gain, output_uid = %output.uid, "app audio tap created");
     if !tap.is_float_format().map_err(native)? {
         return Err(Error::new(
             ErrorKind::Native,
@@ -443,6 +524,9 @@ fn build_control(
         ));
     }
     let aggregate = Aggregate::create(&output.uid, &tap.uid)?;
+    tracing::info!(tap = tap.id, aggregate = aggregate.id, output_uid = %output.uid,
+        input_buffer_index = 0, input_selection = "ins.first()", "app audio aggregate created");
+    super::macos::log_aggregate_streams(aggregate.id);
     let gain = Arc::new(Gain::new(gain));
     let running = Running::start(aggregate.id, Arc::clone(&gain))?;
     Ok(Control {
@@ -455,6 +539,7 @@ fn build_control(
         processes: processes.to_vec(),
         output: output.clone(),
         silence: SilenceWatch::default(),
+        last_summary: Instant::now(),
     })
 }
 
@@ -485,17 +570,59 @@ impl TapSystem for CoreAudio {
         build_control(processes, true, gain, output)
     }
     fn probe(&self, processes: &[ObjId], output: &Output) -> Result<(), Error> {
-        if !self.running(processes)? {
+        let probe_started = Instant::now();
+        tracing::info!(?processes, output_uid = %output.uid, "app audio probe start");
+        let running = self.running(processes).inspect_err(|error| {
+            tracing::warn!(?processes, %error, elapsed_ms = probe_started.elapsed().as_millis(), callbacks = 0, peak = 0.0, "app audio probe end: activity error");
+        })?;
+        tracing::info!(
+            ?processes,
+            running_output = running,
+            "app audio probe activity"
+        );
+        if !running {
+            tracing::warn!(
+                ?processes,
+                running_output = running,
+                elapsed_ms = probe_started.elapsed().as_millis(),
+                callbacks = 0,
+                peak = 0.0,
+                "app audio probe end: silent app"
+            );
             return Err(Error::new(ErrorKind::Permission, "cannot confirm the System Audio Recording permission while the app is silent; play audio in it and retry"));
         }
-        let probe = build_control(processes, false, 0.0, output)?;
+        let probe = build_control(processes, false, 0.0, output).inspect_err(|error| {
+            tracing::warn!(?processes, %error, elapsed_ms = probe_started.elapsed().as_millis(), "app audio probe end: construction failed");
+        })?;
         let started = Instant::now();
         while started.elapsed() < PROBE_WINDOW {
             if probe.gain.peak() > 0.0 {
+                tracing::info!(
+                    ?processes,
+                    running_output = running,
+                    elapsed_ms = probe_started.elapsed().as_millis(),
+                    callbacks = probe.gain.callbacks.load(Ordering::Relaxed),
+                    peak = probe.gain.peak(),
+                    input_buffers = probe.gain.input_buffers.load(Ordering::Relaxed),
+                    first_input_channels = probe.gain.first_input_channels.load(Ordering::Relaxed),
+                    output_buffers = probe.gain.output_buffers.load(Ordering::Relaxed),
+                    "app audio probe end: signal confirmed"
+                );
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        tracing::warn!(
+            ?processes,
+            running_output = running,
+            elapsed_ms = probe_started.elapsed().as_millis(),
+            callbacks = probe.gain.callbacks.load(Ordering::Relaxed),
+            peak = probe.gain.peak(),
+            input_buffers = probe.gain.input_buffers.load(Ordering::Relaxed),
+            first_input_channels = probe.gain.first_input_channels.load(Ordering::Relaxed),
+            output_buffers = probe.gain.output_buffers.load(Ordering::Relaxed),
+            "app audio probe end: only silence"
+        );
         Err(Error::new(ErrorKind::Permission, "the tap delivered only silence: Lunchpad probably lacks the System Audio Recording permission (silence cannot be told apart from denial)"))
     }
 }
@@ -508,6 +635,18 @@ pub struct Taps {
     /// Why per-app control was last switched off for an app (G1), until the
     /// next successful change.
     problem: Option<String>,
+}
+
+impl Drop for Taps {
+    fn drop(&mut self) {
+        for app in self.controls.keys() {
+            tracing::info!(
+                app,
+                reason = "tap manager dropped (configure off/shutdown)",
+                "app audio control removed"
+            );
+        }
+    }
 }
 
 impl Taps {
@@ -550,6 +689,10 @@ impl Taps {
 
     fn verified<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         result.inspect_err(|error| {
+            tracing::warn!(%error, "app audio process enumeration/activity verification failed");
+            for app in self.controls.keys() {
+                tracing::warn!(app, %error, reason = "process verification failed", "app audio control removed");
+            }
             self.controls.clear();
             self.settings.clear();
             self.permission = Permission::Unconfirmed;
@@ -576,7 +719,13 @@ impl Taps {
             self.settings.retain(|app, _| apps.contains_key(app));
             return;
         }
-        let output = self.system.output().ok();
+        let output = self
+            .system
+            .output()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "app audio maintenance output unavailable");
+            })
+            .ok();
         self.retain_apps(apps, output.as_ref());
         self.follow_output(output.as_ref());
         self.watch_silence(Instant::now());
@@ -588,7 +737,12 @@ impl Taps {
     /// never overlap; the app plays unchanged for that moment.
     fn retain_apps(&mut self, apps: &HashMap<String, Vec<ObjId>>, output: Option<&Output>) {
         self.settings.retain(|app, _| apps.contains_key(app));
-        self.controls.retain(|app, _| apps.contains_key(app));
+        self.controls.retain(|app, _| {
+            if !apps.contains_key(app) {
+                tracing::info!(app, reason = "app disappeared", "app audio control removed");
+            }
+            apps.contains_key(app)
+        });
         let changed: Vec<String> = self
             .controls
             .iter()
@@ -596,6 +750,8 @@ impl Taps {
             .map(|(app, _)| app.clone())
             .collect();
         for app in changed {
+            tracing::info!(app, old_processes = ?self.controls.get(&app).map(|c| &c.processes),
+                new_processes = ?apps.get(&app), reason = "process set changed", "app audio control removed for rebuild");
             self.controls.remove(&app);
             if let (Some(processes), Some(output)) = (apps.get(&app), output) {
                 self.rebuild(&app, processes, output);
@@ -622,6 +778,7 @@ impl Taps {
                 continue;
             };
             let processes = control.processes.clone();
+            tracing::info!(app, old_output = ?control.output, ?route, reason = "default output changed/lost", "app audio control removed");
             drop(control);
             match route {
                 Route::Rebuild(output) => self.rebuild(&app, &processes, &output),
@@ -639,6 +796,18 @@ impl Taps {
             .iter_mut()
             .filter_map(|(app, control)| {
                 let producing = self.system.running(&control.processes);
+                if now.duration_since(control.last_summary) >= Duration::from_secs(5) {
+                    let (callbacks, input_peak, output_peak) = control.gain.take_summary();
+                    tracing::info!(app,
+                        gain = f32::from_bits(control.gain.gain_bits.load(Ordering::Relaxed)),
+                        callbacks, input_peak, output_peak,
+                        input_buffers = control.gain.input_buffers.load(Ordering::Relaxed),
+                        first_input_channels = control.gain.first_input_channels.load(Ordering::Relaxed),
+                        output_buffers = control.gain.output_buffers.load(Ordering::Relaxed),
+                        running_output = ?producing, elapsed_ms = now.duration_since(control.last_summary).as_millis(),
+                        "app audio control summary");
+                    control.last_summary = now;
+                }
                 let heard = control.gain.take_peak() > 0.0;
                 match producing {
                     Ok(producing) => control
@@ -653,9 +822,15 @@ impl Taps {
             self.controls.remove(&app);
             self.settings.remove(&app);
             if let Some(error) = reason {
+                tracing::warn!(app, %error, reason = "output activity verification failed", "app audio control removed");
                 self.permission = Permission::Unconfirmed;
                 self.problem = Some(format!("Process tap for {app} was removed because output activity could not be verified: {error}"));
             } else {
+                tracing::warn!(
+                    app,
+                    reason = "watchdog: silent tap while running output",
+                    "app audio control removed"
+                );
                 self.permission = Permission::Denied;
                 self.problem = Some(format!(
                 "Per-app volume for {app} was switched off: its tap stayed silent for {} s while the app was playing, so Lunchpad probably lacks the System Audio Recording permission",
@@ -668,12 +843,19 @@ impl Taps {
     /// Rebuilds a tap with the app's setting; on failure the setting goes too.
     fn rebuild(&mut self, app: &str, processes: &[ObjId], output: &Output) {
         if let Some((volume, muted)) = self.settings.remove(app) {
-            if let Ok(control) =
-                self.system
-                    .build(processes, if muted { 0.0 } else { volume }, output)
+            tracing::info!(app, ?processes, output = ?output, volume, muted, "app audio rebuild start");
+            match self
+                .system
+                .build(processes, if muted { 0.0 } else { volume }, output)
             {
-                self.controls.insert(app.to_string(), control);
-                self.settings.insert(app.to_string(), (volume, muted));
+                Ok(control) => {
+                    self.controls.insert(app.to_string(), control);
+                    self.settings.insert(app.to_string(), (volume, muted));
+                    tracing::info!(app, "app audio rebuild succeeded");
+                }
+                Err(error) => {
+                    tracing::warn!(app, %error, reason = "rebuild failed; setting forgotten", "app audio rebuild failed")
+                }
             }
         }
     }
@@ -685,7 +867,10 @@ impl Taps {
         volume: Option<f32>,
         muted: Option<bool>,
     ) -> Result<(), Error> {
+        tracing::info!(app, ?processes, requested_volume = ?volume, requested_mute = ?muted,
+            permission = ?self.permission, "app audio setter");
         if processes.is_empty() {
+            tracing::warn!(app, "app audio setter rejected: no process objects");
             return Err(Error::new(
                 ErrorKind::Native,
                 "the app has no Core Audio process objects",
@@ -694,12 +879,19 @@ impl Taps {
         let (old_volume, old_muted) = self.setting(app).unwrap_or((1.0, false));
         let next = (volume.unwrap_or(old_volume), muted.unwrap_or(old_muted));
         if next == (1.0, false) {
+            tracing::info!(
+                app,
+                had_control = self.controls.contains_key(app),
+                reason = "unity/unmuted: direct path, no tap",
+                "app audio setter unity/no-op or removal"
+            );
             // Unchanged audio needs no tap; dropping it restores the direct path.
             self.controls.remove(app);
             self.settings.remove(app);
             return Ok(());
         }
-        let output = self.system.output().inspect_err(|_| {
+        let output = self.system.output().inspect_err(|error| {
+            tracing::warn!(app, %error, reason = "setter output unavailable", "app audio control removed");
             self.controls.remove(app);
             self.settings.remove(app);
         })?;
@@ -708,11 +900,20 @@ impl Taps {
             .get(app)
             .is_some_and(|control| control.processes != processes || control.output != output)
         {
+            tracing::info!(
+                app,
+                ?processes,
+                ?output,
+                reason = "setter process set/output mismatch",
+                "app audio control removed for rebuild"
+            );
             self.controls.remove(app);
             self.settings.remove(app);
         }
         if self.permission != Permission::Granted {
+            tracing::info!(app, ?processes, "app audio setter probing permission");
             if let Err(e) = self.system.probe(processes, &output) {
+                tracing::warn!(app, error = %e, reason = "permission probe failed", "app audio control removed/setter failed");
                 self.controls.remove(app);
                 self.settings.remove(app);
                 // Silence is ambiguous; earlier evidence of denial (G1) stands.
@@ -722,17 +923,29 @@ impl Taps {
                 return Err(e);
             }
             self.permission = Permission::Granted;
+            tracing::info!(app, permission = ?self.permission, "app audio setter probe confirmed");
         }
         let gain = if next.1 { 0.0 } else { next.0 };
         match self.controls.get(app) {
             Some(control) if control.processes == processes && control.output == output => {
+                tracing::info!(app, gain, "app audio setter existing control gain update");
                 control.gain.set(gain)
             }
             _ => {
+                tracing::info!(
+                    app,
+                    gain,
+                    ?output,
+                    ?processes,
+                    "app audio setter build start"
+                );
                 self.controls.remove(app);
                 self.settings.remove(app);
-                let control = self.system.build(processes, gain, &output)?;
+                let control = self.system.build(processes, gain, &output).inspect_err(|error| {
+                    tracing::warn!(app, %error, "app audio setter build failed; control/setting absent");
+                })?;
                 self.controls.insert(app.to_string(), control);
+                tracing::info!(app, "app audio setter build succeeded");
             }
         }
         self.settings.insert(app.to_string(), next);
@@ -746,6 +959,51 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    #[test]
+    fn diagnostic_summary_resets_without_consuming_watchdog_peak() {
+        let gain = Gain::new(0.5);
+        let samples = [0.8f32, -0.4];
+        let mut rendered = [0f32; 2];
+        let input = AudioBufferList {
+            count: 1,
+            buffers: [AudioBuffer {
+                channels: 2,
+                byte_size: 8,
+                data: samples.as_ptr().cast_mut().cast(),
+            }],
+        };
+        let mut output = AudioBufferList {
+            count: 1,
+            buffers: [AudioBuffer {
+                channels: 2,
+                byte_size: 8,
+                data: rendered.as_mut_ptr().cast(),
+            }],
+        };
+        // SAFETY: local f32 buffers and Gain outlive this synchronous callback;
+        // the unused timestamp arguments may be null. No HAL/audio is invoked.
+        let status = unsafe {
+            io_proc(
+                0,
+                std::ptr::null(),
+                &input,
+                std::ptr::null(),
+                &mut output,
+                std::ptr::null(),
+                std::ptr::from_ref(&gain).cast_mut().cast(),
+            )
+        };
+        assert_eq!(status, 0);
+        assert_eq!(rendered, [0.4, -0.2]);
+        assert_eq!(gain.input_buffers.load(Ordering::Relaxed), 1);
+        assert_eq!(gain.first_input_channels.load(Ordering::Relaxed), 2);
+        assert_eq!(gain.output_buffers.load(Ordering::Relaxed), 1);
+        assert_eq!(gain.take_summary(), (1, 0.8, 0.4));
+        assert_eq!(gain.take_summary(), (0, 0.0, 0.0));
+        assert_eq!(gain.take_peak(), 0.8);
+        assert_eq!(f32::from_bits(gain.gain_bits.load(Ordering::Relaxed)), 0.5);
+    }
 
     struct FakeResource {
         live: Rc<Cell<usize>>,
@@ -826,6 +1084,7 @@ mod tests {
                 processes: processes.to_vec(),
                 output: output.clone(),
                 silence: SilenceWatch::default(),
+                last_summary: Instant::now(),
             })
         }
     }
