@@ -28,9 +28,24 @@ pub struct LiveStatus {
     pub slobs: ProviderStatus,
     /// Devices and apps as the system audio bridge last saw them.
     pub system: SystemAudioState,
+    pub wave_link: crate::wavelink::WaveLinkState,
 }
 
 pub type SharedLive = Arc<Mutex<LiveStatus>>;
+
+impl LiveStatus {
+    pub fn resolve_audio(
+        &self,
+        target: &crate::profile::AudioTarget,
+    ) -> Option<crate::system_audio::TargetState> {
+        match target {
+            crate::profile::AudioTarget::WaveLink { target } => {
+                crate::system_audio::wave_link_state(&self.wave_link, target)
+            }
+            _ => self.system.resolve(target),
+        }
+    }
+}
 
 /// Writer handle for the integrations; `on_change` runs after a real change
 /// (the app repaints the LEDs with it).
@@ -52,7 +67,7 @@ impl LiveHandle {
                 LinkProvider::Obs => &mut st.obs,
                 LinkProvider::Slobs => &mut st.slobs,
                 // The system audio has its own shape; see `update_system`.
-                LinkProvider::System => return,
+                LinkProvider::System | LinkProvider::WaveLink => return,
             };
             let before = slot.clone();
             f(slot);
@@ -74,16 +89,78 @@ impl LiveHandle {
             (self.on_change)();
         }
     }
+
+    pub fn update_wave_link(&self, next: crate::wavelink::WaveLinkState) {
+        let changed = {
+            let mut live = self.status.lock();
+            if live.wave_link == next {
+                false
+            } else {
+                live.wave_link = next;
+                true
+            }
+        };
+        if changed {
+            (self.on_change)();
+        }
+    }
 }
 
 impl StateLink {
     pub fn is_active(&self, live: &LiveStatus) -> bool {
         let p = match self.provider {
+            LinkProvider::WaveLink => {
+                let state = &live.wave_link;
+                if state.status != crate::wavelink::WaveLinkStatus::Ready {
+                    return false;
+                }
+                let Some(crate::profile::AudioTarget::WaveLink { target }) = &self.target else {
+                    return false;
+                };
+                return match self.kind {
+                    LinkKind::AudioMuted => state
+                        .control(target)
+                        .is_some_and(|control| control.can_mute && control.muted == Some(true)),
+                    LinkKind::WaveLinkMainOutput => match target {
+                        crate::wavelink::WaveLinkTarget::Output {
+                            output_device_id,
+                            output_id,
+                        } => state.main_output.as_ref().is_some_and(|output| {
+                            &output.output_device_id == output_device_id
+                                && &output.output_id == output_id
+                        }),
+                        _ => false,
+                    },
+                    LinkKind::WaveLinkMonitoredMix => match target {
+                        crate::wavelink::WaveLinkTarget::Output {
+                            output_device_id,
+                            output_id,
+                        } => self
+                            .wave_link_mix_id
+                            .as_ref()
+                            .filter(|id| !id.is_empty())
+                            .is_some_and(|mix| {
+                                state.outputs.iter().any(|output| {
+                                    &output.output_device_id == output_device_id
+                                        && &output.output_id == output_id
+                                        && output.mix_id.as_ref() == Some(mix)
+                                })
+                            }),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+            }
             LinkProvider::Obs => &live.obs,
             LinkProvider::Slobs => &live.slobs,
             // Muted and there; a missing device or app (or no audio at all) is not lit.
             LinkProvider::System => {
-                return self.kind == LinkKind::AudioMuted && self.target.as_ref().and_then(|t| live.system.resolve(t)).is_some_and(|s| s.can_mute && s.muted);
+                return self.kind == LinkKind::AudioMuted
+                    && self
+                        .target
+                        .as_ref()
+                        .and_then(|t| live.system.resolve(t))
+                        .is_some_and(|s| s.can_mute && s.muted);
             }
         };
         if !p.connected {
@@ -92,14 +169,22 @@ impl StateLink {
         match self.kind {
             LinkKind::Scene => p.current_scene.as_deref() == Some(self.scene.as_str()),
             LinkKind::SourceVisible => {
-                let scene = if self.scene.is_empty() { p.current_scene.clone() } else { Some(self.scene.clone()) };
-                scene.map(|s| p.visible.contains(&(s, self.source.clone()))).unwrap_or(false)
+                let scene = if self.scene.is_empty() {
+                    p.current_scene.clone()
+                } else {
+                    Some(self.scene.clone())
+                };
+                scene
+                    .map(|s| p.visible.contains(&(s, self.source.clone())))
+                    .unwrap_or(false)
             }
             LinkKind::SourceMuted => p.muted.contains(&self.source),
             LinkKind::Streaming => p.streaming,
             LinkKind::Recording => p.recording,
             LinkKind::ReplayBuffer => p.replay_buffer,
-            LinkKind::AudioMuted => false,
+            LinkKind::AudioMuted
+            | LinkKind::WaveLinkMainOutput
+            | LinkKind::WaveLinkMonitoredMix => false,
         }
     }
 }
@@ -108,8 +193,96 @@ impl StateLink {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wave_link_links_and_faders_require_ready_qualified_state() {
+        use crate::wavelink::*;
+        let target = WaveLinkTarget::Output {
+            output_device_id: "device-a".into(),
+            output_id: "same".into(),
+        };
+        let audio = crate::profile::AudioTarget::WaveLink {
+            target: target.clone(),
+        };
+        let link = StateLink {
+            provider: LinkProvider::WaveLink,
+            kind: LinkKind::AudioMuted,
+            target: Some(audio.clone()),
+            scene: String::new(),
+            source: String::new(),
+            wave_link_mix_id: Some("mix".into()),
+        };
+        let mut live = LiveStatus::default();
+        live.wave_link.status = WaveLinkStatus::Ready;
+        live.wave_link.controls.push(WaveLinkControl {
+            target,
+            name: "Output".into(),
+            level: Some(0.7),
+            muted: Some(true),
+            can_set_level: true,
+            can_mute: true,
+            reason: None,
+            gain: None,
+        });
+        live.wave_link.outputs.push(WaveLinkOutput {
+            output_device_id: "device-a".into(),
+            output_id: "same".into(),
+            name: "Output".into(),
+            mix_id: Some("mix".into()),
+            can_select_main: true,
+            can_set_mix: true,
+        });
+        live.wave_link.main_output = Some(WaveLinkMainOutput {
+            output_device_id: "device-a".into(),
+            output_id: "same".into(),
+        });
+        assert!(link.is_active(&live));
+        assert!(StateLink {
+            kind: LinkKind::WaveLinkMainOutput,
+            ..link.clone()
+        }
+        .is_active(&live));
+        assert!(StateLink {
+            kind: LinkKind::WaveLinkMonitoredMix,
+            ..link.clone()
+        }
+        .is_active(&live));
+        assert!(!StateLink {
+            kind: LinkKind::WaveLinkMonitoredMix,
+            wave_link_mix_id: Some(String::new()),
+            ..link.clone()
+        }
+        .is_active(&live));
+        let mut fader = crate::profile::Fader {
+            bound: Some(audio),
+            min: 0.0,
+            max: 100.0,
+            value: 70.0,
+            ..Default::default()
+        };
+        assert_eq!(fader.render_value(&live), Some(0.0));
+        live.wave_link.controls[0].muted = Some(false);
+        assert_eq!(fader.render_value(&live), Some(70.0));
+        fader.bound = Some(crate::profile::AudioTarget::WaveLink {
+            target: WaveLinkTarget::Output {
+                output_device_id: "device-b".into(),
+                output_id: "same".into(),
+            },
+        });
+        assert_eq!(fader.render_value(&live), None);
+        live.wave_link.status = WaveLinkStatus::Disconnected;
+        assert!(!link.is_active(&live));
+        assert_eq!(live.resolve_audio(link.target.as_ref().unwrap()), None);
+    }
+
     fn link(provider: LinkProvider, kind: LinkKind, scene: &str, source: &str) -> StateLink {
-        StateLink { provider, kind, scene: scene.into(), source: source.into(), target: None }
+        StateLink {
+            provider,
+            kind,
+            scene: scene.into(),
+            source: source.into(),
+            target: None,
+            wave_link_mix_id: None,
+        }
     }
 
     #[test]
@@ -138,13 +311,26 @@ mod tests {
     fn a_system_link_lights_while_its_target_is_muted() {
         use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef};
         use crate::system_audio::FakeAudio;
-        let mic = StateLink { provider: LinkProvider::System, kind: LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }) };
+        let mic = StateLink {
+            provider: LinkProvider::System,
+            kind: LinkKind::AudioMuted,
+            scene: String::new(),
+            source: String::new(),
+            target: Some(AudioTarget::Device {
+                device: DeviceRef::DefaultInput,
+            }),
+            wave_link_mix_id: None,
+        };
         let mut live = LiveStatus::default();
         // No system audio at all: not lit.
         assert!(!mic.is_active(&live));
         let mut device = FakeAudio::device("m", AudioDeviceKind::Input, true, 0.5);
         device.muted = true;
-        live.system = SystemAudioState { available: true, devices: vec![device], ..Default::default() };
+        live.system = SystemAudioState {
+            available: true,
+            devices: vec![device],
+            ..Default::default()
+        };
         assert!(mic.is_active(&live));
         // The muted device is not the default any more: the default input is absent, not lit.
         live.system.devices[0].is_default = false;
@@ -154,17 +340,32 @@ mod tests {
         assert!(!mic.is_active(&live), "unavailable is not lit");
         live.system.available = true;
         // A link without a target, or with an OBS kind, never lights.
-        assert!(!StateLink { target: None, ..mic.clone() }.is_active(&live));
-        assert!(!StateLink { kind: LinkKind::Streaming, ..mic.clone() }.is_active(&live));
+        assert!(!StateLink {
+            target: None,
+            ..mic.clone()
+        }
+        .is_active(&live));
+        assert!(!StateLink {
+            kind: LinkKind::Streaming,
+            ..mic.clone()
+        }
+        .is_active(&live));
         // An OBS link with the System kind does not either.
         live.obs.connected = true;
-        assert!(!StateLink { provider: LinkProvider::Obs, ..mic.clone() }.is_active(&live));
+        assert!(!StateLink {
+            provider: LinkProvider::Obs,
+            ..mic.clone()
+        }
+        .is_active(&live));
         // A change repaints, the same snapshot again does not.
         let repaints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = repaints.clone();
-        let handle = LiveHandle::new(Arc::new(Mutex::new(LiveStatus::default())), Arc::new(move || {
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
+        let handle = LiveHandle::new(
+            Arc::new(Mutex::new(LiveStatus::default())),
+            Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
         let snapshot = live.system.clone();
         handle.update_system(|s| *s = snapshot.clone());
         handle.update_system(|s| *s = snapshot.clone());
@@ -178,6 +379,8 @@ mod tests {
         assert!(!link(LinkProvider::Obs, LinkKind::Streaming, "", "").is_active(&live));
         let handle = LiveHandle::new(Arc::new(Mutex::new(live)), Arc::new(|| {}));
         handle.update(LinkProvider::Obs, |p| p.connected = true);
-        assert!(link(LinkProvider::Obs, LinkKind::Streaming, "", "").is_active(&handle.status.lock()));
+        assert!(
+            link(LinkProvider::Obs, LinkKind::Streaming, "", "").is_active(&handle.status.lock())
+        );
     }
 }

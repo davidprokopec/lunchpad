@@ -637,6 +637,14 @@
         "name": "Device or app audio",
         "desc": "Set, nudge or mute a device or an app, or hold to mute: a tap toggles the mute, holding mutes until you let go."
       },
+      "waveLinkSetMainOutput": {
+        "name": "Wave Link main output",
+        "desc": "Select a discovered Wave Link output without changing the system default."
+      },
+      "waveLinkSetMonitoredMix": {
+        "name": "Wave Link output mix",
+        "desc": "Select a discovered mix on a qualified Wave Link output."
+      },
       "launchApplication": {
         "name": "Launch application",
         "desc": "Start a program or script."

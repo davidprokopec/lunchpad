@@ -539,8 +539,8 @@ export interface AppRef {
   id: string;
   name: string;
 }
-/** A device or an app whose volume and mute Lunchpad follows or sets. */
-export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef };
+/** A device, app or Wave Link control whose volume and mute Lunchpad follows or sets. */
+export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef } | { type: "waveLink"; target: WaveLinkTarget };
 /** `holdMute` goes in both the pressed and the released list: a tap toggles, a hold (the button's holdMs) mutes only while held. */
 export type SetAudioMode = "setVolume" | "adjustVolume" | "mute" | "unmute" | "toggleMute" | "holdMute";
 export const SET_AUDIO_MODES: SetAudioMode[] = ["setVolume", "adjustVolume", "mute", "unmute", "toggleMute", "holdMute"];
@@ -638,6 +638,8 @@ export type ActionKind =
   | { type: "slobsSetAudio"; scene: string; collection: string; source: string; muted: boolean; muteMode: MuteMode | null; volumeDb: number; volumeFrom: string | null; volumeUnit: VolumeUnit; setVolume: boolean }
   | { type: "setSystemVolume"; target: SystemVolumeTarget; mode: SystemVolumeMode; volume: number; volumeFrom: string | null; device: string | null }
   | { type: "setAudio"; target: AudioTarget; mode: SetAudioMode; volume: number; volumeFrom: string | null }
+  | { type: "waveLinkSetMainOutput"; outputDeviceId: string; outputId: string }
+  | { type: "waveLinkSetMonitoredMix"; outputDeviceId: string; outputId: string; mixId: string }
   | { type: "stopAllSounds" }
   | { type: "setAudioDevice"; target: SystemVolumeTarget; device: string }
   | { type: "addToVariable"; name: string; amount: string; scope: VarScope }
@@ -888,6 +890,8 @@ export const AVAILABLE_ACTIONS: ReadonlySet<ActionType> = new Set<ActionType>([
   "textToSpeech",
   "setSystemVolume",
   "setAudio",
+  "waveLinkSetMainOutput",
+  "waveLinkSetMonitoredMix",
   "stopAllSounds",
   "setAudioDevice",
   "addToVariable",
@@ -935,9 +939,9 @@ export interface RunningMacro {
   startedAtMs: number;
 }
 
-export type LinkProvider = "obs" | "slobs" | "system";
+export type LinkProvider = "obs" | "slobs" | "system" | "waveLink";
 /** `audioMuted` is the System provider's only kind. */
-export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer" | "audioMuted";
+export type LinkKind = "scene" | "sourceVisible" | "sourceMuted" | "streaming" | "recording" | "replayBuffer" | "audioMuted" | "waveLinkMainOutput" | "waveLinkMonitoredMix";
 export const LINK_KINDS: LinkKind[] = ["scene", "sourceVisible", "sourceMuted", "streaming", "recording", "replayBuffer"];
 
 /** "Active while …": the button shows its active colour while a streaming app is in this state. */
@@ -949,6 +953,7 @@ export interface StateLink {
   source: string;
   /** System provider: the device or app whose mute lights the pad (left out of the file when unset) */
   target?: AudioTarget | null;
+  waveLinkMixId?: string;
 }
 
 /** What a press does while an earlier run of the same list (pressed, released or held) is still going. */
@@ -1172,6 +1177,11 @@ export const api = {
   stopSound: (id: number) => invoke<void>("stop_sound", { id }),
   stopAllSounds: () => invoke<void>("stop_all_sounds"),
   setAudioSettings: (config: AudioSettings) => invoke<Settings>("set_audio_settings", { config }),
+  waveLinkState: () => invoke<WaveLinkState>("wave_link_state"),
+  waveLinkConnect: () => invoke<WaveLinkState>("wave_link_connect"),
+  waveLinkDisconnect: () => invoke<WaveLinkState>("wave_link_disconnect"),
+  waveLinkRefresh: () => invoke<WaveLinkState>("wave_link_refresh"),
+  setWaveLinkSettings: (config: WaveLinkSettings) => invoke<Settings>("set_wave_link_settings", { config }),
   fileName: (path: string) => invoke<string>("file_name", { path }),
   listVoices: () => invoke<VoiceInfo[]>("list_voices"),
   previewSpeech: (request: { text: string; voice: string | null; volume: number }) => invoke<void>("preview_speech", { request }),
@@ -1271,6 +1281,7 @@ export const events = {
     listen<InputUnavailable>("input:unavailable", (e) => cb(e.payload)),
   /** The system audio changed (coalesced); same payload as `audioStatus`. */
   onSystemAudio: (cb: (status: AudioStatus) => void): Promise<UnlistenFn> => listen<AudioStatus>("system-audio:changed", (e) => cb(e.payload)),
+  onWaveLinkState: (cb: (state: WaveLinkState) => void): Promise<UnlistenFn> => listen<WaveLinkState>("wave-link:state", (e) => cb(e.payload)),
   onObsState: (cb: (state: ObsState) => void): Promise<UnlistenFn> => listen<ObsState>("obs:state", (e) => cb(e.payload)),
   onSlobsState: (cb: (state: SlobsState) => void): Promise<UnlistenFn> => listen<SlobsState>("slobs:state", (e) => cb(e.payload)),
   onHomeAssistantState: (cb: (state: HaState) => void): Promise<UnlistenFn> => listen<HaState>("homeassistant:state", (e) => cb(e.payload)),

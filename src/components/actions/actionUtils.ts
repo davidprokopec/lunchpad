@@ -27,6 +27,8 @@ export const ACTION_ICONS: Record<ActionType, IconName> = {
   textToSpeech: "Speech",
   setSystemVolume: "Volume2",
   setAudio: "MicOff",
+  waveLinkSetMainOutput: "Volume2",
+  waveLinkSetMonitoredMix: "Volume2",
   stopAllSounds: "CircleStop",
   setAudioDevice: "Volume2",
   addToVariable: "Variable",
@@ -242,6 +244,10 @@ export function createActions(type: ActionType): Action[] {
       return [make({ type: "setSystemVolume", target: "output", mode: "set", volume: 50, volumeFrom: null, device: null })];
     case "setAudio":
       return [make({ type: "setAudio", target: { type: "device", device: { type: "defaultOutput" } }, mode: "setVolume", volume: 50, volumeFrom: null })];
+    case "waveLinkSetMainOutput":
+      return [make({ type: "waveLinkSetMainOutput", outputDeviceId: "", outputId: "" })];
+    case "waveLinkSetMonitoredMix":
+      return [make({ type: "waveLinkSetMonitoredMix", outputDeviceId: "", outputId: "", mixId: "" })];
     case "stopAllSounds":
       return [make({ type: "stopAllSounds" })];
     case "setAudioDevice":
@@ -354,7 +360,7 @@ export function createActions(type: ActionType): Action[] {
 
 /** Actions whose `wait` flag is meaningful (they take time). */
 export function hasWait(type: ActionType): boolean {
-  return ["runButton", "playSound", "textToSpeech", "launchApplication", "hotkey", "mouse", "httpRequest", "runScript"].includes(type);
+  return ["runButton", "playSound", "textToSpeech", "launchApplication", "hotkey", "mouse", "httpRequest", "runScript", "waveLinkSetMainOutput", "waveLinkSetMonitoredMix"].includes(type);
 }
 
 /** Variable names visible to completion: built-ins, live globals, and names this button writes. */
@@ -452,7 +458,7 @@ export function summarize(t: TFunction, action: Action, pages: Page[]): string {
     }
     case "setAudio": {
       const target = action.target;
-      const name = target.type === "app" ? target.app.name || t("audio.chooseApp") : target.device.type === "named" ? target.device.label : t(`audio.${target.device.type}`);
+      const name = target.type === "waveLink" ? "Wave Link" : target.type === "app" ? target.app.name || t("audio.chooseApp") : target.device.type === "named" ? target.device.label : t(`audio.${target.device.type}`);
       const mode = t(`audio.modes.${action.mode}`);
       const volume = action.volumeFrom ? `{{${action.volumeFrom}}}` : `${action.mode === "adjustVolume" && action.volume >= 0 ? "+" : ""}${Math.round(action.volume)} %`;
       return `${name} · ${mode}${action.mode === "setVolume" || action.mode === "adjustVolume" ? ` ${volume}` : ""}`;

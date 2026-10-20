@@ -6,6 +6,7 @@ export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "de
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
 export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null) {
   if (!target || !status) return null;
+  if (target.type === "waveLink") return null;
   if (target.type === "app") {
     if (!status.appsAvailable) return null;
     return status.apps.find((a) => a.id === target.app.id && a.present) ?? null;

@@ -183,8 +183,17 @@ pub struct SystemAudioState {
 /// What a target addresses in a snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolved {
-    Device { id: String, kind: AudioDeviceKind },
-    App { id: String },
+    Device {
+        id: String,
+        kind: AudioDeviceKind,
+    },
+    App {
+        id: String,
+    },
+    WaveLink {
+        target: crate::wavelink::WaveLinkTarget,
+        generation: u64,
+    },
 }
 
 /// A target found in a snapshot, with its state.
@@ -202,6 +211,7 @@ impl SystemAudioState {
     /// The target's state, or `None` while it is not there (or audio is unavailable).
     pub fn resolve(&self, target: &AudioTarget) -> Option<TargetState> {
         match target {
+            AudioTarget::WaveLink { .. } => None,
             AudioTarget::Device { device } => {
                 if !self.available {
                     return None;
@@ -313,6 +323,7 @@ pub fn report(status: AudioStatus, state: &SystemAudioState, profile: &Profile) 
                 }
             }
             AudioTarget::Device { .. } => {}
+            AudioTarget::WaveLink { .. } => {}
             AudioTarget::App {
                 app: AppRef { id, name },
             } => {
@@ -380,6 +391,7 @@ pub fn saved_targets(profile: &Profile) -> Vec<AudioTarget> {
 
 fn set_muted(port: &dyn AudioControl, key: &Resolved, muted: bool) -> Result<(), String> {
     match key {
+        Resolved::WaveLink { .. } => Err("Wave Link requires the private writer context".into()),
         Resolved::Device { id, kind } => port.set_device_muted(id, *kind, muted),
         Resolved::App { id } if port.status().can_mute_apps => port.set_app_muted(id, muted),
         Resolved::App { id } => {
@@ -402,6 +414,7 @@ fn set_volume(port: &dyn AudioControl, key: &Resolved, volume: f32) -> Result<()
         0.0
     };
     match key {
+        Resolved::WaveLink { .. } => Err("Wave Link requires the private writer context".into()),
         Resolved::Device { id, kind } => port.set_device_volume(id, *kind, volume),
         Resolved::App { id } if port.status().can_set_app_volume => port.set_app_volume(id, volume),
         Resolved::App { id } => {
@@ -431,6 +444,7 @@ fn fresh(port: &dyn AudioControl, target: &AudioTarget) -> Result<TargetState, S
 
 fn describe(target: &AudioTarget) -> String {
     match target {
+        AudioTarget::WaveLink { target } => format!("Wave Link {target:?}"),
         AudioTarget::Device {
             device: DeviceRef::DefaultInput,
         } => "the default input".into(),
@@ -459,7 +473,7 @@ struct HoldSlot {
     /// When the pad went down; the release must belong to the same press.
     down: Option<Instant>,
     /// Muted before the press; `None` when the target could not be read.
-    captured: Option<bool>,
+    captured: Option<TargetState>,
 }
 
 struct HoldMutes {
@@ -468,7 +482,77 @@ struct HoldMutes {
     stored: watch::Sender<u64>,
 }
 
-type Job = Box<dyn FnOnce(&dyn AudioControl) + Send>;
+struct Writer {
+    port: Arc<dyn AudioControl>,
+    wave_link: Option<crate::wavelink::WaveLink>,
+}
+
+type Job = Box<dyn FnOnce(&Writer) + Send>;
+
+pub(crate) fn wave_link_state(
+    state: &crate::wavelink::WaveLinkState,
+    target: &crate::wavelink::WaveLinkTarget,
+) -> Option<TargetState> {
+    let control = state.control(target)?;
+    Some(TargetState {
+        key: Resolved::WaveLink {
+            target: target.clone(),
+            generation: state.generation,
+        },
+        volume: control.level.unwrap_or(0.0) as f32,
+        muted: control.muted.unwrap_or(false),
+        can_mute: control.can_mute,
+        can_set_volume: control.can_set_level,
+        emulated: false,
+    })
+}
+
+impl Writer {
+    fn fresh(&self, target: &AudioTarget, expected: Option<u64>) -> Result<TargetState, String> {
+        if let AudioTarget::WaveLink { target } = target {
+            let state = self
+                .wave_link
+                .as_ref()
+                .ok_or("Wave Link is unavailable")?
+                .state();
+            if expected != Some(state.generation) {
+                return Err("Wave Link captured session ended".into());
+            }
+            wave_link_state(&state, target).ok_or("Wave Link target is unavailable".into())
+        } else {
+            fresh(self.port.as_ref(), target)
+        }
+    }
+    fn set_muted(&self, key: &Resolved, muted: bool) -> Result<(), String> {
+        if let Resolved::WaveLink { target, generation } = key {
+            self.wave_link
+                .as_ref()
+                .ok_or("Wave Link is unavailable")?
+                .write(
+                    *generation,
+                    crate::wavelink::Mutation::Mute(target.clone(), muted),
+                )
+        } else {
+            set_muted(self.port.as_ref(), key, muted)
+        }
+    }
+    fn set_volume(&self, key: &Resolved, volume: f32) -> Result<(), String> {
+        if let Resolved::WaveLink { target, generation } = key {
+            self.wave_link
+                .as_ref()
+                .ok_or("Wave Link is unavailable")?
+                .write(
+                    *generation,
+                    crate::wavelink::Mutation::Level(
+                        target.clone(),
+                        f64::from(volume.clamp(0.0, 1.0)),
+                    ),
+                )
+        } else {
+            set_volume(self.port.as_ref(), key, volume)
+        }
+    }
+}
 
 /// One physical gesture, retained by queued jobs until its release completes.
 pub struct PhysicalMute {
@@ -477,8 +561,8 @@ pub struct PhysicalMute {
 }
 
 impl PhysicalMute {
-    fn restore(&self, port: &dyn AudioControl, tapped: bool) -> Result<(), String> {
-        let captured = self.captured.lock();
+    fn restore(&self, writer: &Writer, tapped: bool) -> Result<(), String> {
+        let captured = self.captured.lock().clone();
         let Some(state) = captured.as_ref() else {
             return Ok(());
         };
@@ -488,19 +572,35 @@ impl PhysicalMute {
         } else {
             state.muted
         };
-        let now = read_state(port);
         let current = match &state.key {
-            Resolved::Device { id, kind } => now
+            Resolved::WaveLink { target, generation } => {
+                let snapshot = writer
+                    .wave_link
+                    .as_ref()
+                    .ok_or("Wave Link is unavailable")?
+                    .state();
+                if snapshot.generation != *generation {
+                    return Err(
+                        "Wave Link hold session ended; not restoring into new session".into(),
+                    );
+                }
+                snapshot.control(target).and_then(|control| control.muted)
+            }
+            Resolved::Device { id, kind } => read_state(writer.port.as_ref())
                 .devices
                 .iter()
                 .find(|d| d.id == *id && d.kind == *kind)
                 .map(|d| d.muted),
-            Resolved::App { id } => now.apps.iter().find(|a| a.id == *id).map(|a| a.muted),
+            Resolved::App { id } => read_state(writer.port.as_ref())
+                .apps
+                .iter()
+                .find(|a| a.id == *id)
+                .map(|a| a.muted),
         };
         if current == Some(wanted) {
             Ok(())
         } else {
-            set_muted(port, &state.key, wanted)
+            writer.set_muted(&state.key, wanted)
         }
     }
 }
@@ -509,6 +609,7 @@ impl PhysicalMute {
 #[derive(Clone)]
 pub struct SystemAudio {
     port: Arc<dyn AudioControl>,
+    wave_link: Option<crate::wavelink::WaveLink>,
     live: SharedLive,
     jobs: Sender<Job>,
     holds: Arc<HoldMutes>,
@@ -518,13 +619,24 @@ pub struct SystemAudio {
 impl SystemAudio {
     /// Start the writer thread for `port`; `live` is where the bridge keeps the snapshot.
     pub fn new(port: Arc<dyn AudioControl>, live: SharedLive) -> SystemAudio {
+        Self::with_wave_link(port, live, None)
+    }
+
+    pub fn with_wave_link(
+        port: Arc<dyn AudioControl>,
+        live: SharedLive,
+        wave_link: Option<crate::wavelink::WaveLink>,
+    ) -> SystemAudio {
         let (jobs, rx) = unbounded::<Job>();
-        let worker = port.clone();
+        let worker = Writer {
+            port: port.clone(),
+            wave_link: wave_link.clone(),
+        };
         if let Err(e) = std::thread::Builder::new()
             .name("lunchpad-audio-write".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    job(worker.as_ref());
+                    job(&worker);
                 }
             })
         {
@@ -532,6 +644,7 @@ impl SystemAudio {
         }
         SystemAudio {
             port,
+            wave_link,
             live,
             jobs,
             holds: Arc::new(HoldMutes {
@@ -552,7 +665,15 @@ impl SystemAudio {
 
     /// The target as the last change event left it (what the LEDs show).
     pub fn cached(&self, target: &AudioTarget) -> Option<TargetState> {
-        self.live.lock().system.resolve(target)
+        self.live.lock().resolve_audio(target)
+    }
+
+    fn generation(&self, target: &AudioTarget) -> Option<u64> {
+        if matches!(target, AudioTarget::WaveLink { .. }) {
+            Some(self.live.lock().wave_link.generation)
+        } else {
+            None
+        }
     }
 
     pub fn snapshot(&self) -> SystemAudioState {
@@ -569,13 +690,14 @@ impl SystemAudio {
         physical.retain(|p| p.strong_count() != 0);
         physical.push(Arc::downgrade(&press));
         let job = press.clone();
-        self.enqueue(move |port| {
-            let state = fresh(port, &target)?;
+        let generation = self.generation(&target);
+        self.enqueue(move |writer| {
+            let state = writer.fresh(&target, generation)?;
             *job.captured.lock() = Some(state.clone());
             if state.muted {
                 Ok(())
             } else {
-                set_muted(port, &state.key, true)
+                writer.set_muted(&state.key, true)
             }
         });
         press
@@ -597,7 +719,7 @@ impl SystemAudio {
         }
     }
 
-    fn enqueue(&self, job: impl FnOnce(&dyn AudioControl) -> Result<(), String> + Send + 'static) {
+    fn enqueue(&self, job: impl FnOnce(&Writer) -> Result<(), String> + Send + 'static) {
         if self
             .jobs
             .send(Box::new(move |port| {
@@ -618,22 +740,64 @@ impl SystemAudio {
     ) -> Result<T, String> {
         let (tx, rx) = oneshot::channel();
         self.jobs
-            .send(Box::new(move |port| {
-                let _ = tx.send(f(port));
+            .send(Box::new(move |writer| {
+                let _ = tx.send(f(writer.port.as_ref()));
             }))
             .map_err(|_| "the system audio writer has stopped".to_string())?;
         rx.await
             .map_err(|_| "the system audio writer has stopped".to_string())?
     }
 
+    async fn run_writer<T: Send + 'static>(
+        &self,
+        job: impl FnOnce(&Writer) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let (reply, response) = oneshot::channel();
+        self.jobs
+            .send(Box::new(move |writer| {
+                let _ = reply.send(job(writer));
+            }))
+            .map_err(|_| "the system audio writer has stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "the system audio writer has stopped".to_string())?
+    }
+
+    pub async fn wave_link_output(
+        &self,
+        output: crate::wavelink::WaveLinkMainOutput,
+        mix_id: Option<String>,
+    ) -> Result<(), String> {
+        let generation = self
+            .wave_link
+            .as_ref()
+            .map(|wave| wave.state().generation)
+            .ok_or("Wave Link is unavailable")?;
+        self.run_writer(move |writer| {
+            let mutation = match mix_id {
+                Some(mix) => crate::wavelink::Mutation::MonitoredMix(output, mix),
+                None => crate::wavelink::Mutation::MainOutput(output),
+            };
+            writer
+                .wave_link
+                .as_ref()
+                .ok_or("Wave Link is unavailable")?
+                .write(generation, mutation)
+        })
+        .await
+    }
+
     /// A fader's level (0..1) from a press: unmutes a muted target first, then sets the volume.
     pub fn set_level(&self, target: AudioTarget, volume: f32) {
-        let job: Job = Box::new(move |port| {
-            let result = fresh(port, &target).and_then(|state| {
-                if state.muted {
-                    set_muted(port, &state.key, false)?;
+        let generation = self.generation(&target);
+        let job: Job = Box::new(move |writer| {
+            let result = writer.fresh(&target, generation).and_then(|state| {
+                if state.muted
+                    && (state.can_mute || !matches!(state.key, Resolved::WaveLink { .. }))
+                {
+                    writer.set_muted(&state.key, false)?;
                 }
-                set_volume(port, &state.key, volume)
+                writer.set_volume(&state.key, volume)
             });
             if let Err(e) = result {
                 tracing::warn!(error = %e, "the fader could not set the system volume");
@@ -651,17 +815,18 @@ impl SystemAudio {
         mode: SetAudioMode,
         amount: f32,
     ) -> Result<(), String> {
-        self.run(move |port| {
-            let state = fresh(port, &target)?;
+        let generation = self.generation(&target);
+        self.run_writer(move |writer| {
+            let state = writer.fresh(&target, generation)?;
             match mode {
-                SetAudioMode::SetVolume => set_volume(port, &state.key, amount / 100.0),
+                SetAudioMode::SetVolume => writer.set_volume(&state.key, amount / 100.0),
                 SetAudioMode::AdjustVolume => {
-                    set_volume(port, &state.key, state.volume + amount / 100.0)
+                    writer.set_volume(&state.key, state.volume + amount / 100.0)
                 }
-                SetAudioMode::Mute => set_muted(port, &state.key, true),
-                SetAudioMode::Unmute => set_muted(port, &state.key, false),
+                SetAudioMode::Mute => writer.set_muted(&state.key, true),
+                SetAudioMode::Unmute => writer.set_muted(&state.key, false),
                 SetAudioMode::ToggleMute | SetAudioMode::HoldMute => {
-                    set_muted(port, &state.key, !state.muted)
+                    writer.set_muted(&state.key, !state.muted)
                 }
             }
         })
@@ -676,16 +841,17 @@ impl SystemAudio {
         target: AudioTarget,
     ) -> Result<(), String> {
         let holds = self.holds.clone();
-        self.run(move |port| {
-            let state = fresh(port, &target);
-            let captured = state.as_ref().ok().map(|s| s.muted);
+        let generation = self.generation(&target);
+        self.run_writer(move |writer| {
+            let state = writer.fresh(&target, generation);
+            let captured = state.as_ref().ok().cloned();
             holds.slots.lock().insert(key, HoldSlot { down, captured });
             holds.stored.send_modify(|n| *n = n.wrapping_add(1));
             let state = state?;
             if state.muted {
                 Ok(())
             } else {
-                set_muted(port, &state.key, true)
+                writer.set_muted(&state.key, true)
             }
         })
         .await
@@ -717,17 +883,25 @@ impl SystemAudio {
                 }
             }
         };
-        let Some(was_muted) = captured else {
+        let Some(captured) = captured else {
             // The press could not read the target and has said so.
             return Ok(());
         };
-        let wanted = if tapped { !was_muted } else { was_muted };
-        self.run(move |port| {
-            let state = fresh(port, &target)?;
+        let wanted = if tapped {
+            !captured.muted
+        } else {
+            captured.muted
+        };
+        let generation = match captured.key {
+            Resolved::WaveLink { generation, .. } => Some(generation),
+            _ => None,
+        };
+        self.run_writer(move |writer| {
+            let state = writer.fresh(&target, generation)?;
             if state.muted == wanted {
                 Ok(())
             } else {
-                set_muted(port, &state.key, wanted)
+                writer.set_muted(&state.key, wanted)
             }
         })
         .await

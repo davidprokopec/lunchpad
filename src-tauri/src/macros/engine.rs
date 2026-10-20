@@ -578,7 +578,16 @@ impl MacroEngine {
         };
         for (page_id, fader) in bound {
             let Some(target) = &fader.bound else { continue };
-            let Some(st) = state.resolve(target) else { continue };
+            let resolved = if matches!(target, AudioTarget::WaveLink { .. }) {
+                self.inner
+                    .services
+                    .system_audio
+                    .as_ref()
+                    .and_then(|audio| audio.cached(target))
+            } else {
+                state.resolve(target)
+            };
+            let Some(st) = resolved else { continue };
             if st.muted || !st.can_set_volume {
                 continue;
             }
@@ -630,6 +639,7 @@ impl MacroEngine {
                         present = self.inner.services.system_audio.as_ref().is_some_and(|sa| match target.as_ref() {
                             AudioTarget::App { app } => sa.snapshot().apps.iter().any(|a| a.id == app.id && a.present),
                             AudioTarget::Device { .. } => sa.cached(target).is_some(),
+                            AudioTarget::WaveLink { .. } => sa.cached(target).is_some(),
                         }),
                         can_set_volume = self.inner.services.system_audio.as_ref().is_some_and(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)),
                         reason = "audio service missing, target unresolved/not present, or volume capability unavailable",
@@ -1676,6 +1686,8 @@ pub(super) async fn execute(ctx: &RunContext, action: &Action) {
         | ActionKind::HomeAssistantCallService { .. }
         | ActionKind::SetSystemVolume { .. }
         | ActionKind::SetAudio { .. }
+        | ActionKind::WaveLinkSetMainOutput { .. }
+        | ActionKind::WaveLinkSetMonitoredMix { .. }
         | ActionKind::StopAllSounds
         | ActionKind::SetAudioDevice { .. }
         | ActionKind::AddToVariable { .. }
@@ -3182,6 +3194,175 @@ mod tests {
             }
         }
 
+        fn wave_target() -> AudioTarget {
+            AudioTarget::WaveLink {
+                target: crate::wavelink::WaveLinkTarget::Channel {
+                    channel_id: "channel".into(),
+                },
+            }
+        }
+
+        fn wave_rig(wave: &crate::wavelink::WaveLink) -> (Rig, crate::wavelink::WaveLinkBridge) {
+            let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+            let live: SharedLive = Default::default();
+            live.lock().wave_link = wave.state();
+            let audio = SystemAudio::with_wave_link(fake.clone(), live.clone(), Some(wave.clone()));
+            let dir =
+                std::env::temp_dir().join(format!("lunchpad-wave-engine-{}", uuid::Uuid::new_v4()));
+            let profile: SharedProfile = Arc::new(Mutex::new(ProfileStore::load(&dir)));
+            let services = Services {
+                system_audio: Some(audio.clone()),
+                ..Default::default()
+            };
+            let engine = MacroEngine::new(
+                profile.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(NullSink),
+                services,
+                Handle::current(),
+            );
+            let bridge = Bridge {
+                audio,
+                live: LiveHandle::new(live, Arc::new(|| {})),
+                engine: engine.clone(),
+                profile: profile.clone(),
+                app: None,
+            };
+            bridge.refresh();
+            set_button(
+                &profile,
+                3,
+                3,
+                vec![hold_audio(wave_target())],
+                vec![hold_audio(wave_target())],
+                false,
+            );
+            let wave_bridge = crate::wavelink::WaveLinkBridge::spawn(
+                wave,
+                bridge.live.clone(),
+                engine.clone(),
+                bridge.audio.clone(),
+                None,
+            );
+            (
+                Rig {
+                    engine,
+                    profile,
+                    fake,
+                    bridge,
+                },
+                wave_bridge,
+            )
+        }
+
+        #[tokio::test]
+        async fn wave_link_physical_rapid_taps_use_one_fifo_and_authoritative_readback() {
+            let fixture = crate::wavelink::tests::Fixture::new().await;
+            let wave = fixture.start(true);
+            let mut peer = fixture.ready(&wave).await;
+            let (r, _wave_bridge) = wave_rig(&wave);
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, true);
+            input(&r.engine, false);
+            input(&r.engine, true);
+            input(&r.engine, false);
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            tokio::join!(finish_input(&r), async {
+                peer.mutation_readback(true).await;
+                peer.mutation_readback(false).await;
+            });
+            assert_eq!(
+                wave.state()
+                    .control(&crate::wavelink::WaveLinkTarget::Channel {
+                        channel_id: "channel".into()
+                    })
+                    .unwrap()
+                    .muted,
+                Some(false)
+            );
+            assert!(
+                r.fake.writes().is_empty(),
+                "Wave Link never falls back to native audio"
+            );
+            wave.shutdown();
+            peer.closed().await;
+        }
+
+        #[tokio::test]
+        async fn wave_link_hold_page_change_and_cancel_restore_original_state() {
+            for cancel in [false, true] {
+                let fixture = crate::wavelink::tests::Fixture::new().await;
+                let wave = fixture.start(true);
+                let mut peer = fixture.ready(&wave).await;
+                let (r, _wave_bridge) = wave_rig(&wave);
+                let (release, done) = block_writer(&r.bridge.audio).await;
+                let down = Instant::now();
+                *r.engine.inner.input_clock.lock() = Some(down);
+                input(&r.engine, true);
+                r.profile
+                    .lock()
+                    .profile
+                    .pages
+                    .push(crate::profile::Page::new("other", "Other"));
+                r.profile.lock().profile.active_page = "other".into();
+                *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(800));
+                input(&r.engine, false);
+                if cancel {
+                    r.engine.stop_all();
+                }
+                release.send(()).unwrap();
+                done.await.unwrap().unwrap();
+                tokio::join!(finish_input(&r), async {
+                    peer.mutation_readback(true).await;
+                    peer.mutation_readback(false).await;
+                });
+                assert_eq!(
+                    wave.state()
+                        .control(&crate::wavelink::WaveLinkTarget::Channel {
+                            channel_id: "channel".into()
+                        })
+                        .unwrap()
+                        .muted,
+                    Some(false)
+                );
+                assert!(r.fake.writes().is_empty());
+                wave.shutdown();
+                peer.closed().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn wave_link_disconnect_does_not_restore_into_a_new_session_and_feedback_is_getter_only(
+        ) {
+            let fixture = crate::wavelink::tests::Fixture::new().await;
+            let wave = fixture.start(true);
+            let mut peer = fixture.ready(&wave).await;
+            let (r, _wave_bridge) = wave_rig(&wave);
+            input(&r.engine, true);
+            tokio::join!(finish_input(&r), peer.mutation_readback(true));
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, false);
+            wave.disconnect();
+            peer.closed().await;
+            wave.connect();
+            let mut peer = fixture.ready(&wave).await;
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            finish_input(&r).await;
+            bound_fader(&r.profile, wave_target());
+            r.engine.reconcile_audio_bindings();
+            assert!((fader_value(&r.profile) - 70.0).abs() < 0.001);
+            for _ in 0..4 {
+                peer.getter().await;
+            }
+            r.bridge.audio.run(|_| Ok(())).await.unwrap();
+            assert!(!r.engine.globals().contains_key("runs"));
+            assert!(r.fake.writes().is_empty());
+            wave.shutdown();
+            peer.closed().await;
+        }
+
         #[tokio::test]
         async fn physical_release_keeps_its_owner_after_page_and_configuration_change() {
             let r = rig(false, false);
@@ -3286,7 +3467,14 @@ mod tests {
             assert!(r.fake.writes().is_empty());
             assert!(!r.engine.globals().contains_key("runs"));
             assert!(live.system.resolve(&mic()).unwrap().muted);
-            let link = crate::profile::StateLink { provider: crate::profile::LinkProvider::System, kind: crate::profile::LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(mic()) };
+            let link = crate::profile::StateLink {
+                provider: crate::profile::LinkProvider::System,
+                kind: crate::profile::LinkKind::AudioMuted,
+                scene: String::new(),
+                source: String::new(),
+                target: Some(mic()),
+                wave_link_mix_id: None,
+            };
             assert!(link.is_active(&live), "mute-only state links remain usable");
             r.bridge.audio.apply(mic(), SetAudioMode::Unmute, 0.0).await.unwrap();
             assert!(!mic_state(&r.fake).0);

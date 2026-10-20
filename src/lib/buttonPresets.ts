@@ -1,6 +1,7 @@
 import { emptyButton, newActionId, type Action, type AudioTarget, type Button, type PadColor } from "./api";
 
 export function muteCaption(target: AudioTarget, mic: string, output: string): string {
+  if (target.type === "waveLink") return "Wave Link";
   return target.type === "app" ? target.app.name.slice(0, 12) : target.device.type === "named" ? target.device.label.slice(0, 12) : target.device.type === "defaultInput" ? mic : output;
 }
 
@@ -15,6 +16,6 @@ export function muteButton({ target, caption, color, mutedColor }: { target: Aud
     holdWait: false,
     down: [action()],
     up: [action()],
-    stateLink: { provider: "system", kind: "audioMuted", scene: "", source: "", target: structuredClone(target) },
+    stateLink: { provider: target.type === "waveLink" ? "waveLink" : "system", kind: "audioMuted", scene: "", source: "", target: structuredClone(target) },
   };
 }

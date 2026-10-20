@@ -500,6 +500,19 @@ pub enum ActionKind {
         #[serde(default)]
         volume_from: Option<String>,
     },
+    /// Select a discovered Wave Link output without changing the OS default.
+    #[serde(rename_all = "camelCase")]
+    WaveLinkSetMainOutput {
+        output_device_id: String,
+        output_id: String,
+    },
+    /// Set a discovered mix on a qualified Wave Link output.
+    #[serde(rename_all = "camelCase")]
+    WaveLinkSetMonitoredMix {
+        output_device_id: String,
+        output_id: String,
+        mix_id: String,
+    },
     SlobsToggleFilter {
         source: String,
         filter: String,

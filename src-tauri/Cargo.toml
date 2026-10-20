@@ -32,6 +32,8 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "process", "net", "io-util"] }
 tokio-util = "0.7"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3.34", features = ["sink"] }
 enigo = "0.5"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"

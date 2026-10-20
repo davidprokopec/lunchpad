@@ -88,6 +88,7 @@ const TYPE_SOURCES: Record<string, string> = {
     "CompareOp VarScope HttpMethod HttpResponse HttpHeader HttpBodyMode HttpFilePart HttpAuth ButtonRef ButtonTrigger Keystroke KeyEvent ObsTarget ObsMode VisibilityMode MuteMode VolumeUnit SystemVolumeMode SystemVolumeTarget SetAudioMode StudioMode WindowTarget WindowOp ObsHotkeyBy ScreenPick MouseStep ScrollAxis LoopMode LoopCheck",
   "src-tauri/src/profile/model.rs": "PadColor",
   "src-tauri/src/profile/audio.rs": "AudioTarget DeviceRef AppRef AudioDeviceKind",
+  "src-tauri/src/wavelink/model.rs": "WaveLinkTarget",
   "src-tauri/src/desktop/mod.rs": "TitleMatch",
   "src-tauri/src/input/mod.rs": "MouseButton",
   "src-tauri/src/homeassistant/mod.rs": "HaPower HaValueKind",
@@ -195,7 +196,7 @@ function schema(): { payloads: Record<string, PayloadInfo>; types: Record<string
     const source = read(file);
     for (const name of names.split(" ")) {
       // The attributes above the definition say how it is tagged.
-      const at = new RegExp(`((?:^\\s*(?:///|#\\[).*\\n)*)pub (enum|struct) ${name} \\{\\n([\\s\\S]*?)\\n\\}`, "m").exec(source);
+      const at = new RegExp(`((?:^\\s*///.*\\n|^\\s*#\\[[^\\]]*\\]\\s*\\n)*)pub (enum|struct) ${name} \\{\\n([\\s\\S]*?)\\n\\}`, "m").exec(source);
       if (!at) continue;
       const [, attrs, kind, block] = at;
       const doc = [...attrs.matchAll(/^\s*\/\/\/ ?(.*)$/gm)].map((m) => m[1].trim()).join(" ");

@@ -359,6 +359,49 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                 None => report(action, "System volume", crate::system_volume::apply(*target, *mode, amount, device.as_deref()).await),
             }
         }
+        ActionKind::WaveLinkSetMainOutput {
+            output_device_id,
+            output_id,
+        } => {
+            let Some(audio) = services.system_audio.as_ref() else {
+                return unavailable(action);
+            };
+            report(
+                action,
+                "Wave Link",
+                audio
+                    .wave_link_output(
+                        crate::wavelink::WaveLinkMainOutput {
+                            output_device_id: output_device_id.clone(),
+                            output_id: output_id.clone(),
+                        },
+                        None,
+                    )
+                    .await,
+            );
+        }
+        ActionKind::WaveLinkSetMonitoredMix {
+            output_device_id,
+            output_id,
+            mix_id,
+        } => {
+            let Some(audio) = services.system_audio.as_ref() else {
+                return unavailable(action);
+            };
+            report(
+                action,
+                "Wave Link",
+                audio
+                    .wave_link_output(
+                        crate::wavelink::WaveLinkMainOutput {
+                            output_device_id: output_device_id.clone(),
+                            output_id: output_id.clone(),
+                        },
+                        Some(mix_id.clone()),
+                    )
+                    .await,
+            );
+        }
         ActionKind::SetAudio { target, mode, volume, volume_from } => {
             let Some(sa) = &services.system_audio else { return unavailable(action) };
             let result = match mode {

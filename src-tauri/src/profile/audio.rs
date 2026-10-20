@@ -52,12 +52,19 @@ pub struct AppRef {
     pub name: String,
 }
 
-/// A device or an application whose volume and mute Lunchpad follows or sets.
+/// A device, application or Wave Link control whose volume and mute Lunchpad follows or sets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AudioTarget {
-    Device { device: DeviceRef },
-    App { app: AppRef },
+    Device {
+        device: DeviceRef,
+    },
+    App {
+        app: AppRef,
+    },
+    WaveLink {
+        target: crate::wavelink::WaveLinkTarget,
+    },
 }
 
 #[cfg(test)]

@@ -263,7 +263,12 @@ pub fn run() {
             // One native service and persistent emulation store; taps stay opt-in.
             let macos_taps = settings.lock().settings.audio.macos_app_volume;
             let sysaudio = sysaudio::SystemAudio::start_in(sysaudio::Options { macos_taps }, &config_dir);
-            let system_audio = system_audio::SystemAudio::new(Arc::new(system_audio_adapter::NativeAudio::new(sysaudio.clone())), shared_live.clone());
+            let wave_link = wavelink::WaveLink::start(settings.lock().settings.wave_link.clone());
+            let system_audio = system_audio::SystemAudio::with_wave_link(
+                Arc::new(system_audio_adapter::NativeAudio::new(sysaudio.clone())),
+                shared_live.clone(),
+                Some(wave_link.clone()),
+            );
             // State-linked button colours: repaint the LEDs whenever OBS / Streamlabs / the system audio change.
             let live = {
                 let render_slot = render_slot.clone();
@@ -324,10 +329,37 @@ pub fn run() {
                 engine.set_device(manager.lock().state().device);
             }
 
+            let wave_link_bridge = wavelink::WaveLinkBridge::spawn(
+                &wave_link,
+                live.clone(),
+                engine.clone(),
+                system_audio.clone(),
+                Some(app.handle().clone()),
+            );
             let audio_bridge = system_audio_bridge::Bridge { audio: system_audio.clone(), live, engine: engine.clone(), profile: profile.clone(), app: Some(app.handle().clone()) }.spawn();
 
             let window_settings = settings.lock().settings.window.clone();
-            app.manage(AppState { manager: manager.clone(), profile, settings, engine, keyboard, audio, speech, obs, slobs, home_assistant, sysaudio, hub, system_audio, audio_bridge: Mutex::new(Some(audio_bridge)), audio_settings_write: tokio::sync::Mutex::new(()), history: Mutex::new(Vec::new()), redo: Mutex::new(Vec::new()) });
+            app.manage(AppState {
+                manager: manager.clone(),
+                profile,
+                settings,
+                engine,
+                keyboard,
+                audio,
+                speech,
+                obs,
+                slobs,
+                home_assistant,
+                sysaudio,
+                hub,
+                system_audio,
+                audio_bridge: Mutex::new(Some(audio_bridge)),
+                audio_settings_write: tokio::sync::Mutex::new(()),
+                wave_link,
+                wave_link_bridge: Mutex::new(Some(wave_link_bridge)),
+                history: Mutex::new(Vec::new()),
+                redo: Mutex::new(Vec::new()),
+            });
             if let Err(e) = tray::setup(app.handle(), &window_settings) {
                 tracing::warn!(error = %e, "tray icon could not be created");
             }
@@ -416,6 +448,11 @@ pub fn run() {
             // media
             list_audio_devices,
             list_system_audio_devices,
+            wave_link_state,
+            wave_link_connect,
+            wave_link_disconnect,
+            wave_link_refresh,
+            set_wave_link_settings,
             audio_list_devices,
             audio_list_apps,
             audio_status,
@@ -486,6 +523,8 @@ pub fn run() {
             // Taps, listeners and COM objects are released on the audio thread.
             if let tauri::RunEvent::Exit = event {
                 app.state::<AppState>().sysaudio.shutdown();
+                app.state::<AppState>().wave_link.shutdown();
+                app.state::<AppState>().wave_link_bridge.lock().take();
                 app.state::<AppState>().audio_bridge.lock().take();
             }
             // macOS: clicking the dock icon while the window is hidden brings it back.

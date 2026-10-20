@@ -67,7 +67,11 @@ pub struct WaveLinkSettings {
 
 impl Default for WaveLinkSettings {
     fn default() -> Self {
-        Self { enabled: false, auto_connect: true, port: None }
+        Self {
+            enabled: false,
+            auto_connect: true,
+            port: None,
+        }
     }
 }
 

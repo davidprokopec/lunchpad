@@ -438,7 +438,7 @@ impl Fader {
     /// for when it comes back), and `None` ("unavailable") while the target is missing.
     pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
         let Some(target) = &self.bound else { return Some(self.value) };
-        let state = live.system.resolve(target)?;
+        let state = live.resolve_audio(target)?;
         if !state.can_set_volume {
             return None;
         }
@@ -500,6 +500,7 @@ pub enum LinkProvider {
     Slobs,
     /// The system's audio (devices and apps), see `StateLink::target`
     System,
+    WaveLink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +517,8 @@ pub enum LinkKind {
     ReplayBuffer,
     /// `target` is muted (System audio)
     AudioMuted,
+    WaveLinkMainOutput,
+    WaveLinkMonitoredMix,
 }
 
 /// "Active while …" binding of a button to the state of OBS, Streamlabs or the system audio.
@@ -531,6 +534,8 @@ pub struct StateLink {
     /// The device or app a System link watches; left out of the file when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<AudioTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_link_mix_id: Option<String>,
 }
 
 impl Default for Button {
@@ -671,7 +676,16 @@ mod tests {
         use super::super::audio::{AudioTarget, DeviceRef};
         let mut bound = profile.clone();
         bound.pages[0].faders[0].bound = Some(AudioTarget::Device { device: DeviceRef::DefaultInput });
-        bound.pages[0].buttons[0].button.state_link = Some(StateLink { provider: LinkProvider::System, kind: LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }) });
+        bound.pages[0].buttons[0].button.state_link = Some(StateLink {
+            provider: LinkProvider::System,
+            kind: LinkKind::AudioMuted,
+            scene: String::new(),
+            source: String::new(),
+            target: Some(AudioTarget::Device {
+                device: DeviceRef::DefaultInput,
+            }),
+            wave_link_mix_id: None,
+        });
         let json = serde_json::to_value(&bound).unwrap();
         assert_eq!(json["pages"][0]["faders"][0]["bound"], serde_json::json!({ "type": "device", "device": { "type": "defaultInput" } }));
         assert_eq!(json["pages"][0]["buttons"][0]["stateLink"]["provider"], "system");
@@ -709,7 +723,14 @@ mod tests {
             kind: ActionKind::PlaySound { file: "a.wav".into(), volume: 0.5, start: 0.1, end: 0.9, output_device: Some("Speakers".into()), volume_from_velocity: true },
         });
         button.hold_ms = 800;
-        button.state_link = Some(StateLink { provider: LinkProvider::Obs, kind: LinkKind::Scene, scene: "Game".into(), source: String::new(), target: None });
+        button.state_link = Some(StateLink {
+            provider: LinkProvider::Obs,
+            kind: LinkKind::Scene,
+            scene: "Game".into(),
+            source: String::new(),
+            target: None,
+            wave_link_mix_id: None,
+        });
         let json = serde_json::to_string(&button).unwrap();
         let back: Button = serde_json::from_str(&json).unwrap();
         assert_eq!(back, button);

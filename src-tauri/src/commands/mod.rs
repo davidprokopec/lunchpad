@@ -9,6 +9,7 @@ pub mod macros;
 pub mod media;
 pub mod profile;
 pub mod settings;
+pub mod wavelink;
 
 use crate::audio::AudioHandle;
 use crate::config::SharedSettings;
@@ -38,6 +39,8 @@ pub struct AppState {
     pub system_audio: crate::system_audio::SystemAudio,
     pub audio_bridge: Mutex<Option<crate::system_audio_bridge::BridgeHandle>>,
     pub audio_settings_write: tokio::sync::Mutex<()>,
+    pub wave_link: crate::wavelink::WaveLink,
+    pub wave_link_bridge: Mutex<Option<crate::wavelink::WaveLinkBridge>>,
     /// Profiles before each edit made from the UI, newest last (undo).
     pub history: Mutex<Vec<crate::profile::Profile>>,
     /// Profiles undone, newest last (redo); cleared by the next edit.
@@ -59,3 +62,4 @@ pub use macros::*;
 pub use media::*;
 pub use profile::*;
 pub use settings::*;
+pub use wavelink::*;
