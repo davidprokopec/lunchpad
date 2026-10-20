@@ -9,9 +9,10 @@ import { audioControllable, audioState } from "./systemAudio";
 export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): boolean {
   if (!link) return false;
   if (link.provider === "fineTune") {
-    if (link.target?.type !== "fineTune" || fineTuneReason(link.target.target, fineTune) || !fineTune?.snapshot) return false;
+    if (link.target?.type !== "fineTune" || fineTune?.status !== "ready" || !fineTune.snapshot) return false;
     const target = link.target.target;
     if (link.kind === "audioMuted") return audioState(link.target, audio, waveLink, fineTune)?.muted === true;
+    if (fineTuneReason(target, fineTune)) return false;
     if (target.type === "output") return link.kind === "fineTuneDefaultOutput" && fineTune.snapshot.defaultOutput === target.deviceUid;
     if (target.type === "input") return link.kind === "fineTunePreferredInput" ? fineTune.snapshot.inputPolicy.preferredDeviceUID === target.deviceUid : link.kind === "fineTuneDefaultInput" && fineTune.snapshot.defaultInput === target.deviceUid;
     return false;

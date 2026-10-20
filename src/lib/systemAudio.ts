@@ -34,7 +34,7 @@ export function audioActionConfigured(action: Action): boolean {
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
 export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
   if (!target) return null;
-  if (target.type === "fineTune") return target.target.type === "app" && !fineTuneReason(target.target, fineTune) ? fineTuneApp(target.target.appId, fineTune) : null;
+  if (target.type === "fineTune") return target.target.type === "app" ? fineTuneApp(target.target.appId, fineTune) : null;
   if (target.type === "waveLink") {
     if (waveLink?.status !== "ready") return null;
     const control = waveLinkControl(target.target, waveLink);
@@ -63,8 +63,13 @@ export function audioControllable(target: AudioTarget, status: AudioStatus | nul
   return !!state && (!("canSetVolume" in state) || (control === "volume" ? state.canSetVolume : state.canMute || state.emulated));
 }
 
+/** FineTune snapshots remain readable even when capture permission prevents writes. */
+export function audioFaderReadable(target: AudioTarget, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
+  return target.type === "fineTune" ? !!audioState(target, status, waveLink, fineTune) : audioControllable(target, status, "volume", waveLink);
+}
+
 export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): Fader {
   if (!fader.bound) return fader;
-  const state = audioControllable(fader.bound, status, "volume", waveLink, fineTune) ? audioState(fader.bound, status, waveLink, fineTune) : null;
+  const state = audioFaderReadable(fader.bound, status, waveLink, fineTune) ? audioState(fader.bound, status, waveLink, fineTune) : null;
   return { ...fader, value: state && !state.muted && state.volume !== null ? fader.min + (fader.max - fader.min) * state.volume : fader.min };
 }

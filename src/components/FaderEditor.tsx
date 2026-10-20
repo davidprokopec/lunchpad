@@ -7,7 +7,7 @@ import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useVariablesStore } from "../store/variables";
 import { useMediaStore } from "../store/media";
-import { audioActionConfigured, audioControllable, audioFader, audioState, audioTargetConfigured } from "../lib/systemAudio";
+import { audioActionConfigured, audioControllable, audioFader, audioFaderReadable, audioState, audioTargetConfigured } from "../lib/systemAudio";
 import { AudioTargetField } from "./AudioTargetField";
 import { ActionsTab } from "./actions/ActionsTab";
 import { RgbField } from "./RgbField";
@@ -150,6 +150,7 @@ function FaderForm({
   const fineTune = useMediaStore((s) => s.fineTune);
   const shown = audioFader(fader, audio, waveLink, fineTune);
   const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
+  const displayUnavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
   const dirty = JSON.stringify(fader) !== JSON.stringify(initial);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
   const [tab, setTab] = useState<"fader" | "actions">("fader");
@@ -265,10 +266,10 @@ function FaderForm({
           <div className="text-xs text-stage-400">{t("fader.preview")}</div>
           <div className="flex gap-1">
             {pads.map(([x, y], i) => {
-              const [r, g, b] = unavailable ? (i === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shown, i);
+              const [r, g, b] = displayUnavailable ? (i === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shown, i);
               return <div key={`${x},${y}`} className="h-8 flex-1 rounded-md" style={{ backgroundColor: `rgb(${r}, ${g}, ${b})` }} title={`${x + 1}, ${y + 1}`} />;
             })}
-            <div className="ml-2 self-center text-xs text-stage-400">{unavailable ? t("audio.unavailableShort") : formatFaderValue(shown)}</div>
+            <div className="ml-2 self-center text-xs text-stage-400">{displayUnavailable ? t("audio.unavailableShort") : formatFaderValue(shown)}</div>
           </div>
           {overlaps && <p className="text-xs text-danger">{t("fader.overlap")}</p>}
           {covered > 0 && <p className="text-xs text-warn">{t("fader.covered", { count: covered })}</p>}

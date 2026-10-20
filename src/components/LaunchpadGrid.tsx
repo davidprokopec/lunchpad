@@ -25,7 +25,7 @@ import { buttonsOutside, cornerRadius, cornersOf, isControl, isKey, legendSize, 
 import { PadLabel } from "./PadLabel";
 import { Description } from "./Description";
 import { Tooltip } from "./Tooltip";
-import { audioControllable, audioFader } from "../lib/systemAudio";
+import { audioControllable, audioFader, audioFaderReadable } from "../lib/systemAudio";
 
 interface Props {
   layout: Layout;
@@ -708,7 +708,7 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
   const fineTune = useMediaStore((s) => s.fineTune);
-  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
+  const unavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
   const shownFader = audioFader(fader, audio, waveLink, fineTune);
   const key = corners === "key";
   const blend = unavailable ? (step === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shownFader, step);
@@ -762,6 +762,7 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
   const fineTune = useMediaStore((s) => s.fineTune);
   const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune));
   const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
+  const displayUnavailable = !!fader?.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
   const shownFader = fader ? audioFader(fader, audio, waveLink, fineTune) : null;
   const missing = useProfileStore((s) => s.missingFiles);
   const hasMissing = !!button && [...button.down, ...button.up, ...button.hold].some((a) => a.type === "playSound" && missing.includes(a.file));
@@ -858,9 +859,9 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
   if (control) {
     // Without a fader the control still shows and takes its position: the last one the
     // hardware reported, or where the pointer left it.
-    const resting = shownFader ? unavailable ? null : faderFraction(shownFader) : (hardwarePosition ?? (pad.centred ? 0.5 : null));
+    const resting = shownFader ? displayUnavailable ? null : faderFraction(shownFader) : (hardwarePosition ?? (pad.centred ? 0.5 : null));
     // A system-bound control shows only confirmed audio state, not a requested level.
-    const fraction = unavailable ? null : fader?.bound ? resting : dragFraction ?? resting;
+    const fraction = displayUnavailable ? null : fader?.bound ? resting : dragFraction ?? resting;
     const name = pad.shape === "strip" ? t("grid.strip", { name: pad.label ?? "" }) : t("grid.knob", { n: controlNumber ?? pad.x + 1 });
     return (
       <div
@@ -875,7 +876,7 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
       >
         <button
           type="button"
-          aria-label={unavailable ? `${name}: ${t("audio.unavailableShort")}` : shownFader ? `${name}: ${formatFaderValue(shownFader)}` : name}
+          aria-label={displayUnavailable ? `${name}: ${t("audio.unavailableShort")}` : shownFader ? `${name}: ${formatFaderValue(shownFader)}` : name}
           onPointerDown={(e) => {
             const primary = e.button === 0 || (e.button === 2 && e.ctrlKey);
             if (!primary) return;
@@ -921,8 +922,8 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
           )}
           style={pad.shape === "knob" && pad.rows > 1 ? { paddingBottom: 4 } : { paddingTop: topInset, paddingBottom: 4 }}
         >
-          {pad.shape === "strip" ? <StripFace fraction={fraction} label={unavailable ? t("audio.unavailableShort") : pad.label} cell={cell} centred={pad.centred} /> : <KnobFace fraction={fraction} cell={cell} />}
-          {pad.shape === "knob" && <span className="text-[9px] leading-none text-stage-500">{unavailable ? t("audio.unavailableShort") : fader ? formatFaderValue(fader, fader.min + (fader.max - fader.min) * (fraction ?? 0)) : pad.label}</span>}
+          {pad.shape === "strip" ? <StripFace fraction={fraction} label={displayUnavailable ? t("audio.unavailableShort") : pad.label} cell={cell} centred={pad.centred} /> : <KnobFace fraction={fraction} cell={cell} />}
+          {pad.shape === "knob" && <span className="text-[9px] leading-none text-stage-500">{displayUnavailable ? t("audio.unavailableShort") : fader ? formatFaderValue(fader, fader.min + (fader.max - fader.min) * (fraction ?? 0)) : pad.label}</span>}
         </button>
       </div>
     );

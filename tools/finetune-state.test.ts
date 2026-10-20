@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { api, events, type AudioTarget, type FineTuneState, type StateLink } from "../src/lib/api";
 import { useMediaStore } from "../src/store/media";
-import { audioActionConfigured, audioControllable, audioFader, audioTargetConfigured } from "../src/lib/systemAudio";
+import { audioActionConfigured, audioControllable, audioFader, audioFaderReadable, audioState, audioTargetConfigured } from "../src/lib/systemAudio";
 import { fineTuneApp, fineTuneReason } from "../src/lib/fineTune";
 import { isLinkActive } from "../src/lib/stateLink";
 import { muteButton } from "../src/lib/buttonPresets";
@@ -42,6 +42,36 @@ test("FineTune live feedback uses managed gain, not boost; muted/unavailable ren
   live.status = "disconnected";
   expect(audioFader(fader, null, null, live).value).toBe(10);
   expect(isLinkActive(link, null, null, null, null, live)).toBe(false);
+});
+
+test("FineTune reported mute and fader state remain readable without capture write permission", () => {
+  const live = state(); const fader = { ...newFader(0, 0, null), min: 10, max: 110, bound: target };
+  for (const permission of ["denied", "unknown"] as const) {
+    live.snapshot!.permission.audioCapture = permission;
+    live.snapshot!.apps[0].muted = true;
+    expect(isLinkActive(link, null, null, null, null, live)).toBe(true);
+    expect(audioState(target, null, null, live)?.muted).toBe(true);
+    expect(audioFaderReadable(target, null, null, live)).toBe(true);
+    expect(audioFader(fader, null, null, live).value).toBe(10);
+    for (const control of ["volume", "mute"] as const) expect(audioControllable(target, null, control, null, live)).toBe(false);
+    live.snapshot!.apps[0].muted = false;
+    expect(isLinkActive(link, null, null, null, null, live)).toBe(false);
+    expect(audioFader(fader, null, null, live).value).toBe(85);
+  }
+  live.snapshot!.apps[0].muted = true;
+  const app = live.snapshot!.apps[0];
+  for (const apps of [[], [{ ...app, active: false }], [app, { ...app, pids: [456] }]]) {
+    live.snapshot!.apps = apps;
+    expect(isLinkActive(link, null, null, null, null, live)).toBe(false);
+    expect(audioState(target, null, null, live)).toBeNull();
+    expect(audioFaderReadable(target, null, null, live)).toBe(false);
+    expect(audioControllable(target, null, "mute", null, live)).toBe(false);
+  }
+  live.snapshot!.apps = [app]; live.status = "disconnected";
+  expect(isLinkActive(link, null, null, null, null, live)).toBe(false);
+  expect(audioState(target, null, null, live)).toBeNull();
+  expect(audioFaderReadable(target, null, null, live)).toBe(false);
+  expect(audioControllable(target, null, "volume", null, live)).toBe(false);
 });
 
 test("FineTune device links use actual state and direction, independently of capture and device level capability", () => {
