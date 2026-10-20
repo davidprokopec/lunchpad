@@ -17,8 +17,9 @@ import { SecretsTab } from "./SecretsTab";
 import { SlobsTab } from "./SlobsTab";
 import { SoundTab } from "./SoundTab";
 import { VariablesTab } from "./VariablesTab";
+import { WaveLinkTab } from "./WaveLinkTab";
 
-export type SettingsTab = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "hub" | "pages" | "variables" | "secrets" | "about" | "diagnostics";
+export type SettingsTab = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "waveLink" | "hub" | "pages" | "variables" | "secrets" | "about" | "diagnostics";
 
 interface NavGroup {
   group: string;
@@ -28,7 +29,7 @@ interface NavGroup {
 /** Add an integration here (and a tab component) and it shows up in the navigation. */
 const NAV: NavGroup[] = [
   { group: "general", tabs: ["launchpad", "sound", "keyboard", "interface"] },
-  { group: "integrations", tabs: ["hub", "obs", "slobs", "homeAssistant"] },
+  { group: "integrations", tabs: ["hub", "obs", "slobs", "homeAssistant", "waveLink"] },
   { group: "data", tabs: ["pages", "variables", "secrets"] },
   { group: "about", tabs: ["about", "diagnostics"] },
 ];
@@ -39,6 +40,7 @@ const TABS: Record<SettingsTab, () => React.ReactElement> = {
   keyboard: KeyboardTab,
   interface: InterfaceTab,
   obs: ObsTab,
+  waveLink: WaveLinkTab,
   slobs: SlobsTab,
   homeAssistant: HomeAssistantTab,
   hub: HubTab,

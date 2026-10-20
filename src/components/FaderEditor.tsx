@@ -7,7 +7,7 @@ import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useVariablesStore } from "../store/variables";
 import { useMediaStore } from "../store/media";
-import { audioControllable, audioFader, audioState } from "../lib/systemAudio";
+import { audioControllable, audioFader, audioState, audioTargetConfigured } from "../lib/systemAudio";
 import { AudioTargetField } from "./AudioTargetField";
 import { ActionsTab } from "./actions/ActionsTab";
 import { RgbField } from "./RgbField";
@@ -146,8 +146,9 @@ function FaderForm({
   const { t } = useTranslation();
   const [fader, setFader] = useState<Fader>(initial);
   const audio = useMediaStore((s) => s.systemAudio);
-  const shown = audioFader(fader, audio);
-  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio);
+  const waveLink = useMediaStore((s) => s.waveLink);
+  const shown = audioFader(fader, audio, waveLink);
+  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink);
   const dirty = JSON.stringify(fader) !== JSON.stringify(initial);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
   const [tab, setTab] = useState<"fader" | "actions">("fader");
@@ -178,7 +179,7 @@ function FaderForm({
   const actionCount = fader.onChange.length + (strip ? (fader.onTouch?.length ?? 0) + (fader.onRelease?.length ?? 0) : 0);
   const setDirection = (direction: FaderDirection) => setFader({ ...fader, direction, length: Math.min(fader.length, maxFaderLength(layout, fader.x, fader.y, direction)) });
   const control = isControlCell(layout, fader.x, fader.y);
-  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max && (fader.bound?.type !== "app" || !!fader.bound.app.id);
+  const valid = (control ? fader.length >= 1 : fader.length >= 2) && !overlaps && fader.min !== fader.max && (!fader.bound || audioTargetConfigured(fader.bound));
 
   return (
     <>
@@ -366,7 +367,7 @@ function FaderForm({
         </div>
         <div className="flex gap-2">
           <UiButton onClick={onCancel}>{t("common.cancel")}</UiButton>
-          <UiButton variant="primary" onClick={() => onSave(fader.bound && !unavailable && !audioState(fader.bound, audio)?.muted ? shown : fader)} disabled={!valid}>
+           <UiButton variant="primary" onClick={() => onSave(fader.bound && !unavailable && !audioState(fader.bound, audio, waveLink)?.muted ? shown : fader)} disabled={!valid}>
             {t("common.save")}
           </UiButton>
         </div>

@@ -18,6 +18,7 @@ import { SoundEditor } from "./SoundEditor";
 import { SpeechEditor } from "./SpeechEditor";
 import { SystemVolumeEditor } from "./SystemVolumeEditor";
 import { SetAudioEditor } from "./SetAudioEditor";
+import { WaveLinkRoutingField } from "../WaveLinkRoutingField";
 import { SetFaderEditor } from "./SetFaderEditor";
 import { AudioDeviceEditor } from "./AudioDeviceEditor";
 
@@ -113,6 +114,10 @@ export function ActionEditor({ action, onChange, pages, layout, button }: Props)
       return <SystemVolumeEditor action={action} onChange={onChange} button={button} />;
     case "setAudio":
       return <SetAudioEditor action={action} onChange={onChange} button={button} />;
+    case "waveLinkSetMainOutput":
+      return <WaveLinkRoutingField {...action} monitored={false} onChange={(value) => onChange({ ...action, outputDeviceId: value.outputDeviceId, outputId: value.outputId })} />;
+    case "waveLinkSetMonitoredMix":
+      return <WaveLinkRoutingField {...action} monitored onChange={(value) => onChange({ ...action, ...value, mixId: value.mixId ?? action.mixId })} />;
     case "setAudioDevice":
       return <AudioDeviceEditor action={action} onChange={onChange} />;
     case "launchApplication":

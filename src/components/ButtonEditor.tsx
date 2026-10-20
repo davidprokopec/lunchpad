@@ -22,7 +22,7 @@ import { Button as UiButton, IconClose, Segmented, Toggle } from "./ui";
 import { Tooltip } from "./Tooltip";
 import { StateLinkField } from "./StateLinkField";
 import { muteButton, muteCaption } from "../lib/buttonPresets";
-import { DEFAULT_INPUT } from "../lib/systemAudio";
+import { audioTargetConfigured, DEFAULT_INPUT } from "../lib/systemAudio";
 import { useMediaStore } from "../store/media";
 import { isLinkActive } from "../lib/stateLink";
 import { AudioTargetField } from "./AudioTargetField";
@@ -140,7 +140,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
   const [tab, setTab] = useState<Tab>("appearance");
   const muteSettingsRef = useRef<HTMLElement>(null);
   const [previewActive, setPreviewActive] = useState(false);
-  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio));
+  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink));
   const pad = layout?.pads.find((p) => p.x === x && p.y === y);
   const ledKind = pad?.led ?? "rgb";
   /** A tap-only button (Arp, Scale): the device reports no release, so only the pressed list. */
@@ -150,9 +150,9 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
   const mutePreset = button.down.length === 1 && button.up.length === 1 && button.hold.length === 0
     && button.down[0].type === "setAudio" && button.down[0].mode === "holdMute"
     && button.up[0].type === "setAudio" && button.up[0].mode === "holdMute"
-    && button.stateLink?.provider === "system" && button.stateLink.kind === "audioMuted";
-  const valid = [...button.down, ...button.up, ...button.hold].every((a) => a.type !== "setAudio" || a.target.type !== "app" || !!a.target.app.id)
-    && (button.stateLink?.target?.type !== "app" || !!button.stateLink.target.app.id);
+    && (button.stateLink?.provider === "system" || button.stateLink?.provider === "waveLink") && button.stateLink.kind === "audioMuted";
+  const valid = [...button.down, ...button.up, ...button.hold].every((a) => a.type !== "setAudio" || audioTargetConfigured(a.target))
+    && (!button.stateLink?.target || audioTargetConfigured(button.stateLink.target));
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   useEffect(() => {
@@ -241,7 +241,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
               if (!target || !button.stateLink) return;
               const caption = (value: typeof target) => muteCaption(value, t("audio.micCaption"), t("audio.outputCaption"));
               const look = button.look.type === "text" && button.stateLink.target && button.look.caption === caption(button.stateLink.target) ? { ...button.look, caption: caption(target) } : button.look;
-              setButton({ ...button, look, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target } });
+              setButton({ ...button, look, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target, provider: target.type === "waveLink" ? "waveLink" : "system" } });
             }} />
             {textLook && <label className="flex flex-col gap-1 text-xs text-stage-400">
               {t("editor.caption")}

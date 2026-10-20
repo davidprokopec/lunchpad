@@ -5,17 +5,21 @@ import { Select } from "../Select";
 import { Slider } from "../Slider";
 import { useVariableSuggestions } from "./VariableFields";
 import { VariableNameField } from "./VariableNameField";
+import { useMediaStore } from "../../store/media";
+import { audioControllable } from "../../lib/systemAudio";
 
 export function SetAudioEditor({ action, onChange, button }: { action: Extract<Action, { type: "setAudio" }>; onChange: (next: Action) => void; button: Button }) {
   const { t } = useTranslation();
   const suggestions = useVariableSuggestions(button);
   const level = action.mode === "setVolume" || action.mode === "adjustVolume";
   const adjust = action.mode === "adjustVolume";
+  const waveLink = useMediaStore((s) => s.waveLink);
+  const allowedModes = SET_AUDIO_MODES.filter((mode) => action.target.type !== "waveLink" || audioControllable(action.target, null, mode === "setVolume" || mode === "adjustVolume" ? "volume" : "mute", waveLink));
   return <div className="flex flex-col gap-3">
     <AudioTargetField value={action.target} control={level ? "volume" : "mute"} onChange={(target) => { if (target) onChange({ ...action, target }); }} />
     <div className="flex max-w-xs flex-col gap-1 text-xs text-stage-400">
       {t("volume.mode")}
-      <Select<SetAudioMode> size="sm" ariaLabel={t("volume.mode")} value={action.mode} options={SET_AUDIO_MODES.map((mode) => ({ value: mode, label: t(`audio.modes.${mode}`) }))} onChange={(mode) => onChange({ ...action, mode, volume: mode === "adjustVolume" ? 5 : Math.max(0, action.volume) })} />
+      <Select<SetAudioMode> size="sm" ariaLabel={t("volume.mode")} value={action.mode} options={[...allowedModes, ...(!allowedModes.includes(action.mode) ? [action.mode] : [])].map((mode) => ({ value: mode, label: t(`audio.modes.${mode}`) + (!allowedModes.includes(mode) ? ` · ${t("audio.unavailableShort")}` : "") }))} onChange={(mode) => onChange({ ...action, mode, volume: mode === "adjustVolume" ? 5 : Math.max(0, action.volume) })} />
     </div>
     {level && <>
       <div className="grid grid-cols-[1fr_auto] items-end gap-3">

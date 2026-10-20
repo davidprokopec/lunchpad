@@ -6,6 +6,7 @@ import { Select } from "./Select";
 import { useSettingsStore } from "../store/settings";
 import { AudioTargetField } from "./AudioTargetField";
 import { DEFAULT_INPUT } from "../lib/systemAudio";
+import { WaveLinkRoutingField } from "./WaveLinkRoutingField";
 
 type ProviderChoice = LinkProvider | "none";
 
@@ -17,7 +18,7 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
   const { loaded, load } = view;
 
   useEffect(() => {
-    if (value && value.provider !== "system" && !loaded) void load();
+    if (value && (value.provider === "obs" || value.provider === "slobs") && !loaded) void load();
   }, [value, loaded, load]);
 
   const obsEnabled = useSettingsStore((s) => s.settings?.obs.enabled ?? false);
@@ -25,6 +26,7 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
   const providerOptions: { value: ProviderChoice; label: string }[] = [
     { value: "none", label: t("editor.linkNone") },
     { value: "system", label: t("audio.system") },
+    { value: "waveLink", label: t("waveLink.name") },
     ...(obsEnabled || value?.provider === "obs" ? [{ value: "obs" as const, label: t("integrations.obs") }] : []),
     ...(slobsEnabled || value?.provider === "slobs" ? [{ value: "slobs" as const, label: t("integrations.slobs") }] : []),
   ];
@@ -38,13 +40,13 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
             size="sm"
             value={value ? value.provider : "none"}
             options={providerOptions}
-            onChange={(v) => onChange(v === "none" ? null : v === "system" ? { provider: v, kind: "audioMuted", scene: "", source: "", target: value?.target ?? DEFAULT_INPUT } : { provider: v, kind: value?.provider === "system" ? "scene" : value?.kind ?? "scene", scene: value?.scene ?? "", source: value?.source ?? "" })}
+            onChange={(v) => onChange(v === "none" ? null : v === "system" || v === "waveLink" ? { provider: v, kind: "audioMuted", scene: "", source: "", target: v === "system" ? DEFAULT_INPUT : { type: "waveLink", target: { type: "channel", channelId: "" } } } : { provider: v, kind: "scene", scene: "", source: "" })}
           />
         </div>
         {value && (
           <div className="flex flex-col gap-1 text-xs text-stage-400">
             {t("editor.linkKind")}
-            <Select<LinkKind> size="sm" value={value.kind} options={(value.provider === "system" ? ["audioMuted" as const] : LINK_KINDS).map((k) => ({ value: k, label: t(k === "audioMuted" ? "audio.muted" : `editor.linkKinds.${k}`) }))} onChange={(kind) => onChange({ ...value, kind })} />
+            <Select<LinkKind> size="sm" value={value.kind} options={(value.provider === "system" ? ["audioMuted" as const] : value.provider === "waveLink" ? ["audioMuted", "waveLinkMainOutput", "waveLinkMonitoredMix"] as const : LINK_KINDS.filter((kind) => kind !== "audioMuted" && kind !== "waveLinkMainOutput" && kind !== "waveLinkMonitoredMix")).map((k) => ({ value: k, label: t(k === "audioMuted" ? "audio.muted" : k.startsWith("waveLink") ? `waveLink.links.${k}` : `editor.linkKinds.${k}`) }))} onChange={(kind) => onChange({ ...value, kind })} />
           </div>
         )}
       </div>
@@ -66,8 +68,9 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
           <NamePicker view={view} label={t("obs.source")} value={value.source} list={view.audioSources} onChange={(source) => onChange({ ...value, source })} />
         </div>
       )}
-      {value?.provider === "system" && <AudioTargetField control="mute" value={value.target ?? DEFAULT_INPUT} onChange={(target) => onChange({ ...value, target })} />}
-      {value && value.provider !== "system" && <ProviderStatus view={view} />}
+      {(value?.provider === "system" || value?.provider === "waveLink") && value.kind === "audioMuted" && <AudioTargetField control="mute" value={value.target ?? DEFAULT_INPUT} onChange={(target) => onChange({ ...value, target, provider: target?.type === "waveLink" ? "waveLink" : "system" })} />}
+      {value?.provider === "waveLink" && (value.kind === "waveLinkMainOutput" || value.kind === "waveLinkMonitoredMix") && <WaveLinkRoutingField outputDeviceId={value.target?.type === "waveLink" && value.target.target.type === "output" ? value.target.target.outputDeviceId : ""} outputId={value.target?.type === "waveLink" && value.target.target.type === "output" ? value.target.target.outputId : ""} mixId={value.waveLinkMixId} monitored={value.kind === "waveLinkMonitoredMix"} onChange={(next) => onChange({ ...value, target: { type: "waveLink", target: { type: "output", outputDeviceId: next.outputDeviceId, outputId: next.outputId } }, waveLinkMixId: next.mixId })} />}
+      {value && (value.provider === "obs" || value.provider === "slobs") && <ProviderStatus view={view} />}
     </div>
   );
 }

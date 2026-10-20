@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, events, type AudioSettings, type InputUnavailable, type ObsSettings, type PushToTalkSettings, type Settings, type SlobsSettings, type WindowSettings, type HomeAssistantSettings } from "../lib/api";
+import { api, events, type AudioSettings, type InputUnavailable, type ObsSettings, type PushToTalkSettings, type Settings, type SlobsSettings, type WindowSettings, type HomeAssistantSettings, type WaveLinkSettings } from "../lib/api";
 
 interface SettingsStore {
   settings: Settings | null;
@@ -8,6 +8,10 @@ interface SettingsStore {
   audioDesired: AudioSettings | null;
   audioPending: boolean;
   audioError: string | null;
+  waveLinkDesired: WaveLinkSettings | null;
+  waveLinkPending: boolean;
+  waveLinkError: string | null;
+  setWaveLink: (change: Partial<WaveLinkSettings>) => Promise<void>;
   init: () => Promise<() => void>;
   setPushToTalk: (config: PushToTalkSettings) => Promise<void>;
   setAudio: (change: Partial<AudioSettings>) => Promise<void>;
@@ -28,24 +32,29 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   let settingsRevision = 0;
   let receivedRevision = 0;
   let pendingAudio = 0;
+  let waveLinkQueue = Promise.resolve();
+  let waveLinkRevision = 0;
+  let pendingWaveLink = 0;
 
   // Full snapshots from unrelated commands/events may contain older audio fields.
   // Only a fenced get_settings read can replace the confirmed audio snapshot.
   const receiveSettings = (settings: Settings) => {
     ++receivedRevision;
-    set((state) => ({ settings: state.settings ? { ...settings, audio: state.settings.audio } : settings }));
+    set((state) => ({ settings: state.settings ? { ...settings, audio: state.settings.audio, waveLink: state.settings.waveLink } : settings }));
   };
 
   const refreshSettings = async () => {
     const revision = ++settingsRevision;
     const audioVersion = audioRevision;
+    const waveLinkVersion = waveLinkRevision;
     const receivedVersion = receivedRevision;
     try {
       const settings = await api.getSettings();
       if (revision !== settingsRevision || audioVersion !== audioRevision || pendingAudio > 0) return;
       // A read confirms audio, but cannot roll back unrelated updates received in flight.
       set((state) => ({
-        settings: receivedVersion !== receivedRevision && state.settings ? { ...state.settings, audio: settings.audio } : settings,
+        settings: { ...(receivedVersion !== receivedRevision && state.settings ? { ...state.settings, audio: settings.audio } : settings),
+          waveLink: state.settings && (waveLinkRevision > 0 || waveLinkVersion !== waveLinkRevision || pendingWaveLink > 0) ? state.settings.waveLink : settings.waveLink },
         audioDesired: state.audioError ? state.audioDesired : settings.audio,
       }));
     } catch (error) {
@@ -62,6 +71,41 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     audioDesired: null,
     audioPending: false,
     audioError: null,
+    waveLinkDesired: null,
+    waveLinkPending: false,
+    waveLinkError: null,
+
+    setWaveLink: (change) => {
+      const base = get().waveLinkDesired ?? get().settings?.waveLink;
+      if (!base) return Promise.reject(new Error("Wave Link settings have not loaded"));
+      const desired = { ...base, ...change };
+      const revision = ++waveLinkRevision;
+      ++pendingWaveLink;
+      set({ waveLinkDesired: desired, waveLinkPending: true });
+      const task = waveLinkQueue.then(async () => {
+        let failed: { error: unknown } | null = null;
+        try {
+          // This command confirms only its own field, never another setting's snapshot.
+          const response = await api.setWaveLinkSettings(desired);
+          if (revision === waveLinkRevision) set((state) => ({ settings: state.settings ? { ...state.settings, waveLink: response.waveLink } : response }));
+        } catch (error) { failed = { error }; }
+        --pendingWaveLink;
+        if (pendingWaveLink === 0) {
+          try {
+            const response = await api.getSettings();
+            if (revision === waveLinkRevision) set((state) => ({
+              settings: state.settings ? { ...state.settings, waveLink: response.waveLink } : response,
+              waveLinkDesired: failed ? desired : response.waveLink,
+            }));
+          } catch (error) { failed ??= { error }; }
+          if (revision === waveLinkRevision) set({ waveLinkPending: false });
+        }
+        if (revision === waveLinkRevision) set({ waveLinkError: failed ? String(failed.error) : null });
+        if (failed) throw failed.error;
+      });
+      waveLinkQueue = task.catch(() => undefined);
+      return task;
+    },
 
     init: async () => {
       const unlisten = await Promise.all([
