@@ -1,7 +1,11 @@
 import { create } from "zustand";
-import { api, events, type AudioDevices, type AudioStatus, type HaState, type ObsState, type SlobsState, type VoiceInfo, type WaveLinkState } from "../lib/api";
+import { api, events, type AudioDevices, type AudioStatus, type HaState, type ObsState, type SlobsState, type VoiceInfo, type WaveLinkState, type FineTuneState } from "../lib/api";
 
 interface MediaStore {
+  fineTune: FineTuneState | null;
+  fineTuneError: string | null;
+  loadFineTune: () => Promise<void>;
+  receiveFineTune: (state: FineTuneState) => void;
   waveLink: WaveLinkState | null;
   waveLinkError: string | null;
   loadWaveLink: () => Promise<void>;
@@ -41,6 +45,15 @@ interface MediaStore {
 let systemAudioRevision = 0;
 
 export const useMediaStore = create<MediaStore>((set, get) => ({
+  fineTune: null,
+  fineTuneError: null,
+  receiveFineTune: (fineTune) => {
+    if (!get().fineTune || fineTune.revision > get().fineTune!.revision) set({ fineTune, fineTuneError: null });
+  },
+  loadFineTune: async () => {
+    try { get().receiveFineTune(await api.fineTuneState()); }
+    catch (error) { if (!get().fineTune) set({ fineTuneError: String(error) }); }
+  },
   waveLink: null,
   waveLinkError: null,
   receiveWaveLink: (waveLink) => {
@@ -81,12 +94,14 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
         set({ systemAudio, systemAudioError: null });
       }),
       events.onWaveLinkState((state) => get().receiveWaveLink(state)),
+      events.onFineTuneState((state) => get().receiveFineTune(state)),
     ]);
     void get().loadObs();
     void get().loadSlobs();
     void get().loadHomeAssistant();
     void get().loadSystemAudio();
     void get().loadWaveLink();
+    void get().loadFineTune();
     return () => unlisten.forEach((fn) => fn());
   },
 

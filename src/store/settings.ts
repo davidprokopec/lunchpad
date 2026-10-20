@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, events, type AudioSettings, type InputUnavailable, type ObsSettings, type PushToTalkSettings, type Settings, type SlobsSettings, type WindowSettings, type HomeAssistantSettings, type WaveLinkSettings } from "../lib/api";
+import { api, events, type AudioSettings, type InputUnavailable, type ObsSettings, type PushToTalkSettings, type Settings, type SlobsSettings, type WindowSettings, type HomeAssistantSettings, type WaveLinkSettings, type FineTuneSettings } from "../lib/api";
 
 interface SettingsStore {
   settings: Settings | null;
@@ -12,6 +12,10 @@ interface SettingsStore {
   waveLinkPending: boolean;
   waveLinkError: string | null;
   setWaveLink: (change: Partial<WaveLinkSettings>) => Promise<void>;
+  fineTuneDesired: FineTuneSettings | null;
+  fineTunePending: boolean;
+  fineTuneError: string | null;
+  setFineTune: (change: Partial<FineTuneSettings>) => Promise<void>;
   init: () => Promise<() => void>;
   setPushToTalk: (config: PushToTalkSettings) => Promise<void>;
   setAudio: (change: Partial<AudioSettings>) => Promise<void>;
@@ -35,18 +39,22 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
   let waveLinkQueue = Promise.resolve();
   let waveLinkRevision = 0;
   let pendingWaveLink = 0;
+  let fineTuneQueue = Promise.resolve();
+  let fineTuneRevision = 0;
+  let pendingFineTune = 0;
 
   // Full snapshots from unrelated commands/events may contain older audio fields.
   // Only a fenced get_settings read can replace the confirmed audio snapshot.
   const receiveSettings = (settings: Settings) => {
     ++receivedRevision;
-    set((state) => ({ settings: state.settings ? { ...settings, audio: state.settings.audio, waveLink: state.settings.waveLink } : settings }));
+    set((state) => ({ settings: state.settings ? { ...settings, audio: state.settings.audio, waveLink: state.settings.waveLink, fineTune: state.settings.fineTune } : settings }));
   };
 
   const refreshSettings = async () => {
     const revision = ++settingsRevision;
     const audioVersion = audioRevision;
     const waveLinkVersion = waveLinkRevision;
+    const fineTuneVersion = fineTuneRevision;
     const receivedVersion = receivedRevision;
     try {
       const settings = await api.getSettings();
@@ -54,7 +62,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
       // A read confirms audio, but cannot roll back unrelated updates received in flight.
       set((state) => ({
         settings: { ...(receivedVersion !== receivedRevision && state.settings ? { ...state.settings, audio: settings.audio } : settings),
-          waveLink: state.settings && (waveLinkRevision > 0 || waveLinkVersion !== waveLinkRevision || pendingWaveLink > 0) ? state.settings.waveLink : settings.waveLink },
+          waveLink: state.settings && (waveLinkRevision > 0 || waveLinkVersion !== waveLinkRevision || pendingWaveLink > 0) ? state.settings.waveLink : settings.waveLink,
+          fineTune: state.settings && (fineTuneRevision > 0 || fineTuneVersion !== fineTuneRevision || pendingFineTune > 0) ? state.settings.fineTune : settings.fineTune },
         audioDesired: state.audioError ? state.audioDesired : settings.audio,
       }));
     } catch (error) {
@@ -74,6 +83,40 @@ export const useSettingsStore = create<SettingsStore>((set, get) => {
     waveLinkDesired: null,
     waveLinkPending: false,
     waveLinkError: null,
+    fineTuneDesired: null,
+    fineTunePending: false,
+    fineTuneError: null,
+
+    setFineTune: (change) => {
+      const base = get().fineTuneDesired ?? get().settings?.fineTune;
+      if (!base) return Promise.reject(new Error("FineTune settings have not loaded"));
+      const desired = { ...base, ...change };
+      const revision = ++fineTuneRevision;
+      ++pendingFineTune;
+      set({ fineTuneDesired: desired, fineTunePending: true });
+      const task = fineTuneQueue.then(async () => {
+        let failed: { error: unknown } | null = null;
+        try {
+          const response = await api.setFineTuneSettings(desired);
+          if (revision === fineTuneRevision) set((state) => ({ settings: state.settings ? { ...state.settings, fineTune: response.fineTune } : response }));
+        } catch (error) { failed = { error }; }
+        --pendingFineTune;
+        if (pendingFineTune === 0) {
+          try {
+            const response = await api.getSettings();
+            if (revision === fineTuneRevision) set((state) => ({
+              settings: state.settings ? { ...state.settings, fineTune: response.fineTune } : response,
+              fineTuneDesired: failed ? desired : response.fineTune,
+            }));
+          } catch (error) { failed ??= { error }; }
+          if (revision === fineTuneRevision) set({ fineTunePending: false });
+        }
+        if (revision === fineTuneRevision) set({ fineTuneError: failed ? String(failed.error) : null });
+        if (failed) throw failed.error;
+      });
+      fineTuneQueue = task.catch(() => undefined);
+      return task;
+    },
 
     setWaveLink: (change) => {
       const base = get().waveLinkDesired ?? get().settings?.waveLink;

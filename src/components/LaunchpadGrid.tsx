@@ -707,8 +707,9 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
   const { t } = useTranslation();
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
-  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink);
-  const shownFader = audioFader(fader, audio, waveLink);
+  const fineTune = useMediaStore((s) => s.fineTune);
+  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
+  const shownFader = audioFader(fader, audio, waveLink, fineTune);
   const key = corners === "key";
   const blend = unavailable ? (step === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shownFader, step);
   const shown = limited ? limitedRgb({ r: blend[0], g: blend[1], b: blend[2] }) : { r: blend[0], g: blend[1], b: blend[2] };
@@ -758,9 +759,10 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
   );
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
-  const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink));
-  const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink);
-  const shownFader = fader ? audioFader(fader, audio, waveLink) : null;
+  const fineTune = useMediaStore((s) => s.fineTune);
+  const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune));
+  const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
+  const shownFader = fader ? audioFader(fader, audio, waveLink, fineTune) : null;
   const missing = useProfileStore((s) => s.missingFiles);
   const hasMissing = !!button && [...button.down, ...button.up, ...button.hold].some((a) => a.type === "playSound" && missing.includes(a.file));
   const [mouseDown, setMouseDown] = useState(false);

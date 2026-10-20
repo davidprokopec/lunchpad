@@ -19,6 +19,7 @@ import { SpeechEditor } from "./SpeechEditor";
 import { SystemVolumeEditor } from "./SystemVolumeEditor";
 import { SetAudioEditor } from "./SetAudioEditor";
 import { WaveLinkRoutingField } from "../WaveLinkRoutingField";
+import { FineTuneDeviceField, FineTuneRoutingEditor } from "../FineTuneFields";
 import { SetFaderEditor } from "./SetFaderEditor";
 import { AudioDeviceEditor } from "./AudioDeviceEditor";
 
@@ -120,6 +121,11 @@ export function ActionEditor({ action, onChange, pages, layout, button }: Props)
       return <WaveLinkRoutingField {...action} monitored onChange={(value) => onChange({ ...action, ...value, mixId: value.mixId ?? action.mixId })} />;
     case "setAudioDevice":
       return <AudioDeviceEditor action={action} onChange={onChange} />;
+    case "fineTuneSetAppRouting":
+      return <FineTuneRoutingEditor action={action} onChange={onChange} />;
+    case "fineTuneSetDefaultOutput":
+    case "fineTuneSetPreferredInput":
+      return <FineTuneDeviceField direction={action.type === "fineTuneSetDefaultOutput" ? "output" : "input"} value={action.deviceUid} onChange={(deviceUid) => onChange({ ...action, deviceUid })} />;
     case "launchApplication":
       return <LaunchEditor action={action} onChange={onChange} button={button} />;
     case "hotkey":

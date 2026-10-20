@@ -1,13 +1,21 @@
-import type { AudioStatus, ObsState, SlobsState, StateLink, WaveLinkState } from "./api";
+import type { AudioStatus, ObsState, SlobsState, StateLink, WaveLinkState, FineTuneState } from "./api";
+import { fineTuneReason } from "./fineTune";
 import { audioControllable, audioState } from "./systemAudio";
 
 /**
  * Whether a button's "active while" link currently holds. Mirrors
  * `StateLink::is_active` in src-tauri/src/live.rs, which drives the LEDs.
  */
-export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null): boolean {
+export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): boolean {
   if (!link) return false;
-  if (link.provider === "fineTune") return false;
+  if (link.provider === "fineTune") {
+    if (link.target?.type !== "fineTune" || fineTuneReason(link.target.target, fineTune) || !fineTune?.snapshot) return false;
+    const target = link.target.target;
+    if (link.kind === "audioMuted") return audioState(link.target, audio, waveLink, fineTune)?.muted === true;
+    if (target.type === "output") return link.kind === "fineTuneDefaultOutput" && fineTune.snapshot.defaultOutput === target.deviceUid;
+    if (target.type === "input") return link.kind === "fineTunePreferredInput" ? fineTune.snapshot.inputPolicy.preferredDeviceUID === target.deviceUid : link.kind === "fineTuneDefaultInput" && fineTune.snapshot.defaultInput === target.deviceUid;
+    return false;
+  }
   if (link.provider === "waveLink") {
     if (waveLink?.status !== "ready" || link.target?.type !== "waveLink") return false;
     if (link.kind === "audioMuted") return audioControllable(link.target, audio, "mute", waveLink) && audioState(link.target, audio, waveLink)?.muted === true;

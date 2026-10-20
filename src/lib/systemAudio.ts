@@ -1,5 +1,6 @@
-import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState } from "./api";
+import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState } from "./api";
 import { waveLinkControl } from "./waveLink";
+import { fineTuneApp, fineTuneReason } from "./fineTune";
 
 export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "defaultInput" } };
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
@@ -21,7 +22,7 @@ export function audioTargetConfigured(target: AudioTarget): boolean {
 /** Structural references only: saved offline targets must remain editable. */
 export function audioActionConfigured(action: Action): boolean {
   switch (action.type) {
-    case "setAudio": return audioTargetConfigured(action.target);
+    case "setAudio": return audioTargetConfigured(action.target) && (action.target.type !== "fineTune" || action.target.target.type === "app");
     case "fineTuneSetAppRouting": return !!action.appId && (action.routing.mode === "followDefault" || !!action.routing.deviceUID);
     case "fineTuneSetDefaultOutput": case "fineTuneSetPreferredInput": return !!action.deviceUid;
     case "waveLinkSetMainOutput": return !!action.outputDeviceId && !!action.outputId;
@@ -31,9 +32,9 @@ export function audioActionConfigured(action: Action): boolean {
 }
 
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
-export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null) {
+export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
   if (!target) return null;
-  if (target.type === "fineTune") return null;
+  if (target.type === "fineTune") return target.target.type === "app" && !fineTuneReason(target.target, fineTune) ? fineTuneApp(target.target.appId, fineTune) : null;
   if (target.type === "waveLink") {
     if (waveLink?.status !== "ready") return null;
     const control = waveLinkControl(target.target, waveLink);
@@ -51,7 +52,8 @@ export function audioState(target: AudioTarget | null | undefined, status: Audio
     : d.isDefault && d.kind === (ref.type === "defaultInput" ? "input" : "output"))) ?? null;
 }
 
-export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume", waveLink: WaveLinkState | null = null) {
+export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume", waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
+  if (target.type === "fineTune") return target.target.type === "app" && !fineTuneReason(target.target, fineTune);
   if (target.type === "waveLink") {
     const found = waveLink?.status === "ready" ? waveLinkControl(target.target, waveLink) : null;
     return !!found && (control === "volume" ? found.canSetLevel && found.level !== null : found.canMute && found.muted !== null);
@@ -61,8 +63,8 @@ export function audioControllable(target: AudioTarget, status: AudioStatus | nul
   return !!state && (!("canSetVolume" in state) || (control === "volume" ? state.canSetVolume : state.canMute || state.emulated));
 }
 
-export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null): Fader {
+export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): Fader {
   if (!fader.bound) return fader;
-  const state = audioControllable(fader.bound, status, "volume", waveLink) ? audioState(fader.bound, status, waveLink) : null;
+  const state = audioControllable(fader.bound, status, "volume", waveLink, fineTune) ? audioState(fader.bound, status, waveLink, fineTune) : null;
   return { ...fader, value: state && !state.muted && state.volume !== null ? fader.min + (fader.max - fader.min) * state.volume : fader.min };
 }

@@ -6,6 +6,8 @@ import { useMediaStore } from "../store/media";
 import { Select } from "./Select";
 import { Button } from "./ui";
 import { waveLinkControl, waveLinkKey } from "../lib/waveLink";
+import { FineTuneAppField } from "./FineTuneFields";
+import { fineTuneReason } from "../lib/fineTune";
 
 type Source = "manual" | "device" | "app" | "waveLink" | "fineTune";
 const targetKey = (target: AudioTarget): string => target.type === "fineTune" ? `fineTune:${JSON.stringify(target.target)}` : target.type === "waveLink" ? waveLinkKey(target.target) : target.type === "app" ? `app:${target.app.id}` : target.device.type === "named" ? `device:${target.device.kind}:${target.device.id || target.device.label}` : target.device.type;
@@ -23,7 +25,9 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
   const refresh = useMediaStore((s) => s.loadSystemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
   const loadWaveLink = useMediaStore((s) => s.loadWaveLink);
-  useEffect(() => { void refresh(); }, [refresh]);
+  const fineTune = useMediaStore((s) => s.fineTune);
+  const loadFineTune = useMediaStore((s) => s.loadFineTune);
+  useEffect(() => { if (value?.type !== "fineTune") void refresh(); }, [refresh, value?.type]);
   const source: Source = value?.type ?? (manual ? "manual" : "device");
   const targets: { target: AudioTarget; label: string }[] = source === "fineTune" ? [] : source === "waveLink"
     ? (waveLink?.status === "ready" ? waveLink.controls : []).filter((item) => control === "volume" ? item.canSetLevel && item.level !== null : item.canMute && item.muted !== null).map((item) => ({ target: { type: "waveLink", target: item.target }, label: `${t(`waveLink.kinds.${item.target.type}`)} · ${item.name}` }))
@@ -38,11 +42,11 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
     const name = value.type === "fineTune" ? "FineTune" : value.type === "waveLink" ? waveLinkControl(value.target, waveLink)?.name ?? waveLinkKey(value.target) : value.type === "app" ? value.app.name : value.device.type === "named" ? value.device.label : "";
     targets.push({ target: value, label: t(value.type === "app" ? "audio.notRunning" : "audio.missingTarget", { name }) });
   }
-  const unavailable = value && !audioControllable(value, status, control, waveLink);
+  const unavailable = value && !audioControllable(value, status, control, waveLink, fineTune);
   const selected = value?.type === "waveLink" ? waveLinkControl(value.target, waveLink) : null;
   const channelId = value?.type === "waveLink" && (value.target.type === "channel" || value.target.type === "channelMix") ? value.target.channelId : null;
   const members = waveLink?.channels.find((channel) => channel.id === channelId)?.apps ?? [];
-  const reason = source === "waveLink" ? waveLink?.status !== "ready" ? t("waveLink.notReady") : selected?.target.type === "inputGain" ? t("waveLink.gainReadOnly") : selected?.reason || t("waveLink.unsupportedControl") : status?.message || (value?.type === "app" && (status?.permission === "denied" || status?.permission === "unconfirmed")
+  const reason = source === "fineTune" ? t(value?.type === "fineTune" && value.target.type !== "app" ? "fineTune.deviceLinksOnly" : `fineTune.${value?.type === "fineTune" ? fineTuneReason(value.target, fineTune) ?? "chooseApp" : "chooseApp"}`) : source === "waveLink" ? waveLink?.status !== "ready" ? t("waveLink.notReady") : selected?.target.type === "inputGain" ? t("waveLink.gainReadOnly") : selected?.reason || t("waveLink.unsupportedControl") : status?.message || (value?.type === "app" && (status?.permission === "denied" || status?.permission === "unconfirmed")
     ? t("audio.permission", { status: t(`audio.permissions.${status.permission}`) })
     : t(status ? "audio.unavailable" : "audio.loading"));
   return (
@@ -55,19 +59,19 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
             { value: "device", label: t(manual ? "audio.deviceVolume" : "volume.device") },
             { value: "app", label: t(manual ? "audio.appVolume" : "audio.app") },
             { value: "waveLink", label: t("waveLink.name") },
-            ...(source === "fineTune" ? [{ value: "fineTune" as const, label: "FineTune" }] : []),
-          ]} onChange={(next) => { if (next === "fineTune") return; if (next === "waveLink") { void loadWaveLink(); onChange({ type: "waveLink", target: { type: "channel", channelId: "" } }); } else onChange(next === "manual" ? null : next === "device" ? DEFAULT_OUTPUT : { type: "app", app: { id: "", name: "" } }); }} />
+            { value: "fineTune", label: t("fineTune.name") },
+          ]} onChange={(next) => { if (next === "fineTune") { void loadFineTune(); onChange({ type: "fineTune", target: { type: "app", appId: "" } }); } else if (next === "waveLink") { void loadWaveLink(); onChange({ type: "waveLink", target: { type: "channel", channelId: "" } }); } else onChange(next === "manual" ? null : next === "device" ? DEFAULT_OUTPUT : { type: "app", app: { id: "", name: "" } }); }} />
         </div>
-        {source !== "manual" && <div className="flex min-w-0 flex-col gap-1 text-xs text-stage-400">
+        {source === "fineTune" ? <FineTuneAppField value={value?.type === "fineTune" && value.target.type === "app" ? value.target.appId : ""} onChange={(appId) => onChange({ type: "fineTune", target: { type: "app", appId } })} /> : source !== "manual" && <div className="flex min-w-0 flex-col gap-1 text-xs text-stage-400">
           {t(source === "waveLink" ? "waveLink.control" : source === "app" ? "audio.app" : "volume.device")}
           <Select size="sm" ariaLabel={t(source === "waveLink" ? "waveLink.control" : source === "app" ? "audio.app" : "volume.device")} value={value && (value.type !== "app" || value.app.id) ? targetKey(value) : null} placeholder={t("waveLink.chooseTarget")} options={targets.filter(({ target }) => target.type !== "app" || !!target.app.id).map(({ target, label }) => ({ value: targetKey(target), label }))} onChange={(key) => { const item = targets.find(({ target }) => targetKey(target) === key); if (item) onChange(item.target); }} />
         </div>}
       </div>
       {source !== "manual" && <div className="flex items-start justify-between gap-3">
         <p role="status" className={"text-xs " + (unavailable || error ? "text-warn" : "text-stage-500")}>
-          {(source === "waveLink" ? null : error) || (unavailable ? reason : "")}
+          {(source === "waveLink" || source === "fineTune" ? null : error) || (unavailable && (source !== "fineTune" || value?.type === "fineTune" && value.target.type !== "app") ? reason : "")}
         </p>
-        <Button size="sm" onClick={() => void (source === "waveLink" ? loadWaveLink() : refresh())}>{t("audio.retry")}</Button>
+        <Button size="sm" onClick={() => void (source === "fineTune" ? loadFineTune() : source === "waveLink" ? loadWaveLink() : refresh())}>{t("audio.retry")}</Button>
       </div>}
       {channelId && <p className="text-xs text-stage-500">{t("waveLink.groupedApps", { apps: members.map((app) => app.name).join(", ") || t("waveLink.noApps") })}</p>}
       {selected?.gain && <p className="text-xs text-stage-500">{t("waveLink.gainMetadata", selected.gain)}</p>}

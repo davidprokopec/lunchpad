@@ -140,7 +140,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
   const [tab, setTab] = useState<Tab>("appearance");
   const muteSettingsRef = useRef<HTMLElement>(null);
   const [previewActive, setPreviewActive] = useState(false);
-  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink));
+  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune));
   const pad = layout?.pads.find((p) => p.x === x && p.y === y);
   const ledKind = pad?.led ?? "rgb";
   /** A tap-only button (Arp, Scale): the device reports no release, so only the pressed list. */
@@ -150,9 +150,13 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
   const mutePreset = button.down.length === 1 && button.up.length === 1 && button.hold.length === 0
     && button.down[0].type === "setAudio" && button.down[0].mode === "holdMute"
     && button.up[0].type === "setAudio" && button.up[0].mode === "holdMute"
-    && (button.stateLink?.provider === "system" || button.stateLink?.provider === "waveLink") && button.stateLink.kind === "audioMuted";
+    && (button.stateLink?.provider === "system" || button.stateLink?.provider === "waveLink" || button.stateLink?.provider === "fineTune") && button.stateLink.kind === "audioMuted";
   const valid = [...button.down, ...button.up, ...button.hold].every(audioActionConfigured)
-    && (!button.stateLink?.target || audioTargetConfigured(button.stateLink.target));
+    && (!button.stateLink?.target || audioTargetConfigured(button.stateLink.target))
+    && (button.stateLink?.provider !== "fineTune" || button.stateLink.target?.type === "fineTune" && (
+      button.stateLink.kind === "audioMuted" ? button.stateLink.target.target.type === "app"
+        : button.stateLink.kind === "fineTuneDefaultOutput" ? button.stateLink.target.target.type === "output"
+        : (button.stateLink.kind === "fineTunePreferredInput" || button.stateLink.kind === "fineTuneDefaultInput") && button.stateLink.target.target.type === "input"));
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   useEffect(() => {
@@ -241,7 +245,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
               if (!target || !button.stateLink) return;
               const caption = (value: typeof target) => muteCaption(value, t("audio.micCaption"), t("audio.outputCaption"));
               const look = button.look.type === "text" && button.stateLink.target && button.look.caption === caption(button.stateLink.target) ? { ...button.look, caption: caption(target) } : button.look;
-              setButton({ ...button, look, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target, provider: target.type === "waveLink" ? "waveLink" : "system" } });
+              setButton({ ...button, look, down: button.down.map((a) => a.type === "setAudio" ? { ...a, target } : a), up: button.up.map((a) => a.type === "setAudio" ? { ...a, target } : a), stateLink: { ...button.stateLink, target, provider: target.type === "fineTune" ? "fineTune" : target.type === "waveLink" ? "waveLink" : "system" } });
             }} />
             {textLook && <label className="flex flex-col gap-1 text-xs text-stage-400">
               {t("editor.caption")}

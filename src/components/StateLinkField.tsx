@@ -7,6 +7,7 @@ import { useSettingsStore } from "../store/settings";
 import { AudioTargetField } from "./AudioTargetField";
 import { DEFAULT_INPUT } from "../lib/systemAudio";
 import { WaveLinkRoutingField } from "./WaveLinkRoutingField";
+import { FineTuneDeviceField } from "./FineTuneFields";
 
 type ProviderChoice = LinkProvider | "none";
 
@@ -27,6 +28,7 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
     { value: "none", label: t("editor.linkNone") },
     { value: "system", label: t("audio.system") },
     { value: "waveLink", label: t("waveLink.name") },
+    { value: "fineTune", label: t("fineTune.name") },
     ...(obsEnabled || value?.provider === "obs" ? [{ value: "obs" as const, label: t("integrations.obs") }] : []),
     ...(slobsEnabled || value?.provider === "slobs" ? [{ value: "slobs" as const, label: t("integrations.slobs") }] : []),
   ];
@@ -40,13 +42,13 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
             size="sm"
             value={value ? value.provider : "none"}
             options={providerOptions}
-            onChange={(v) => onChange(v === "none" ? null : v === "system" || v === "waveLink" ? { provider: v, kind: "audioMuted", scene: "", source: "", target: v === "system" ? DEFAULT_INPUT : { type: "waveLink", target: { type: "channel", channelId: "" } } } : { provider: v, kind: "scene", scene: "", source: "" })}
+            onChange={(v) => onChange(v === "none" ? null : v === "system" || v === "waveLink" || v === "fineTune" ? { provider: v, kind: "audioMuted", scene: "", source: "", target: v === "system" ? DEFAULT_INPUT : v === "fineTune" ? { type: "fineTune", target: { type: "app", appId: "" } } : { type: "waveLink", target: { type: "channel", channelId: "" } } } : { provider: v, kind: "scene", scene: "", source: "" })}
           />
         </div>
         {value && (
           <div className="flex flex-col gap-1 text-xs text-stage-400">
             {t("editor.linkKind")}
-            <Select<LinkKind> size="sm" value={value.kind} options={(value.provider === "system" ? ["audioMuted" as const] : value.provider === "waveLink" ? ["audioMuted", "waveLinkMainOutput", "waveLinkMonitoredMix"] as const : LINK_KINDS.filter((kind) => kind !== "audioMuted" && kind !== "waveLinkMainOutput" && kind !== "waveLinkMonitoredMix")).map((k) => ({ value: k, label: t(k === "audioMuted" ? "audio.muted" : k.startsWith("waveLink") ? `waveLink.links.${k}` : `editor.linkKinds.${k}`) }))} onChange={(kind) => onChange({ ...value, kind })} />
+            <Select<LinkKind> size="sm" value={value.kind} options={(value.provider === "system" ? ["audioMuted" as const] : value.provider === "waveLink" ? ["audioMuted", "waveLinkMainOutput", "waveLinkMonitoredMix"] as const : value.provider === "fineTune" ? ["audioMuted", "fineTuneDefaultOutput", "fineTunePreferredInput", "fineTuneDefaultInput"] as const : LINK_KINDS.filter((kind) => kind !== "audioMuted" && !kind.startsWith("waveLink") && !kind.startsWith("fineTune"))).map((k) => ({ value: k, label: t(k === "audioMuted" ? "audio.muted" : k.startsWith("fineTune") ? `fineTune.links.${k}` : k.startsWith("waveLink") ? `waveLink.links.${k}` : `editor.linkKinds.${k}`) }))} onChange={(kind) => onChange({ ...value, kind, ...(value.provider === "fineTune" ? { target: { type: "fineTune", target: kind === "audioMuted" ? { type: "app", appId: "" } : { type: kind === "fineTuneDefaultOutput" ? "output" : "input", deviceUid: "" } } } : {}) })} />
           </div>
         )}
       </div>
@@ -68,7 +70,8 @@ export function StateLinkField({ value, onChange }: { value: StateLink | null; o
           <NamePicker view={view} label={t("obs.source")} value={value.source} list={view.audioSources} onChange={(source) => onChange({ ...value, source })} />
         </div>
       )}
-      {(value?.provider === "system" || value?.provider === "waveLink") && value.kind === "audioMuted" && <AudioTargetField control="mute" value={value.target ?? DEFAULT_INPUT} onChange={(target) => onChange({ ...value, target, provider: target?.type === "waveLink" ? "waveLink" : "system" })} />}
+      {(value?.provider === "system" || value?.provider === "waveLink" || value?.provider === "fineTune") && value.kind === "audioMuted" && <AudioTargetField control="mute" value={value.target ?? DEFAULT_INPUT} onChange={(target) => onChange({ ...value, target, provider: target?.type === "fineTune" ? "fineTune" : target?.type === "waveLink" ? "waveLink" : "system" })} />}
+      {value?.provider === "fineTune" && value.kind !== "audioMuted" && <FineTuneDeviceField selection={false} direction={value.kind === "fineTuneDefaultOutput" ? "output" : "input"} value={value.target?.type === "fineTune" && value.target.target.type !== "app" ? value.target.target.deviceUid : ""} onChange={(deviceUid) => onChange({ ...value, target: { type: "fineTune", target: { type: value.kind === "fineTuneDefaultOutput" ? "output" : "input", deviceUid } } })} />}
       {value?.provider === "waveLink" && (value.kind === "waveLinkMainOutput" || value.kind === "waveLinkMonitoredMix") && <WaveLinkRoutingField outputDeviceId={value.target?.type === "waveLink" && value.target.target.type === "output" ? value.target.target.outputDeviceId : ""} outputId={value.target?.type === "waveLink" && value.target.target.type === "output" ? value.target.target.outputId : ""} mixId={value.waveLinkMixId} monitored={value.kind === "waveLinkMonitoredMix"} onChange={(next) => onChange({ ...value, target: { type: "waveLink", target: { type: "output", outputDeviceId: next.outputDeviceId, outputId: next.outputId } }, waveLinkMixId: next.mixId })} />}
       {value && (value.provider === "obs" || value.provider === "slobs") && <ProviderStatus view={view} />}
     </div>

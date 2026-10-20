@@ -18,6 +18,7 @@ async function fixture() {
     version: 1, device: null, autoConnect: false, pressFeedback: true,
     pushToTalk: { enabled: false, key: "", modifiers: [] }, audio: { outputDevice: null, macosAppVolume: false },
     waveLink: { enabled: false, autoConnect: true, port: null },
+    fineTune: { enabled: false, autoConnect: true },
     obs: { enabled: false, host: "localhost", port: 4455, password: "", autoConnect: false },
     slobs: { enabled: false, host: "localhost", port: 59650, token: "", autoConnect: false },
     homeAssistant: { enabled: false, url: "", token: "", ignoreTlsErrors: false },

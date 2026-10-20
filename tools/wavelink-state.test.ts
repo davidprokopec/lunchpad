@@ -76,6 +76,8 @@ test("subscribe precedes initial read; late initial and equal/older snapshots ca
   const calls: string[] = [];
   events.onWaveLinkState = async (cb) => { calls.push("subscribe"); listener = cb; return () => {}; };
   api.waveLinkState = () => { calls.push("read"); return initial; };
+  events.onFineTuneState = async () => () => {};
+  api.fineTuneState = async () => { throw new Error("fixture"); };
   events.onObsState = events.onSlobsState = events.onHomeAssistantState = events.onSystemAudio = async () => () => {};
   api.obsState = async () => { throw new Error("fixture"); }; api.slobsState = api.obsState;
   api.homeAssistantState = async () => { throw new Error("fixture"); }; api.audioStatus = async () => { throw new Error("fixture"); };
