@@ -51,6 +51,8 @@ enum Command {
         reply: Reply,
     },
     Refresh,
+    #[cfg(test)]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 impl FineTune {
@@ -122,6 +124,20 @@ impl FineTune {
     pub fn refresh(&self) -> FineTuneState {
         let _ = self.inner.commands.try_send(Command::Refresh);
         self.state()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn barrier(&self) {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::Barrier(reply))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn change(&self, config: Option<FineTuneSettings>, connect: bool, shutdown: bool) {
@@ -270,8 +286,15 @@ async fn supervise(
 }
 
 fn reject(command: Option<Command>) {
-    if let Some(Command::Write { reply, .. }) = command {
-        let _ = reply.send(Err("FineTune session ended; command not replayed".into()));
+    match command {
+        Some(Command::Write { reply, .. }) => {
+            let _ = reply.send(Err("FineTune session ended; command not replayed".into()));
+        }
+        #[cfg(test)]
+        Some(Command::Barrier(reply)) => {
+            let _ = reply.send(());
+        }
+        _ => {}
     }
 }
 
@@ -505,6 +528,8 @@ async fn run_session(
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()); };
                 let (method, params, reply, snapshot) = match command {
+                    #[cfg(test)]
+                    Command::Barrier(reply) => { let _ = reply.send(()); continue; }
                     Command::Refresh => {
                         if pending.values().any(|p| p.snapshot) { continue; }
                         ("getState", json!({}), None, true)

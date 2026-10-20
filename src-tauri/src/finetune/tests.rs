@@ -221,6 +221,118 @@ async fn hello_first_subscribe_then_revisioned_full_snapshots() {
 }
 
 #[tokio::test]
+async fn disabled_integration_never_connects_and_enable_disable_reenable_is_fenced() {
+    let fixture = Fixture::new().await;
+    let fine = FineTune::start_at(FineTuneSettings::default(), Some(fixture.dir.join("s")));
+    fine.barrier().await;
+    assert_eq!(fine.state().status, FineTuneStatus::Disabled);
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+    fine.connect();
+    fine.refresh();
+    fine.barrier().await;
+    assert_eq!(fine.state().status, FineTuneStatus::Disabled);
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+
+    fine.configure(FineTuneSettings {
+        enabled: true,
+        auto_connect: true,
+    });
+    let mut peer = fixture.ready(&fine).await;
+    let ready = fine.state();
+    let target = FineTuneTarget::App {
+        app_id: "app".into(),
+    };
+    assert!(ready.target_reason(&target).is_none());
+    let handle = fine.clone();
+    let pending = tokio::task::spawn_blocking(move || {
+        handle.write(ready.generation, Mutation::Mute("app".into(), true))
+    });
+    let request = peer.request().await;
+    assert_eq!(request["method"], "setAppMute");
+    fine.configure(FineTuneSettings::default());
+    let disabled = fine.state();
+    assert_eq!(disabled.status, FineTuneStatus::Disabled);
+    assert!(!disabled.connected);
+    assert!(disabled.snapshot.is_none());
+    assert!(disabled.session_id.is_none());
+    assert!(disabled.target_reason(&target).is_some());
+    assert!(disabled
+        .target_reason(&FineTuneTarget::Output {
+            device_uid: "out".into()
+        })
+        .is_some());
+    assert!(disabled
+        .target_reason(&FineTuneTarget::Input {
+            device_uid: "in".into()
+        })
+        .is_some());
+    assert!(fine
+        .write(ready.generation, Mutation::Mute("app".into(), true))
+        .is_err());
+    peer.closed().await;
+    assert!(timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    fine.barrier().await;
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+
+    fine.configure(FineTuneSettings {
+        enabled: true,
+        auto_connect: true,
+    });
+    let mut peer = fixture.ready_session(&fine, "reenabled").await;
+    assert!(fine.state().generation > ready.generation);
+    assert!(fine
+        .write(ready.generation, Mutation::Mute("app".into(), true))
+        .is_err());
+    fine.refresh();
+    peer.getter().await;
+    fine.configure(FineTuneSettings::default());
+    peer.closed().await;
+    fine.barrier().await;
+    assert_eq!(fine.state().status, FineTuneStatus::Disabled);
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+    fine.shutdown();
+}
+
+#[tokio::test]
+async fn disabling_cancels_handshake_and_backoff_without_a_reconnect() {
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.accept().await;
+    // No hello: disable must cancel the reader rather than wait for its timeout.
+    fine.configure(FineTuneSettings::default());
+    peer.closed().await;
+    fine.barrier().await;
+    assert_eq!(fine.state().status, FineTuneStatus::Disabled);
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+
+    fine.configure(FineTuneSettings {
+        enabled: true,
+        auto_connect: true,
+    });
+    let peer = fixture.ready_session(&fine, "before-backoff").await;
+    drop(peer);
+    until(&fine, |state| state.status == FineTuneStatus::Disconnected).await;
+    fine.configure(FineTuneSettings::default());
+    fine.barrier().await;
+    assert_eq!(fine.state().status, FineTuneStatus::Disabled);
+    assert!(futures_util::poll!(Box::pin(fixture.listener.accept())).is_pending());
+
+    fine.configure(FineTuneSettings {
+        enabled: true,
+        auto_connect: true,
+    });
+    let mut peer = fixture.ready_session(&fine, "after-backoff").await;
+    fine.configure(FineTuneSettings::default());
+    peer.closed().await;
+    fine.barrier().await;
+    fine.shutdown();
+}
+
+#[tokio::test]
 async fn unsupported_hello_versions_never_subscribe() {
     for (protocol, version) in [("other", 1), ("finetune-control", 2)] {
         let fixture = Fixture::new().await;
