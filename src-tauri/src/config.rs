@@ -57,6 +57,29 @@ pub struct AudioSettings {
     pub macos_app_volume: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WaveLinkSettings {
+    pub enabled: bool,
+    pub auto_connect: bool,
+    pub port: Option<u16>,
+}
+
+impl Default for WaveLinkSettings {
+    fn default() -> Self {
+        Self { enabled: false, auto_connect: true, port: None }
+    }
+}
+
+impl WaveLinkSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == Some(0) {
+            return Err("Wave Link port must be between 1 and 65535".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObsSettings {
@@ -182,6 +205,8 @@ pub struct Settings {
     #[serde(default)]
     pub audio: AudioSettings,
     #[serde(default)]
+    pub wave_link: WaveLinkSettings,
+    #[serde(default)]
     pub obs: ObsSettings,
     #[serde(default)]
     pub slobs: SlobsSettings,
@@ -217,6 +242,7 @@ impl Default for Settings {
             press_threshold: None,
             push_to_talk: PushToTalkSettings::default(),
             audio: AudioSettings::default(),
+            wave_link: WaveLinkSettings::default(),
             obs: ObsSettings::default(),
             slobs: SlobsSettings::default(),
             home_assistant: HomeAssistantSettings::default(),

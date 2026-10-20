@@ -32,6 +32,7 @@ pub mod system_audio_bridge;
 pub mod sysaudio;
 pub mod system_volume;
 pub mod tray;
+pub mod wavelink;
 
 use commands::*;
 use config::{SettingsStore, SharedSettings};

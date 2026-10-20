@@ -181,6 +181,63 @@ export interface AudioSettings {
   macosAppVolume: boolean;
 }
 
+export interface WaveLinkSettings {
+  enabled: boolean;
+  autoConnect: boolean;
+  port: number | null;
+}
+
+export type WaveLinkTarget =
+  | { type: "channel"; channelId: string }
+  | { type: "channelMix"; channelId: string; mixId: string }
+  | { type: "mix"; mixId: string }
+  | { type: "output"; outputDeviceId: string; outputId: string }
+  | { type: "input"; inputDeviceId: string; inputId: string }
+  | { type: "inputGain"; inputDeviceId: string; inputId: string };
+
+export interface WaveLinkApplication {
+  name: string;
+  operatingSystem: string;
+  appID: string;
+  interfaceRevision: number;
+}
+
+export interface WaveLinkControl {
+  target: WaveLinkTarget;
+  name: string;
+  level: number | null;
+  muted: boolean | null;
+  canSetLevel: boolean;
+  canMute: boolean;
+  reason: string | null;
+  gain: { value: number; min: number; max: number; unit: string } | null;
+}
+
+export interface WaveLinkOutput {
+  outputDeviceId: string;
+  outputId: string;
+  name: string;
+  mixId: string | null;
+  canSelectMain: boolean;
+  canSetMix: boolean;
+}
+
+export interface WaveLinkState {
+  status: "disabled" | "disconnected" | "connecting" | "synchronizing" | "ready" | "unsupported" | "error";
+  connected: boolean;
+  error: string | null;
+  port: number | null;
+  application: WaveLinkApplication | null;
+  version: string | null;
+  generation: number;
+  revision: number;
+  controls: WaveLinkControl[];
+  channels: { id: string; name: string; apps: { id: string; name: string }[] }[];
+  mixes: { id: string; name: string }[];
+  outputs: WaveLinkOutput[];
+  mainOutput: { outputDeviceId: string; outputId: string } | null;
+}
+
 export interface ObsSettings {
   enabled: boolean;
   host: string;
@@ -357,6 +414,7 @@ export interface Settings {
   pressFeedback: boolean;
   pushToTalk: PushToTalkSettings;
   audio: AudioSettings;
+  waveLink: WaveLinkSettings;
   obs: ObsSettings;
   slobs: SlobsSettings;
   homeAssistant: HomeAssistantSettings;
