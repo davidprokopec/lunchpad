@@ -35,6 +35,8 @@ interface Props {
 
 /** Pointer distance before a modifier-press turns into a drag instead of a click. */
 const DRAG_THRESHOLD = 6;
+const isMac = navigator.platform.toLowerCase().includes("mac");
+const shortcutModifier = isMac ? "⌘" : "Ctrl+";
 
 /** True for the modifier that moves a button: Ctrl, or ⌘ on macOS. */
 const isMoveModifier = (e: { ctrlKey: boolean; metaKey: boolean }) => e.ctrlKey || e.metaKey;
@@ -55,6 +57,7 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
   const { ref, width, height } = useElementSize<HTMLDivElement>();
   const reduced = useReducedMotion();
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [target, setTarget] = useState<PadRef | null>(null);
   const drag = useDragStore((s) => s.drag);
   const setDrag = useDragStore((s) => s.setDrag);
   const pending = useRef<{ from: PadRef; copy: boolean; x: number; y: number; started: boolean; fader: { fader: Fader; step: number } | null } | null>(null);
@@ -147,6 +150,54 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
 
+  // A target is only meaningful on the page and device where it was chosen.
+  useEffect(() => {
+    setTarget(null);
+    setMenu(null);
+  }, [page?.id, layout.model]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target instanceof Element ? e.target : null;
+      if (e.defaultPrevented || e.repeat || e.isComposing || !target || pending.current || drag) return;
+      if (el?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox'], [role='dialog']")) return;
+      if (document.querySelector("[role='dialog'], [aria-modal='true']")) return;
+      const state = useProfileStore.getState();
+      const ui = useUiStore.getState();
+      if (state.editor || state.faderEditor || ui.settingsOpen || ui.shareIntent || ui.outsideOpen || pendingImport) return;
+      // Do not capture clipboard keys after focus has left the board (menus are portalled).
+      if (!ref.current?.contains(document.activeElement) && !(menu && (el === document.body || el?.closest("[role='menu']")))) return;
+      const current = state.activePage();
+      const pad = layout.pads.find((p) => p.x === target.x && p.y === target.y);
+      if (!current || !pad || pad.shape === "empty" || pad.shape === "logo") return;
+      const hit = faderAt(current, target.x, target.y);
+      const hasButton = !!hit || current.buttons.some((b) => b.x === target.x && b.y === target.y);
+      const modifier = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+      const key = e.key.toLowerCase();
+      if (!menu && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && key.startsWith("arrow")) {
+        const [dx, dy] = key === "arrowleft" ? [-1, 0] : key === "arrowright" ? [1, 0] : key === "arrowup" ? [0, 1] : [0, -1];
+        const next = layout.pads
+          .filter((p) => p.shape !== "empty" && p.shape !== "logo" && (dx ? p.y === target.y && (p.x - target.x) * dx > 0 : p.x === target.x && (p.y - target.y) * dy > 0))
+          .sort((a, b) => (dx ? Math.abs(a.x - target.x) - Math.abs(b.x - target.x) : Math.abs(a.y - target.y) - Math.abs(b.y - target.y)));
+        const button = next.map((p) => ref.current?.querySelector<HTMLButtonElement>(`[data-pad='${p.x},${p.y}'] button`)).find(Boolean);
+        if (button) button.focus({ preventScroll: true });
+        e.preventDefault();
+        return;
+      }
+      const clipboardKey = modifier && !e.altKey && !e.shiftKey;
+      const remove = !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (key === "delete" || key === "backspace");
+      if (clipboardKey && key === "c" && hasButton) copyButton(target.x, target.y);
+      else if (clipboardKey && key === "x" && hasButton) void cutButton(target.x, target.y);
+      else if (clipboardKey && key === "v" && state.clipboard && (!isControl(pad.shape) || "direction" in state.clipboard) && (!hit || "direction" in state.clipboard)) void pasteButton(target.x, target.y);
+      else if (remove && hasButton) { if (hit) void removeFader(hit.fader.id); else void clearButton(target.x, target.y); }
+      else return;
+      e.preventDefault();
+      setMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [target, drag, menu, pendingImport, layout, ref, copyButton, cutButton, pasteButton, clearButton, removeFader]);
+
   const totalRowWeight = layout.rowWeights.reduce((a, b) => a + b, 0);
   /**
    * The board is as wide as the columns that hold controls (a logo column with nothing in it
@@ -158,7 +209,7 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
   );
   const aspect = columns / totalRowWeight;
   const padding = 8;
-  const boardWidth = Math.max(0, Math.min(width - padding, (height - padding) * aspect));
+  const boardWidth = Math.max(0, Math.min(width - padding, (height - padding - 44) * aspect));
   const boardHeight = boardWidth / aspect;
 
   const rowsTopDown = useMemo(
@@ -266,6 +317,8 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
       e.preventDefault();
       // macOS reports Ctrl+click as a right click; Ctrl is the move modifier, not a menu request.
       if (e.ctrlKey || pending.current?.started) return;
+      setTarget({ x: pad.x, y: pad.y });
+      e.currentTarget.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
       const historyItems: MenuEntry[] = [
         ...(outsideCount > 0 ? ["divider" as const, { label: t("grid.outside", { count: outsideCount }), onSelect: openOutside }] : []),
         "divider",
@@ -281,7 +334,10 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
           items: [
             { label: t("grid.editFader"), onSelect: () => openFaderEditor(pad.x, pad.y) },
             "divider",
-            { label: t("grid.removeFader"), danger: true, onSelect: () => void removeFader(faderId) },
+            { label: t("grid.copy"), shortcut: `${shortcutModifier}C`, onSelect: () => copyButton(pad.x, pad.y) },
+            { label: t("grid.cut"), shortcut: `${shortcutModifier}X`, onSelect: () => void cutButton(pad.x, pad.y) },
+            "divider",
+            { label: t("grid.removeFader"), shortcut: isMac ? "⌫" : t("grid.deleteKey"), danger: true, onSelect: () => void removeFader(faderId) },
             ...historyItems,
           ],
         });
@@ -298,9 +354,9 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
           { label: hasButton ? t("grid.editButton") : t("grid.addButton"), onSelect: () => openEditor(pad.x, pad.y) },
           ...(!hasButton && !pad.momentary ? [{ label: t("audio.mutePreset"), onSelect: () => openEditor(pad.x, pad.y, "mute") }] : []),
           "divider",
-          { label: t("grid.copy"), disabled: !hasButton, onSelect: () => copyButton(pad.x, pad.y) },
-          { label: t("grid.cut"), disabled: !hasButton, onSelect: () => void cutButton(pad.x, pad.y) },
-          { label: t("grid.paste"), disabled: !clipboard, onSelect: () => void pasteButton(pad.x, pad.y) },
+          { label: t("grid.copy"), shortcut: `${shortcutModifier}C`, disabled: !hasButton, onSelect: () => copyButton(pad.x, pad.y) },
+          { label: t("grid.cut"), shortcut: `${shortcutModifier}X`, disabled: !hasButton, onSelect: () => void cutButton(pad.x, pad.y) },
+          { label: t("grid.paste"), shortcut: `${shortcutModifier}V`, disabled: !clipboard, onSelect: () => void pasteButton(pad.x, pad.y) },
           { label: t("grid.exportButton"), disabled: !hasButton, onSelect: () => void exportButton(pad.x, pad.y) },
           { label: t("grid.importButton"), onSelect: () => void importButton(pad.x, pad.y) },
           { label: t("grid.share"), disabled: !hasButton, onSelect: () => shareButton(pad.x, pad.y) },
@@ -308,7 +364,7 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
           "divider",
           { label: t("grid.newFader"), onSelect: () => openFaderEditor(pad.x, pad.y) },
           "divider",
-          { label: t("grid.clearButton"), disabled: !hasButton, danger: true, onSelect: () => void clearButton(pad.x, pad.y) },
+          { label: t("grid.clearButton"), shortcut: isMac ? "⌫ / ⌦" : t("grid.deleteShortcut"), disabled: !hasButton, danger: true, onSelect: () => void clearButton(pad.x, pad.y) },
           ...historyItems,
         ],
       });
@@ -359,7 +415,23 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
   );
 
   return (
-    <div ref={ref} className="flex h-full w-full items-center justify-center">
+    <div
+      ref={ref}
+      className="relative flex h-full w-full items-center justify-center pb-11"
+      onPointerDownCapture={(e) => {
+        // WebKit does not always focus a button on a mouse press. Keep targeting
+        // consistent without replacing the pad's existing press/drag handlers.
+        const pad = (e.target as HTMLElement).closest<HTMLElement>("[data-pad]");
+        pad?.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
+      }}
+      onFocusCapture={(e) => {
+        const pad = (e.target as HTMLElement).closest<HTMLElement>("[data-pad]");
+        if (pad?.dataset.pad) {
+          const [x, y] = pad.dataset.pad.split(",").map(Number);
+          setTarget({ x, y });
+        }
+      }}
+    >
       {boardWidth > 0 && (
         <motion.div
           key={layout.model}
@@ -393,7 +465,7 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
             }
             if (pad.shape === "empty") return null;
             return (
-              <div key={padKey(pad.x, pad.y)} style={place} className="min-h-0 min-w-0">
+              <div key={padKey(pad.x, pad.y)} style={place} className={clsx("min-h-0 min-w-0 rounded-sm", sameRef(target, pad) && "outline outline-1 outline-offset-2 outline-accent-400/70")}>
                 {renderPad(pad)}
               </div>
             );
@@ -403,6 +475,10 @@ export function LaunchpadGrid({ layout, preview = false }: Props) {
       )}
       {drag && dragButton && <DragGhost button={dragButton} cell={cell} copy={drag.copy} corners={dragCorners} limited={layout.limitedColor} />}
       {drag?.fader && <FaderGhost fader={drag.fader.fader} cell={cell} />}
+      <div className="pointer-events-none absolute inset-x-2 bottom-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-0.5 text-center text-[11px] leading-4 text-stage-400">
+        <span>{t("grid.targetHint")}</span>
+        <span>{t("grid.dragHint", { modifier: isMac ? "⌘" : "Ctrl" })}</span>
+      </div>
       <ContextMenu menu={menu} onClose={() => setMenu(null)} />
       <ImportReviewDialog
         review={pendingImport?.review ?? null}

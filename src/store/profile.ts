@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { faderAt, newFader } from "../lib/fader";
+import { faderAt, faderFitsAt, newFader } from "../lib/fader";
+import i18n from "../i18n";
 import { useDeviceStore } from "./device";
 import {
   api,
@@ -26,7 +27,8 @@ interface EditorTarget extends PadRef {
 
 interface ProfileStore {
   profile: Profile | null;
-  clipboard: Button | null;
+  clipboard: Button | Fader | null;
+  clipboardFaderCut: boolean;
   editor: EditorTarget | null;
   faderEditor: { pageId: string; fader: Fader; isNew: boolean } | null;
   lastImport: ImportReport | null;
@@ -105,6 +107,7 @@ function offerUndo(set: (partial: Partial<ProfileStore>) => void, get: () => Pro
 export const useProfileStore = create<ProfileStore>((set, get) => ({
   profile: null,
   clipboard: null,
+  clipboardFaderCut: false,
   editor: null,
   faderEditor: null,
   lastImport: null,
@@ -209,19 +212,44 @@ export const useProfileStore = create<ProfileStore>((set, get) => ({
     offerUndo(set, get);
   },
   copyButton: (x, y) => {
+    const page = get().activePage();
+    const hit = page ? faderAt(page, x, y) : null;
+    if (hit) {
+      set({ clipboard: structuredClone(hit.fader), clipboardFaderCut: false });
+      return;
+    }
     const button = get().buttonAt(x, y);
     if (button) {
       const { x: _x, y: _y, ...rest } = button as Button & PadRef;
-      set({ clipboard: structuredClone(rest) });
+      set({ clipboard: structuredClone(rest), clipboardFaderCut: false });
     }
   },
   cutButton: async (x, y) => {
+    const page = get().activePage();
+    const hit = page ? faderAt(page, x, y) : null;
     get().copyButton(x, y);
-    await get().clearButton(x, y);
+    if (hit) {
+      set({ clipboardFaderCut: true });
+      await get().removeFader(hit.fader.id);
+    } else await get().clearButton(x, y);
   },
   pasteButton: async (x, y) => {
     const clip = get().clipboard;
     if (!clip) return;
+    if ("direction" in clip) {
+      const page = get().activePage();
+      if (!page) return;
+      if (!faderFitsAt({ ...clip, id: "" }, x, y, page, useDeviceStore.getState().layout)) {
+        set({ error: i18n.t("grid.faderPasteBlocked") });
+        return;
+      }
+      // A cut retains identity for macro references; copying (or pasting again)
+      // gets a fresh backend id. Undoing the cut must not create duplicate ids.
+      const id = get().clipboardFaderCut && !get().profile?.pages.some((p) => p.faders.some((f) => f.id === clip.id)) ? clip.id : "";
+      const result = await guard(set, () => api.setFader(page.id, { ...structuredClone(clip), id, x, y }));
+      if (result !== null) set({ clipboardFaderCut: false });
+      return;
+    }
     await get().saveButton(x, y, structuredClone(clip));
   },
   moveButton: async (from, to, copy) => {

@@ -318,6 +318,11 @@
   "grid": {
     "editButton": "Edit button…",
     "addButton": "Add button…",
+    "targetHint": "Tab or right-click to target a pad · Arrow keys to move focus",
+    "dragHint": "{{modifier}} + drag to move · Shift + drag to copy",
+    "faderPasteBlocked": "The fader does not fit here. Choose enough empty pads away from other buttons and faders.",
+    "deleteKey": "Del",
+    "deleteShortcut": "Del / Backspace",
     "copy": "Copy",
     "cut": "Cut",
     "paste": "Paste",
