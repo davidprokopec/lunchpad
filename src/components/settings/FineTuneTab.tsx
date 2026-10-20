@@ -39,6 +39,7 @@ export function FineTuneTab() {
       <ol className="list-decimal space-y-2 pl-4 text-xs leading-relaxed text-stage-400"><li>{t("fineTune.install")}</li><li>{t("fineTune.controllerAccess")}</li><li>{t("fineTune.pickApps")}</li></ol>
       <Button size="sm" className="self-start" onClick={() => { void openUrl("https://github.com/ronitsingh10/FineTune").catch((e: unknown) => setError(String(e))); }}>{t("fineTune.download")}</Button>
       <p className="text-xs leading-relaxed text-stage-500">{t("fineTune.buildNote")}</p>
+      {state?.status === "ready" && !state.capabilities?.includes("managedApps") && <p role="status" className="text-xs leading-relaxed text-stage-400">{t("fineTune.updateForInactive")}</p>}
       <div className="rounded-lg border border-warn/20 bg-warn/5 p-3 text-xs leading-relaxed text-stage-300">{t("fineTune.caution")}</div>
     </Section>
     {config.enabled && <>

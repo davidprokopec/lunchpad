@@ -21,7 +21,7 @@ const link: StateLink = { provider: "fineTune", kind: "audioMuted", scene: "", s
 test("FineTune app resolution rejects duplicates, missing/inactive apps and capture denial without PID persistence", () => {
   const live = state();
   expect(fineTuneApp("com.player", live)?.pids).toEqual([123]);
-  expect(fineTuneReason({ type: "app", appId: "absent" }, live)).toBe("notRunning");
+  expect(fineTuneReason({ type: "app", appId: "absent" }, live)).toBe("missingApp");
   live.snapshot!.apps.push({ ...live.snapshot!.apps[0], pids: [456] });
   expect(fineTuneApp("com.player", live)).toBeNull();
   expect(fineTuneReason(target.target, live)).toBe("ambiguous");
