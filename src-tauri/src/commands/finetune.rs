@@ -73,18 +73,17 @@ mod tests {
         assert_eq!(saved.audio.output_device.as_deref(), Some("preserved"));
         assert!(!saved.audio.macos_app_volume);
         assert_eq!(saved.wave_link.port, Some(1888));
-        assert_eq!(
-            fine.state().status,
+        let expected_status = if cfg!(target_os = "macos") {
             crate::finetune::FineTuneStatus::Disconnected
-        );
+        } else {
+            crate::finetune::FineTuneStatus::Unsupported
+        };
+        assert_eq!(fine.state().status, expected_status);
         std::fs::remove_file(dir.join("settings.json")).unwrap();
         std::fs::create_dir(dir.join("settings.json")).unwrap();
         assert!(update(&settings, &fine, FineTuneSettings::default()).is_err());
         assert_eq!(settings.lock().settings.fine_tune, config);
-        assert_eq!(
-            fine.state().status,
-            crate::finetune::FineTuneStatus::Disconnected
-        );
+        assert_eq!(fine.state().status, expected_status);
         fine.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
