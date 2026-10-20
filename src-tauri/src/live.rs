@@ -29,6 +29,7 @@ pub struct LiveStatus {
     /// Devices and apps as the system audio bridge last saw them.
     pub system: SystemAudioState,
     pub wave_link: crate::wavelink::WaveLinkState,
+    pub fine_tune: crate::finetune::FineTuneState,
 }
 
 pub type SharedLive = Arc<Mutex<LiveStatus>>;
@@ -39,6 +40,9 @@ impl LiveStatus {
         target: &crate::profile::AudioTarget,
     ) -> Option<crate::system_audio::TargetState> {
         match target {
+            crate::profile::AudioTarget::FineTune { target } => {
+                crate::system_audio::fine_tune_state(&self.fine_tune, target)
+            }
             crate::profile::AudioTarget::WaveLink { target } => {
                 crate::system_audio::wave_link_state(&self.wave_link, target)
             }
@@ -67,7 +71,7 @@ impl LiveHandle {
                 LinkProvider::Obs => &mut st.obs,
                 LinkProvider::Slobs => &mut st.slobs,
                 // The system audio has its own shape; see `update_system`.
-                LinkProvider::System | LinkProvider::WaveLink => return,
+                LinkProvider::System | LinkProvider::WaveLink | LinkProvider::FineTune => return,
             };
             let before = slot.clone();
             f(slot);
@@ -104,11 +108,57 @@ impl LiveHandle {
             (self.on_change)();
         }
     }
+
+    pub fn update_fine_tune(&self, next: crate::finetune::FineTuneState) {
+        let changed = {
+            let mut live = self.status.lock();
+            if live.fine_tune == next {
+                false
+            } else {
+                live.fine_tune = next;
+                true
+            }
+        };
+        if changed {
+            (self.on_change)();
+        }
+    }
 }
 
 impl StateLink {
     pub fn is_active(&self, live: &LiveStatus) -> bool {
         let p = match self.provider {
+            LinkProvider::FineTune => {
+                use crate::finetune::{FineTuneStatus, FineTuneTarget};
+                let state = &live.fine_tune;
+                if state.status != FineTuneStatus::Ready {
+                    return false;
+                }
+                let Some(crate::profile::AudioTarget::FineTune { target }) = &self.target else {
+                    return false;
+                };
+                if state.target_reason(target).is_some() {
+                    return false;
+                }
+                let Some(snapshot) = state.snapshot.as_ref() else {
+                    return false;
+                };
+                return match (&self.kind, target) {
+                    (LinkKind::AudioMuted, FineTuneTarget::App { app_id }) => {
+                        state.app(app_id).is_ok_and(|app| app.muted)
+                    }
+                    (LinkKind::FineTuneDefaultOutput, FineTuneTarget::Output { device_uid }) => {
+                        snapshot.default_output.as_ref() == Some(device_uid)
+                    }
+                    (LinkKind::FineTunePreferredInput, FineTuneTarget::Input { device_uid }) => {
+                        snapshot.input_policy.preferred_device_uid.as_ref() == Some(device_uid)
+                    }
+                    (LinkKind::FineTuneDefaultInput, FineTuneTarget::Input { device_uid }) => {
+                        snapshot.default_input.as_ref() == Some(device_uid)
+                    }
+                    _ => false,
+                };
+            }
             LinkProvider::WaveLink => {
                 let state = &live.wave_link;
                 if state.status != crate::wavelink::WaveLinkStatus::Ready {
@@ -185,6 +235,9 @@ impl StateLink {
             LinkKind::AudioMuted
             | LinkKind::WaveLinkMainOutput
             | LinkKind::WaveLinkMonitoredMix => false,
+            LinkKind::FineTuneDefaultOutput
+            | LinkKind::FineTunePreferredInput
+            | LinkKind::FineTuneDefaultInput => false,
         }
     }
 }
@@ -192,6 +245,93 @@ impl StateLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fine_tune_links_follow_only_ready_snapshot_visible_targets() {
+        use crate::finetune::*;
+        use crate::profile::AudioTarget;
+        let mut snapshot: FineTuneSnapshot =
+            serde_json::from_value(crate::finetune::tests::snapshot()).unwrap();
+        snapshot.apps[0].muted = true;
+        let mut live = LiveStatus {
+            fine_tune: FineTuneState {
+                status: FineTuneStatus::Ready,
+                snapshot: Some(snapshot),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (kind, target) in [
+            (
+                LinkKind::AudioMuted,
+                FineTuneTarget::App {
+                    app_id: "app".into(),
+                },
+            ),
+            (
+                LinkKind::FineTuneDefaultOutput,
+                FineTuneTarget::Output {
+                    device_uid: "out".into(),
+                },
+            ),
+            (
+                LinkKind::FineTunePreferredInput,
+                FineTuneTarget::Input {
+                    device_uid: "in".into(),
+                },
+            ),
+            (
+                LinkKind::FineTuneDefaultInput,
+                FineTuneTarget::Input {
+                    device_uid: "in".into(),
+                },
+            ),
+        ] {
+            let link = StateLink {
+                provider: LinkProvider::FineTune,
+                kind,
+                target: Some(AudioTarget::FineTune { target }),
+                scene: String::new(),
+                source: String::new(),
+                wave_link_mix_id: None,
+            };
+            assert!(link.is_active(&live));
+            live.fine_tune.status = FineTuneStatus::Disconnected;
+            assert!(!link.is_active(&live));
+            live.fine_tune.status = FineTuneStatus::Ready;
+        }
+        let target = AudioTarget::FineTune {
+            target: FineTuneTarget::App {
+                app_id: "app".into(),
+            },
+        };
+        assert!(live.resolve_audio(&target).unwrap().muted);
+        let snapshot = live.fine_tune.snapshot.as_mut().unwrap();
+        snapshot.apps.push(snapshot.apps[0].clone());
+        assert!(
+            live.resolve_audio(&target).is_none(),
+            "ambiguous apps cannot drive a bound fader"
+        );
+        let snapshot = live.fine_tune.snapshot.as_mut().unwrap();
+        snapshot.devices.clear();
+        let link = StateLink {
+            provider: LinkProvider::FineTune,
+            kind: LinkKind::FineTuneDefaultOutput,
+            target: Some(AudioTarget::FineTune {
+                target: FineTuneTarget::Output {
+                    device_uid: "out".into(),
+                },
+            }),
+            scene: String::new(),
+            source: String::new(),
+            wave_link_mix_id: None,
+        };
+        assert!(
+            !link.is_active(&live),
+            "a UID must still be visible to FineTune"
+        );
+    }
 
     #[test]
     fn wave_link_links_and_faders_require_ready_qualified_state() {

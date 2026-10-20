@@ -506,6 +506,19 @@ pub enum ActionKind {
         output_device_id: String,
         output_id: String,
     },
+    #[serde(rename_all = "camelCase")]
+    FineTuneSetAppRouting {
+        app_id: String,
+        routing: crate::finetune::FineTuneRoutingRequest,
+    },
+    #[serde(rename_all = "camelCase")]
+    FineTuneSetDefaultOutput {
+        device_uid: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    FineTuneSetPreferredInput {
+        device_uid: String,
+    },
     /// Set a discovered mix on a qualified Wave Link output.
     #[serde(rename_all = "camelCase")]
     WaveLinkSetMonitoredMix {

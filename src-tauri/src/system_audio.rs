@@ -194,6 +194,10 @@ pub enum Resolved {
         target: crate::wavelink::WaveLinkTarget,
         generation: u64,
     },
+    FineTune {
+        app_id: String,
+        generation: u64,
+    },
 }
 
 /// A target found in a snapshot, with its state.
@@ -211,7 +215,7 @@ impl SystemAudioState {
     /// The target's state, or `None` while it is not there (or audio is unavailable).
     pub fn resolve(&self, target: &AudioTarget) -> Option<TargetState> {
         match target {
-            AudioTarget::WaveLink { .. } => None,
+            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } => None,
             AudioTarget::Device { device } => {
                 if !self.available {
                     return None;
@@ -323,7 +327,7 @@ pub fn report(status: AudioStatus, state: &SystemAudioState, profile: &Profile) 
                 }
             }
             AudioTarget::Device { .. } => {}
-            AudioTarget::WaveLink { .. } => {}
+            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } => {}
             AudioTarget::App {
                 app: AppRef { id, name },
             } => {
@@ -391,6 +395,7 @@ pub fn saved_targets(profile: &Profile) -> Vec<AudioTarget> {
 
 fn set_muted(port: &dyn AudioControl, key: &Resolved, muted: bool) -> Result<(), String> {
     match key {
+        Resolved::FineTune { .. } => Err("FineTune requires the private writer context".into()),
         Resolved::WaveLink { .. } => Err("Wave Link requires the private writer context".into()),
         Resolved::Device { id, kind } => port.set_device_muted(id, *kind, muted),
         Resolved::App { id } if port.status().can_mute_apps => port.set_app_muted(id, muted),
@@ -414,6 +419,7 @@ fn set_volume(port: &dyn AudioControl, key: &Resolved, volume: f32) -> Result<()
         0.0
     };
     match key {
+        Resolved::FineTune { .. } => Err("FineTune requires the private writer context".into()),
         Resolved::WaveLink { .. } => Err("Wave Link requires the private writer context".into()),
         Resolved::Device { id, kind } => port.set_device_volume(id, *kind, volume),
         Resolved::App { id } if port.status().can_set_app_volume => port.set_app_volume(id, volume),
@@ -444,6 +450,7 @@ fn fresh(port: &dyn AudioControl, target: &AudioTarget) -> Result<TargetState, S
 
 fn describe(target: &AudioTarget) -> String {
     match target {
+        AudioTarget::FineTune { target } => format!("FineTune {target:?}"),
         AudioTarget::WaveLink { target } => format!("Wave Link {target:?}"),
         AudioTarget::Device {
             device: DeviceRef::DefaultInput,
@@ -505,9 +512,34 @@ impl HoldMutes {
 struct Writer {
     port: Arc<dyn AudioControl>,
     wave_link: Option<crate::wavelink::WaveLink>,
+    fine_tune: Option<crate::finetune::FineTune>,
+    fine_fader_completed: Mutex<HashMap<String, Instant>>,
 }
 
 type Job = Box<dyn FnOnce(&Writer) + Send>;
+
+pub(crate) fn fine_tune_state(
+    state: &crate::finetune::FineTuneState,
+    target: &crate::finetune::FineTuneTarget,
+) -> Option<TargetState> {
+    let crate::finetune::FineTuneTarget::App { app_id } = target else {
+        return None;
+    };
+    let app = state.app(app_id).ok()?;
+    let permitted = state.snapshot.as_ref()?.permission.audio_capture
+        == crate::finetune::FineTuneCapturePermission::Authorized;
+    Some(TargetState {
+        key: Resolved::FineTune {
+            app_id: app_id.clone(),
+            generation: state.generation,
+        },
+        volume: app.volume as f32,
+        muted: app.muted,
+        can_mute: permitted,
+        can_set_volume: permitted,
+        emulated: false,
+    })
+}
 
 pub(crate) fn wave_link_state(
     state: &crate::wavelink::WaveLinkState,
@@ -529,7 +561,21 @@ pub(crate) fn wave_link_state(
 
 impl Writer {
     fn fresh(&self, target: &AudioTarget, expected: Option<u64>) -> Result<TargetState, String> {
-        if let AudioTarget::WaveLink { target } = target {
+        if let AudioTarget::FineTune { target } = target {
+            let state = self
+                .fine_tune
+                .as_ref()
+                .ok_or("FineTune is unavailable")?
+                .state();
+            if expected != Some(state.generation) {
+                return Err("FineTune captured session ended".into());
+            }
+            if let Some(reason) = state.target_reason(target) {
+                return Err(reason);
+            }
+            fine_tune_state(&state, target)
+                .ok_or("FineTune target does not support volume/mute".into())
+        } else if let AudioTarget::WaveLink { target } = target {
             let state = self
                 .wave_link
                 .as_ref()
@@ -544,7 +590,15 @@ impl Writer {
         }
     }
     fn set_muted(&self, key: &Resolved, muted: bool) -> Result<(), String> {
-        if let Resolved::WaveLink { target, generation } = key {
+        if let Resolved::FineTune { app_id, generation } = key {
+            self.fine_tune
+                .as_ref()
+                .ok_or("FineTune is unavailable")?
+                .write(
+                    *generation,
+                    crate::finetune::Mutation::Mute(app_id.clone(), muted),
+                )
+        } else if let Resolved::WaveLink { target, generation } = key {
             self.wave_link
                 .as_ref()
                 .ok_or("Wave Link is unavailable")?
@@ -557,7 +611,18 @@ impl Writer {
         }
     }
     fn set_volume(&self, key: &Resolved, volume: f32) -> Result<(), String> {
-        if let Resolved::WaveLink { target, generation } = key {
+        if let Resolved::FineTune { app_id, generation } = key {
+            self.fine_tune
+                .as_ref()
+                .ok_or("FineTune is unavailable")?
+                .write(
+                    *generation,
+                    crate::finetune::Mutation::Volume(
+                        app_id.clone(),
+                        f64::from(volume.clamp(0.0, 1.0)),
+                    ),
+                )
+        } else if let Resolved::WaveLink { target, generation } = key {
             self.wave_link
                 .as_ref()
                 .ok_or("Wave Link is unavailable")?
@@ -577,6 +642,7 @@ impl Writer {
 /// One physical gesture, retained by queued jobs until its release completes.
 pub struct PhysicalMute {
     admission: Result<Option<u64>, String>,
+    target: AudioTarget,
     captured: Mutex<Option<TargetState>>,
     cancelled: std::sync::atomic::AtomicBool,
     invalidated: std::sync::atomic::AtomicBool,
@@ -598,6 +664,19 @@ impl PhysicalMute {
             state.muted
         };
         let current = match &state.key {
+            Resolved::FineTune { app_id, generation } => {
+                let snapshot = writer
+                    .fine_tune
+                    .as_ref()
+                    .ok_or("FineTune is unavailable")?
+                    .state();
+                if snapshot.generation != *generation {
+                    return Err(
+                        "FineTune hold session ended; not restoring into new session".into(),
+                    );
+                }
+                Some(snapshot.app(app_id)?.muted)
+            }
             Resolved::WaveLink { target, generation } => {
                 let snapshot = writer
                     .wave_link
@@ -635,6 +714,8 @@ impl PhysicalMute {
 pub struct SystemAudio {
     port: Arc<dyn AudioControl>,
     wave_link: Option<crate::wavelink::WaveLink>,
+    fine_tune: Option<crate::finetune::FineTune>,
+    fine_faders: Arc<Mutex<HashMap<(String, u64), f32>>>,
     live: SharedLive,
     jobs: Sender<Job>,
     holds: Arc<HoldMutes>,
@@ -652,10 +733,21 @@ impl SystemAudio {
         live: SharedLive,
         wave_link: Option<crate::wavelink::WaveLink>,
     ) -> SystemAudio {
+        Self::with_integrations(port, live, wave_link, None)
+    }
+
+    pub fn with_integrations(
+        port: Arc<dyn AudioControl>,
+        live: SharedLive,
+        wave_link: Option<crate::wavelink::WaveLink>,
+        fine_tune: Option<crate::finetune::FineTune>,
+    ) -> SystemAudio {
         let (jobs, rx) = unbounded::<Job>();
         let worker = Writer {
             port: port.clone(),
             wave_link: wave_link.clone(),
+            fine_tune: fine_tune.clone(),
+            fine_fader_completed: Default::default(),
         };
         if let Err(e) = std::thread::Builder::new()
             .name("lunchpad-audio-write".into())
@@ -670,6 +762,8 @@ impl SystemAudio {
         SystemAudio {
             port,
             wave_link,
+            fine_tune,
+            fine_faders: Default::default(),
             live,
             jobs,
             holds: Arc::new(HoldMutes {
@@ -706,11 +800,40 @@ impl SystemAudio {
     }
 
     fn generation(&self, target: &AudioTarget) -> Result<Option<u64>, String> {
-        if matches!(target, AudioTarget::WaveLink { .. }) {
+        if matches!(target, AudioTarget::FineTune { .. }) {
+            self.fine_tune_generation().map(Some)
+        } else if matches!(target, AudioTarget::WaveLink { .. }) {
             self.wave_link_generation().map(Some)
         } else {
             Ok(None)
         }
+    }
+
+    fn fine_tune_generation(&self) -> Result<u64, String> {
+        let state = self
+            .fine_tune
+            .as_ref()
+            .ok_or("FineTune is unavailable")?
+            .state();
+        if state.status != crate::finetune::FineTuneStatus::Ready {
+            return Err("FineTune is unavailable until synchronization completes".into());
+        }
+        Ok(state.generation)
+    }
+
+    pub(crate) async fn fine_tune_write(
+        &self,
+        mutation: crate::finetune::Mutation,
+    ) -> Result<(), String> {
+        let generation = self.fine_tune_generation()?;
+        self.run_writer(move |writer| {
+            writer
+                .fine_tune
+                .as_ref()
+                .ok_or("FineTune is unavailable")?
+                .write(generation, mutation)
+        })
+        .await
     }
 
     pub fn snapshot(&self) -> SystemAudioState {
@@ -721,6 +844,7 @@ impl SystemAudio {
     pub fn physical_press(&self, target: AudioTarget) -> Arc<PhysicalMute> {
         let press = Arc::new(PhysicalMute {
             admission: self.generation(&target),
+            target: target.clone(),
             captured: Mutex::new(None),
             cancelled: false.into(),
             invalidated: false.into(),
@@ -760,18 +884,24 @@ impl SystemAudio {
         }
         match &press.admission {
             Err(_) => return,
-            Ok(Some(generation)) => match self.wave_link_generation() {
-                Ok(current) if current == *generation => {}
-                _ => {
-                    press
-                        .invalidated
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    tracing::warn!(
-                        "physical Wave Link release ignored: session unavailable or changed"
-                    );
-                    return;
+            Ok(Some(generation)) => {
+                match self.generation(&press.target) {
+                    Ok(Some(current)) if current == *generation => {}
+                    _ => {
+                        press
+                            .invalidated
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        if matches!(press.target, AudioTarget::FineTune { .. }) {
+                            tracing::warn!(
+                                "physical FineTune release ignored: session unavailable or changed"
+                            );
+                        } else {
+                            tracing::warn!("physical Wave Link release ignored: session unavailable or changed");
+                        }
+                        return;
+                    }
                 }
-            },
+            }
             Ok(None) => {}
         }
         self.enqueue(move |port| press.restore(port, tapped));
@@ -862,6 +992,49 @@ impl SystemAudio {
                 return;
             }
         };
+        if let AudioTarget::FineTune {
+            target: crate::finetune::FineTuneTarget::App { app_id },
+        } = &target
+        {
+            let key = (app_id.clone(), generation.unwrap());
+            let mut pending = self.fine_faders.lock();
+            if let Some(latest) = pending.get_mut(&key) {
+                *latest = volume;
+                return;
+            }
+            if pending.len() >= 32 {
+                tracing::warn!("FineTune fader queue is full");
+                return;
+            }
+            pending.insert(key.clone(), volume);
+            let values = self.fine_faders.clone();
+            self.enqueue(move |writer| {
+                let last = writer.fine_fader_completed.lock().get(&key.0).copied();
+                if let Some(last) = last {
+                    if let Some(wait) = Duration::from_millis(40).checked_sub(last.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                let state = writer.fresh(&target, generation).and_then(|state| {
+                    if state.muted && state.can_mute {
+                        writer.set_muted(&state.key, false)?;
+                    }
+                    Ok(state)
+                });
+                let Some(volume) = values.lock().remove(&key) else {
+                    return Ok(());
+                };
+                let state = state?;
+                let result = writer.set_volume(&state.key, volume);
+                // Completion is after wire dispatch, even if the transport was delayed.
+                writer
+                    .fine_fader_completed
+                    .lock()
+                    .insert(key.0, Instant::now());
+                result
+            });
+            return;
+        }
         let job: Job = Box::new(move |writer| {
             let result = writer.fresh(&target, generation).and_then(|state| {
                 if state.muted
@@ -913,6 +1086,11 @@ impl SystemAudio {
         target: AudioTarget,
     ) -> Result<(), String> {
         let holds = self.holds.clone();
+        let integration = if matches!(target, AudioTarget::FineTune { .. }) {
+            "FineTune"
+        } else {
+            "Wave Link"
+        };
         let generation = match self.generation(&target) {
             Ok(generation) => generation,
             Err(error) => {
@@ -949,7 +1127,9 @@ impl SystemAudio {
                 .as_ref()
                 .is_some_and(|invalidated| invalidated.load(std::sync::atomic::Ordering::Acquire))
             {
-                return Err("Wave Link hold press was invalidated by its release".into());
+                return Err(format!(
+                    "{integration} hold press was invalidated by its release"
+                ));
             }
             let state = writer.fresh(&target, generation);
             let captured = state.as_ref().ok().cloned();
@@ -962,7 +1142,9 @@ impl SystemAudio {
                             .as_ref()
                             .is_some_and(|current| Arc::ptr_eq(current, invalidated))
                 }) else {
-                    return Err("Wave Link hold ownership ended before the press".into());
+                    return Err(format!(
+                        "{integration} hold ownership ended before the press"
+                    ));
                 };
                 slot.captured = captured;
                 slot.pending = false;
@@ -985,7 +1167,9 @@ impl SystemAudio {
                 if wave_press.as_ref().is_some_and(|invalidated| {
                     invalidated.load(std::sync::atomic::Ordering::Acquire)
                 }) {
-                    return Err("Wave Link hold press was invalidated by its release".into());
+                    return Err(format!(
+                        "{integration} hold press was invalidated by its release"
+                    ));
                 }
                 writer.set_muted(&state.key, true)
             }
@@ -1038,14 +1222,23 @@ impl SystemAudio {
             captured.muted
         };
         let generation = match captured.key {
-            Resolved::WaveLink { generation, .. } => Some(generation),
+            Resolved::WaveLink { generation, .. } | Resolved::FineTune { generation, .. } => {
+                Some(generation)
+            }
             _ => None,
+        };
+        let integration = if matches!(target, AudioTarget::FineTune { .. }) {
+            "FineTune"
+        } else {
+            "Wave Link"
         };
         let admission = self.generation(&target).and_then(|current| {
             if current == generation {
                 Ok(())
             } else {
-                Err("Wave Link hold session ended; not restoring into new session".into())
+                Err(format!(
+                    "{integration} hold session ended; not restoring into new session"
+                ))
             }
         });
         if let Err(error) = admission {
@@ -1275,6 +1468,295 @@ impl AudioControl for FakeAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fine_target() -> AudioTarget {
+        AudioTarget::FineTune {
+            target: crate::finetune::FineTuneTarget::App {
+                app_id: "app".into(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    async fn fine_writer_barrier(
+        audio: &SystemAudio,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<(), String>>,
+    ) {
+        let (entered, barrier) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let writer = audio.clone();
+        let job = tokio::spawn(async move {
+            writer
+                .run(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        barrier.await.unwrap();
+        (release, job)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_ready_admission_rejects_all_jobs_before_fifo() {
+        use crate::finetune::{
+            tests::{until, Fixture},
+            FineTuneStatus, Mutation,
+        };
+        let fixture = Fixture::new().await;
+        let fine = fixture.start(true);
+        let mut peer = fixture.accept().await;
+        peer.hello().await;
+        let subscribe = peer.request().await;
+        until(&fine, |state| state.status == FineTuneStatus::Synchronizing).await;
+        let live = SharedLive::default();
+        live.lock().fine_tune = crate::finetune::FineTuneState {
+            status: FineTuneStatus::Ready,
+            ..fine.state()
+        };
+        let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+        let audio = SystemAudio::with_integrations(fake.clone(), live, None, Some(fine.clone()));
+        let (release, job) = fine_writer_barrier(&audio).await;
+        assert!(audio
+            .apply(fine_target(), SetAudioMode::Mute, 50.0)
+            .await
+            .is_err());
+        assert!(audio
+            .fine_tune_write(Mutation::DefaultOutput("out".into()))
+            .await
+            .is_err());
+        assert!(audio
+            .fine_tune_write(Mutation::PreferredInput("in".into()))
+            .await
+            .is_err());
+        assert!(audio
+            .fine_tune_write(Mutation::Routing(
+                "app".into(),
+                crate::finetune::FineTuneRoutingRequest::FollowDefault
+            ))
+            .await
+            .is_err());
+        let key = ("page".into(), 0, 0);
+        let down = Some(Instant::now());
+        assert!(audio
+            .hold_press(key.clone(), down, fine_target())
+            .await
+            .is_err());
+        assert!(audio
+            .hold_release(key, down, true, fine_target())
+            .await
+            .is_err());
+        let press = audio.physical_press(fine_target());
+        audio.physical_release(press, true);
+        audio.set_level(fine_target(), 0.3);
+        assert_eq!(audio.jobs.len(), 0);
+        peer.snapshot_reply(&subscribe).await;
+        until(&fine, |state| state.status == FineTuneStatus::Ready).await;
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        audio.run(|_| Ok(())).await.unwrap();
+        fine.refresh();
+        peer.getter().await;
+        assert!(fake.writes().is_empty());
+        fine.shutdown();
+        peer.closed().await;
+    }
+
+    #[cfg(unix)]
+    async fn fine_rejected_release(general: bool, cancel: bool) {
+        use crate::finetune::tests::Fixture;
+        let fixture = Fixture::new().await;
+        let fine = fixture.start(true);
+        let mut peer = fixture.ready(&fine).await;
+        let live = SharedLive::default();
+        live.lock().fine_tune = fine.state();
+        let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+        let audio = SystemAudio::with_integrations(fake.clone(), live, None, Some(fine.clone()));
+        let (release, job) = fine_writer_barrier(&audio).await;
+        let key = ("page".into(), 0, 0);
+        let down = Some(Instant::now());
+        let mut general_press = Box::pin(audio.hold_press(key.clone(), down, fine_target()));
+        let physical = if general {
+            assert!(futures_util::poll!(&mut general_press).is_pending());
+            None
+        } else {
+            Some(audio.physical_press(fine_target()))
+        };
+        assert_eq!(audio.jobs.len(), 1);
+        fine.disconnect();
+        peer.closed().await;
+        if general {
+            assert!(audio
+                .hold_release(key, down, false, fine_target())
+                .await
+                .is_err());
+        } else if cancel {
+            audio.cancel_physical();
+        } else {
+            audio.physical_release(physical.unwrap(), false);
+        }
+        assert_eq!(audio.jobs.len(), 1, "unavailable releases must not enqueue");
+        fine.connect();
+        let mut peer = fixture.ready_session(&fine, "replacement").await;
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        if general {
+            assert!(general_press.await.unwrap_err().contains("invalidated"));
+        }
+        audio.run(|_| Ok(())).await.unwrap();
+        fine.refresh();
+        peer.getter().await;
+        assert!(!fine.state().app("app").unwrap().muted);
+        assert!(fake.writes().is_empty());
+        fine.shutdown();
+        peer.closed().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_rejected_physical_release_invalidates_pending_press() {
+        fine_rejected_release(false, false).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_rejected_cancel_invalidates_pending_press() {
+        fine_rejected_release(false, true).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_rejected_general_release_invalidates_pending_press() {
+        fine_rejected_release(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_general_release_waits_for_pending_press_and_restores() {
+        let fixture = crate::finetune::tests::Fixture::new().await;
+        let fine = fixture.start(true);
+        let mut peer = fixture.ready(&fine).await;
+        let audio = SystemAudio::with_integrations(
+            Arc::new(NoAudio),
+            SharedLive::default(),
+            None,
+            Some(fine.clone()),
+        );
+        let (release, job) = fine_writer_barrier(&audio).await;
+        let key = ("page".into(), 0, 0);
+        let down = Some(Instant::now());
+        let press = audio.hold_press(key.clone(), down, fine_target());
+        let up = audio.hold_release(key, down, false, fine_target());
+        tokio::pin!(press, up);
+        assert!(futures_util::poll!(&mut press).is_pending());
+        assert!(futures_util::poll!(&mut up).is_pending());
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        let (pressed, released, ()) = tokio::join!(press, up, async {
+            peer.mutation_readback(true).await;
+            peer.mutation_readback(false).await;
+        });
+        pressed.unwrap();
+        released.unwrap();
+        assert!(audio.holds.slots.lock().is_empty());
+        fine.shutdown();
+        peer.closed().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_faders_coalesce_latest_values_and_rate_limit_per_target() {
+        use serde_json::json;
+        let fixture = crate::finetune::tests::Fixture::new().await;
+        let fine = fixture.start(true);
+        let mut peer = fixture.ready(&fine).await;
+        let audio = SystemAudio::with_integrations(
+            Arc::new(NoAudio),
+            SharedLive::default(),
+            None,
+            Some(fine.clone()),
+        );
+        let (release, job) = fine_writer_barrier(&audio).await;
+        for value in 0..100 {
+            audio.set_level(fine_target(), value as f32 / 100.0);
+        }
+        assert_eq!(audio.jobs.len(), 1);
+        assert_eq!(audio.fine_faders.lock().len(), 1);
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        let first = peer.request().await;
+        let first_received = Instant::now();
+        assert_eq!(first["method"], "setAppVolume");
+        assert!((first["params"]["volume"].as_f64().unwrap() - 0.99).abs() < 0.0001);
+        for value in 0..60 {
+            audio.set_level(fine_target(), value as f32 / 100.0);
+        }
+        assert_eq!(audio.jobs.len(), 1);
+        peer.reply(&first, json!({"accepted":true})).await;
+        let getter = peer.request().await;
+        assert_eq!(getter["method"], "getState");
+        peer.snapshot_reply(&getter).await;
+        let second = peer.request().await;
+        assert_eq!(second["method"], "setAppVolume");
+        assert!((second["params"]["volume"].as_f64().unwrap() - 0.59).abs() < 0.0001);
+        assert!(first_received.elapsed() >= Duration::from_millis(40));
+        peer.reply(&second, json!({"accepted":true})).await;
+        let getter = peer.request().await;
+        peer.snapshot_reply(&getter).await;
+        audio.run(|_| Ok(())).await.unwrap();
+        assert!(audio.fine_faders.lock().is_empty());
+        fine.refresh();
+        peer.getter().await;
+        fine.shutdown();
+        peer.closed().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fine_tune_muted_fader_keeps_latest_value_while_unmute_is_pending() {
+        use serde_json::json;
+        let fixture = crate::finetune::tests::Fixture::new().await;
+        let fine = fixture.start(true);
+        let mut peer = fixture.ready(&fine).await;
+        peer.snapshot["apps"][0]["muted"] = json!(true);
+        peer.revision += 1;
+        peer.event().await;
+        crate::finetune::tests::until(&fine, |state| state.app("app").is_ok_and(|app| app.muted))
+            .await;
+        let audio = SystemAudio::with_integrations(
+            Arc::new(NoAudio),
+            SharedLive::default(),
+            None,
+            Some(fine.clone()),
+        );
+        audio.set_level(fine_target(), 0.1);
+        let unmute = peer.request().await;
+        assert_eq!(unmute["method"], "setAppMute");
+        assert_eq!(unmute["params"]["muted"], false);
+        audio.set_level(fine_target(), 0.9);
+        assert_eq!(
+            audio.jobs.len(),
+            0,
+            "updates coalesce into the in-progress unmute's fader job"
+        );
+        peer.reply(&unmute, json!({"accepted":true})).await;
+        let readback = peer.request().await;
+        peer.snapshot["apps"][0]["muted"] = json!(false);
+        peer.revision += 1;
+        peer.snapshot_reply(&readback).await;
+        let volume = peer.request().await;
+        assert_eq!(volume["method"], "setAppVolume");
+        assert!((volume["params"]["volume"].as_f64().unwrap() - 0.9).abs() < 0.0001);
+        peer.reply(&volume, json!({"accepted":true})).await;
+        peer.getter().await;
+        audio.run(|_| Ok(())).await.unwrap();
+        fine.refresh();
+        peer.getter().await;
+        fine.shutdown();
+        peer.closed().await;
+    }
 
     async fn unavailable_wave_link_admission(resync: bool) {
         use crate::wavelink::{

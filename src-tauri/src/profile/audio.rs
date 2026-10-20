@@ -65,6 +65,9 @@ pub enum AudioTarget {
     WaveLink {
         target: crate::wavelink::WaveLinkTarget,
     },
+    FineTune {
+        target: crate::finetune::FineTuneTarget,
+    },
 }
 
 #[cfg(test)]

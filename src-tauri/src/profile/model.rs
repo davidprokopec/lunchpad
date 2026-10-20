@@ -501,6 +501,7 @@ pub enum LinkProvider {
     /// The system's audio (devices and apps), see `StateLink::target`
     System,
     WaveLink,
+    FineTune,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,6 +520,9 @@ pub enum LinkKind {
     AudioMuted,
     WaveLinkMainOutput,
     WaveLinkMonitoredMix,
+    FineTuneDefaultOutput,
+    FineTunePreferredInput,
+    FineTuneDefaultInput,
 }
 
 /// "Active while …" binding of a button to the state of OBS, Streamlabs or the system audio.

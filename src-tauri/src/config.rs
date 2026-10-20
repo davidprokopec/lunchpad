@@ -84,6 +84,22 @@ impl WaveLinkSettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FineTuneSettings {
+    pub enabled: bool,
+    pub auto_connect: bool,
+}
+
+impl Default for FineTuneSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_connect: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObsSettings {
@@ -211,6 +227,8 @@ pub struct Settings {
     #[serde(default)]
     pub wave_link: WaveLinkSettings,
     #[serde(default)]
+    pub fine_tune: FineTuneSettings,
+    #[serde(default)]
     pub obs: ObsSettings,
     #[serde(default)]
     pub slobs: SlobsSettings,
@@ -247,6 +265,7 @@ impl Default for Settings {
             push_to_talk: PushToTalkSettings::default(),
             audio: AudioSettings::default(),
             wave_link: WaveLinkSettings::default(),
+            fine_tune: FineTuneSettings::default(),
             obs: ObsSettings::default(),
             slobs: SlobsSettings::default(),
             home_assistant: HomeAssistantSettings::default(),

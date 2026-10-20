@@ -359,6 +359,47 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                 None => report(action, "System volume", crate::system_volume::apply(*target, *mode, amount, device.as_deref()).await),
             }
         }
+        ActionKind::FineTuneSetAppRouting { app_id, routing } => {
+            let Some(audio) = services.system_audio.as_ref() else {
+                return unavailable(action);
+            };
+            report(
+                action,
+                "FineTune",
+                audio
+                    .fine_tune_write(crate::finetune::Mutation::Routing(
+                        app_id.clone(),
+                        routing.clone(),
+                    ))
+                    .await,
+            );
+        }
+        ActionKind::FineTuneSetDefaultOutput { device_uid } => {
+            let Some(audio) = services.system_audio.as_ref() else {
+                return unavailable(action);
+            };
+            report(
+                action,
+                "FineTune",
+                audio
+                    .fine_tune_write(crate::finetune::Mutation::DefaultOutput(device_uid.clone()))
+                    .await,
+            );
+        }
+        ActionKind::FineTuneSetPreferredInput { device_uid } => {
+            let Some(audio) = services.system_audio.as_ref() else {
+                return unavailable(action);
+            };
+            report(
+                action,
+                "FineTune",
+                audio
+                    .fine_tune_write(crate::finetune::Mutation::PreferredInput(
+                        device_uid.clone(),
+                    ))
+                    .await,
+            );
+        }
         ActionKind::WaveLinkSetMainOutput {
             output_device_id,
             output_id,

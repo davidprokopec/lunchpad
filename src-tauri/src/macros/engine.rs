@@ -578,7 +578,10 @@ impl MacroEngine {
         };
         for (page_id, fader) in bound {
             let Some(target) = &fader.bound else { continue };
-            let resolved = if matches!(target, AudioTarget::WaveLink { .. }) {
+            let resolved = if matches!(
+                target,
+                AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. }
+            ) {
                 self.inner
                     .services
                     .system_audio
@@ -640,6 +643,7 @@ impl MacroEngine {
                             AudioTarget::App { app } => sa.snapshot().apps.iter().any(|a| a.id == app.id && a.present),
                             AudioTarget::Device { .. } => sa.cached(target).is_some(),
                             AudioTarget::WaveLink { .. } => sa.cached(target).is_some(),
+                            AudioTarget::FineTune { .. } => sa.cached(target).is_some(),
                         }),
                         can_set_volume = self.inner.services.system_audio.as_ref().is_some_and(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)),
                         reason = "audio service missing, target unresolved/not present, or volume capability unavailable",
@@ -1687,6 +1691,9 @@ pub(super) async fn execute(ctx: &RunContext, action: &Action) {
         | ActionKind::SetSystemVolume { .. }
         | ActionKind::SetAudio { .. }
         | ActionKind::WaveLinkSetMainOutput { .. }
+        | ActionKind::FineTuneSetAppRouting { .. }
+        | ActionKind::FineTuneSetDefaultOutput { .. }
+        | ActionKind::FineTuneSetPreferredInput { .. }
         | ActionKind::WaveLinkSetMonitoredMix { .. }
         | ActionKind::StopAllSounds
         | ActionKind::SetAudioDevice { .. }
@@ -3192,6 +3199,167 @@ mod tests {
                 assert_eq!(mic_state(&r.fake).0, muted, "two taps starting muted={muted}");
                 assert_eq!(r.fake.writes(), vec![FakeWrite::Muted("mic".into(), !muted), FakeWrite::Muted("mic".into(), muted)]);
             }
+        }
+
+        #[cfg(unix)]
+        fn fine_target() -> AudioTarget {
+            AudioTarget::FineTune {
+                target: crate::finetune::FineTuneTarget::App {
+                    app_id: "app".into(),
+                },
+            }
+        }
+
+        #[cfg(unix)]
+        fn fine_rig(fine: &crate::finetune::FineTune) -> (Rig, crate::finetune::FineTuneBridge) {
+            let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+            let live: SharedLive = Default::default();
+            live.lock().fine_tune = fine.state();
+            let audio = SystemAudio::with_integrations(
+                fake.clone(),
+                live.clone(),
+                None,
+                Some(fine.clone()),
+            );
+            let dir =
+                std::env::temp_dir().join(format!("lunchpad-fine-engine-{}", uuid::Uuid::new_v4()));
+            let profile: SharedProfile = Arc::new(Mutex::new(ProfileStore::load(&dir)));
+            let services = Services {
+                system_audio: Some(audio.clone()),
+                ..Default::default()
+            };
+            let engine = MacroEngine::new(
+                profile.clone(),
+                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(NullSink),
+                services,
+                Handle::current(),
+            );
+            let bridge = Bridge {
+                audio,
+                live: LiveHandle::new(live, Arc::new(|| {})),
+                engine: engine.clone(),
+                profile: profile.clone(),
+                app: None,
+            };
+            bridge.refresh();
+            set_button(
+                &profile,
+                3,
+                3,
+                vec![hold_audio(fine_target())],
+                vec![hold_audio(fine_target())],
+                false,
+            );
+            let fine_bridge = crate::finetune::FineTuneBridge::spawn(
+                fine,
+                bridge.live.clone(),
+                engine.clone(),
+                bridge.audio.clone(),
+                None,
+            );
+            (
+                Rig {
+                    engine,
+                    profile,
+                    fake,
+                    bridge,
+                },
+                fine_bridge,
+            )
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_canonical_rapid_taps_use_physical_order_and_snapshot_readback() {
+            let fixture = crate::finetune::tests::Fixture::new().await;
+            let fine = fixture.start(true);
+            let mut peer = fixture.ready(&fine).await;
+            let (r, _bridge) = fine_rig(&fine);
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, true);
+            input(&r.engine, false);
+            input(&r.engine, true);
+            input(&r.engine, false);
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            tokio::join!(finish_input(&r), async {
+                peer.mutation_readback(true).await;
+                peer.mutation_readback(false).await;
+            });
+            assert!(!fine.state().app("app").unwrap().muted);
+            assert!(r.fake.writes().is_empty());
+            fine.shutdown();
+            peer.closed().await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_canonical_hold_page_change_and_cancel_restore_original_state() {
+            for cancel in [false, true] {
+                let fixture = crate::finetune::tests::Fixture::new().await;
+                let fine = fixture.start(true);
+                let mut peer = fixture.ready(&fine).await;
+                let (r, _bridge) = fine_rig(&fine);
+                let (release, done) = block_writer(&r.bridge.audio).await;
+                let down = Instant::now();
+                *r.engine.inner.input_clock.lock() = Some(down);
+                input(&r.engine, true);
+                r.profile
+                    .lock()
+                    .profile
+                    .pages
+                    .push(crate::profile::Page::new("other", "Other"));
+                r.profile.lock().profile.active_page = "other".into();
+                *r.engine.inner.input_clock.lock() = Some(down + Duration::from_millis(800));
+                input(&r.engine, false);
+                if cancel {
+                    r.engine.stop_all();
+                }
+                release.send(()).unwrap();
+                done.await.unwrap().unwrap();
+                tokio::join!(finish_input(&r), async {
+                    peer.mutation_readback(true).await;
+                    peer.mutation_readback(false).await;
+                });
+                assert!(!fine.state().app("app").unwrap().muted);
+                assert!(r.fake.writes().is_empty());
+                fine.shutdown();
+                peer.closed().await;
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn fine_tune_old_session_restore_is_rejected_and_fader_follow_never_writes_back() {
+            let fixture = crate::finetune::tests::Fixture::new().await;
+            let fine = fixture.start(true);
+            let mut peer = fixture.ready(&fine).await;
+            let (r, _bridge) = fine_rig(&fine);
+            input(&r.engine, true);
+            tokio::join!(finish_input(&r), peer.mutation_readback(true));
+            let (release, done) = block_writer(&r.bridge.audio).await;
+            input(&r.engine, false);
+            fine.disconnect();
+            peer.closed().await;
+            fine.connect();
+            let mut peer = fixture.ready_session(&fine, "replacement").await;
+            release.send(()).unwrap();
+            done.await.unwrap().unwrap();
+            finish_input(&r).await;
+            // Explicitly reconcile the current authoritative snapshot; bridge scheduling
+            // is not a synchronization primitive for profile assertions.
+            r.bridge.live.update_fine_tune(fine.state());
+            bound_fader(&r.profile, fine_target());
+            r.engine.reconcile_audio_bindings();
+            assert!((fader_value(&r.profile) - 70.0).abs() < 0.001);
+            r.bridge.audio.run(|_| Ok(())).await.unwrap();
+            assert!(!r.engine.globals().contains_key("runs"));
+            fine.refresh();
+            peer.getter().await;
+            assert!(r.fake.writes().is_empty());
+            fine.shutdown();
+            peer.closed().await;
         }
 
         fn wave_target() -> AudioTarget {

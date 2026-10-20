@@ -4,6 +4,7 @@ pub mod debug;
 pub mod desktop;
 pub mod device;
 pub mod diagnostics;
+pub mod finetune;
 pub mod hub;
 pub mod macros;
 pub mod media;
@@ -41,6 +42,8 @@ pub struct AppState {
     pub audio_settings_write: tokio::sync::Mutex<()>,
     pub wave_link: crate::wavelink::WaveLink,
     pub wave_link_bridge: Mutex<Option<crate::wavelink::WaveLinkBridge>>,
+    pub fine_tune: crate::finetune::FineTune,
+    pub fine_tune_bridge: Mutex<Option<crate::finetune::FineTuneBridge>>,
     /// Profiles before each edit made from the UI, newest last (undo).
     pub history: Mutex<Vec<crate::profile::Profile>>,
     /// Profiles undone, newest last (redo); cleared by the next edit.
@@ -57,6 +60,7 @@ pub use debug::*;
 pub use desktop::*;
 pub use device::*;
 pub use diagnostics::*;
+pub use finetune::*;
 pub use hub::*;
 pub use macros::*;
 pub use media::*;

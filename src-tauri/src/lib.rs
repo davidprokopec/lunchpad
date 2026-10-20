@@ -13,6 +13,7 @@ mod commands;
 pub mod config;
 pub mod debug;
 pub mod desktop;
+pub mod finetune;
 pub mod http;
 pub mod input;
 pub mod live;
@@ -264,10 +265,12 @@ pub fn run() {
             let macos_taps = settings.lock().settings.audio.macos_app_volume;
             let sysaudio = sysaudio::SystemAudio::start_in(sysaudio::Options { macos_taps }, &config_dir);
             let wave_link = wavelink::WaveLink::start(settings.lock().settings.wave_link.clone());
-            let system_audio = system_audio::SystemAudio::with_wave_link(
+            let fine_tune = finetune::FineTune::start(settings.lock().settings.fine_tune.clone());
+            let system_audio = system_audio::SystemAudio::with_integrations(
                 Arc::new(system_audio_adapter::NativeAudio::new(sysaudio.clone())),
                 shared_live.clone(),
                 Some(wave_link.clone()),
+                Some(fine_tune.clone()),
             );
             // State-linked button colours: repaint the LEDs whenever OBS / Streamlabs / the system audio change.
             let live = {
@@ -336,6 +339,13 @@ pub fn run() {
                 system_audio.clone(),
                 Some(app.handle().clone()),
             );
+            let fine_tune_bridge = finetune::FineTuneBridge::spawn(
+                &fine_tune,
+                live.clone(),
+                engine.clone(),
+                system_audio.clone(),
+                Some(app.handle().clone()),
+            );
             let audio_bridge = system_audio_bridge::Bridge { audio: system_audio.clone(), live, engine: engine.clone(), profile: profile.clone(), app: Some(app.handle().clone()) }.spawn();
 
             let window_settings = settings.lock().settings.window.clone();
@@ -357,6 +367,8 @@ pub fn run() {
                 audio_settings_write: tokio::sync::Mutex::new(()),
                 wave_link,
                 wave_link_bridge: Mutex::new(Some(wave_link_bridge)),
+                fine_tune,
+                fine_tune_bridge: Mutex::new(Some(fine_tune_bridge)),
                 history: Mutex::new(Vec::new()),
                 redo: Mutex::new(Vec::new()),
             });
@@ -453,6 +465,11 @@ pub fn run() {
             wave_link_disconnect,
             wave_link_refresh,
             set_wave_link_settings,
+            fine_tune_state,
+            fine_tune_connect,
+            fine_tune_disconnect,
+            fine_tune_refresh,
+            set_fine_tune_settings,
             audio_list_devices,
             audio_list_apps,
             audio_status,
@@ -525,6 +542,8 @@ pub fn run() {
                 app.state::<AppState>().sysaudio.shutdown();
                 app.state::<AppState>().wave_link.shutdown();
                 app.state::<AppState>().wave_link_bridge.lock().take();
+                app.state::<AppState>().fine_tune.shutdown();
+                app.state::<AppState>().fine_tune_bridge.lock().take();
                 app.state::<AppState>().audio_bridge.lock().take();
             }
             // macOS: clicking the dock icon while the window is hidden brings it back.
