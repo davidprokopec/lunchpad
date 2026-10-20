@@ -556,6 +556,7 @@ impl Writer {
 
 /// One physical gesture, retained by queued jobs until its release completes.
 pub struct PhysicalMute {
+    admission: Result<Option<u64>, String>,
     captured: Mutex<Option<TargetState>>,
     cancelled: std::sync::atomic::AtomicBool,
 }
@@ -668,11 +669,23 @@ impl SystemAudio {
         self.live.lock().resolve_audio(target)
     }
 
-    fn generation(&self, target: &AudioTarget) -> Option<u64> {
+    fn wave_link_generation(&self) -> Result<u64, String> {
+        let state = self
+            .wave_link
+            .as_ref()
+            .ok_or("Wave Link is unavailable")?
+            .state();
+        if state.status != crate::wavelink::WaveLinkStatus::Ready {
+            return Err("Wave Link is unavailable until synchronization completes".into());
+        }
+        Ok(state.generation)
+    }
+
+    fn generation(&self, target: &AudioTarget) -> Result<Option<u64>, String> {
         if matches!(target, AudioTarget::WaveLink { .. }) {
-            Some(self.live.lock().wave_link.generation)
+            self.wave_link_generation().map(Some)
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -683,14 +696,21 @@ impl SystemAudio {
     /// Enqueue at input dispatch, not from an independently scheduled macro runner.
     pub fn physical_press(&self, target: AudioTarget) -> Arc<PhysicalMute> {
         let press = Arc::new(PhysicalMute {
+            admission: self.generation(&target),
             captured: Mutex::new(None),
             cancelled: false.into(),
         });
+        let generation = match &press.admission {
+            Ok(generation) => *generation,
+            Err(error) => {
+                tracing::warn!(%error, "physical audio press ignored at admission");
+                return press;
+            }
+        };
         let mut physical = self.physical.lock();
         physical.retain(|p| p.strong_count() != 0);
         physical.push(Arc::downgrade(&press));
         let job = press.clone();
-        let generation = self.generation(&target);
         self.enqueue(move |writer| {
             let state = writer.fresh(&target, generation)?;
             *job.captured.lock() = Some(state.clone());
@@ -704,6 +724,19 @@ impl SystemAudio {
     }
 
     pub fn physical_release(&self, press: Arc<PhysicalMute>, tapped: bool) {
+        match &press.admission {
+            Err(_) => return,
+            Ok(Some(generation)) => match self.wave_link_generation() {
+                Ok(current) if current == *generation => {}
+                _ => {
+                    tracing::warn!(
+                        "physical Wave Link release ignored: session unavailable or changed"
+                    );
+                    return;
+                }
+            },
+            Ok(None) => {}
+        }
         self.enqueue(move |port| press.restore(port, tapped));
     }
 
@@ -768,11 +801,7 @@ impl SystemAudio {
         output: crate::wavelink::WaveLinkMainOutput,
         mix_id: Option<String>,
     ) -> Result<(), String> {
-        let generation = self
-            .wave_link
-            .as_ref()
-            .map(|wave| wave.state().generation)
-            .ok_or("Wave Link is unavailable")?;
+        let generation = self.wave_link_generation()?;
         self.run_writer(move |writer| {
             let mutation = match mix_id {
                 Some(mix) => crate::wavelink::Mutation::MonitoredMix(output, mix),
@@ -789,7 +818,13 @@ impl SystemAudio {
 
     /// A fader's level (0..1) from a press: unmutes a muted target first, then sets the volume.
     pub fn set_level(&self, target: AudioTarget, volume: f32) {
-        let generation = self.generation(&target);
+        let generation = match self.generation(&target) {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::warn!(%error, "audio fader ignored at admission");
+                return;
+            }
+        };
         let job: Job = Box::new(move |writer| {
             let result = writer.fresh(&target, generation).and_then(|state| {
                 if state.muted
@@ -815,7 +850,7 @@ impl SystemAudio {
         mode: SetAudioMode,
         amount: f32,
     ) -> Result<(), String> {
-        let generation = self.generation(&target);
+        let generation = self.generation(&target)?;
         self.run_writer(move |writer| {
             let state = writer.fresh(&target, generation)?;
             match mode {
@@ -841,7 +876,20 @@ impl SystemAudio {
         target: AudioTarget,
     ) -> Result<(), String> {
         let holds = self.holds.clone();
-        let generation = self.generation(&target);
+        let generation = match self.generation(&target) {
+            Ok(generation) => generation,
+            Err(error) => {
+                holds.slots.lock().insert(
+                    key,
+                    HoldSlot {
+                        down,
+                        captured: None,
+                    },
+                );
+                holds.stored.send_modify(|n| *n = n.wrapping_add(1));
+                return Err(error);
+            }
+        };
         self.run_writer(move |writer| {
             let state = writer.fresh(&target, generation);
             let captured = state.as_ref().ok().cloned();
@@ -866,6 +914,7 @@ impl SystemAudio {
         tapped: bool,
         target: AudioTarget,
     ) -> Result<(), String> {
+        self.generation(&target)?;
         let mut stored = self.holds.stored.subscribe();
         let deadline = tokio::time::Instant::now() + HOLD_SLOT_WAIT;
         let captured = loop {
@@ -896,6 +945,9 @@ impl SystemAudio {
             Resolved::WaveLink { generation, .. } => Some(generation),
             _ => None,
         };
+        if self.generation(&target)? != generation {
+            return Err("Wave Link hold session ended; not restoring into new session".into());
+        }
         self.run_writer(move |writer| {
             let state = writer.fresh(&target, generation)?;
             if state.muted == wanted {
@@ -1117,6 +1169,149 @@ impl AudioControl for FakeAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn unavailable_wave_link_admission(resync: bool) {
+        use crate::wavelink::{
+            tests::{catalog, until, Fixture},
+            WaveLinkMainOutput, WaveLinkStatus, WaveLinkTarget,
+        };
+        use serde_json::json;
+        use std::task::Poll;
+
+        let fixture = Fixture::new().await;
+        let wave = fixture.start(true);
+        let (mut peer, held) = if resync {
+            let mut peer = fixture.ready(&wave).await;
+            let handle = wave.clone();
+            let generation = wave.state().generation;
+            let failed = tokio::task::spawn_blocking(move || {
+                handle.write(
+                    generation,
+                    crate::wavelink::Mutation::Mute(
+                        WaveLinkTarget::Channel {
+                            channel_id: "channel".into(),
+                        },
+                        true,
+                    ),
+                )
+            });
+            let setter = peer.request().await;
+            assert_eq!(setter["method"], "setChannel");
+            peer.send(json!({"jsonrpc":"2.0","id":setter["id"],"error":{"code":-32601,"message":"fixture unsupported"}})).await;
+            assert!(failed.await.unwrap().is_err());
+            let held = peer.request().await;
+            assert_eq!(held["method"], "getChannels");
+            (peer, vec![held])
+        } else {
+            let mut peer = fixture.accept().await;
+            let identify = peer.request().await;
+            peer.reply(&identify, json!({"name":"fixture","operatingSystem":"mac","appID":"EWL","interfaceRevision":2})).await;
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                held.push(peer.request().await);
+            }
+            (peer, held)
+        };
+        let state = until(&wave, |state| state.status == WaveLinkStatus::Synchronizing).await;
+        let generation = state.generation;
+        let live = SharedLive::default();
+        // Deliberately stale Ready live cache: admission must consult the handle.
+        live.lock().wave_link = crate::wavelink::WaveLinkState {
+            status: WaveLinkStatus::Ready,
+            ..state
+        };
+        let fake = Arc::new(FakeAudio::new(vec![], vec![]));
+        let audio = SystemAudio::with_wave_link(fake.clone(), live, Some(wave.clone()));
+        let (entered, barrier) = oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let writer = audio.clone();
+        let blocked_job = tokio::spawn(async move {
+            writer
+                .run(move |_| {
+                    let _ = entered.send(());
+                    blocked.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        barrier.await.unwrap();
+        let target = AudioTarget::WaveLink {
+            target: WaveLinkTarget::Channel {
+                channel_id: "channel".into(),
+            },
+        };
+        let output = WaveLinkMainOutput {
+            output_device_id: "outA".into(),
+            output_id: "same".into(),
+        };
+        let apply = audio.apply(target.clone(), SetAudioMode::Mute, 0.0);
+        let routing = audio.wave_link_output(output.clone(), None);
+        let monitored = audio.wave_link_output(output, Some("mix".into()));
+        let key = ("page".into(), 0, 0);
+        let down = Some(Instant::now());
+        let hold = audio.hold_press(key.clone(), down, target.clone());
+        tokio::pin!(apply, routing, monitored, hold);
+        for result in [
+            futures_util::poll!(&mut apply),
+            futures_util::poll!(&mut routing),
+            futures_util::poll!(&mut monitored),
+            futures_util::poll!(&mut hold),
+        ] {
+            assert!(
+                matches!(result, Poll::Ready(Err(ref error)) if error.contains("unavailable")),
+                "unavailable actions must reject before the blocked FIFO: {result:?}"
+            );
+        }
+        let press = audio.physical_press(target.clone());
+        audio.physical_release(press, true);
+        audio.set_level(target, 0.25);
+        assert!(audio
+            .hold_release(
+                key,
+                down,
+                false,
+                AudioTarget::WaveLink {
+                    target: WaveLinkTarget::Channel {
+                        channel_id: "channel".into()
+                    }
+                }
+            )
+            .await
+            .unwrap_err()
+            .contains("unavailable"));
+        assert_eq!(
+            audio.jobs.len(),
+            0,
+            "unavailable physical/fader work must not enter the FIFO"
+        );
+        for request in held {
+            peer.reply(&request, catalog(request["method"].as_str().unwrap()))
+                .await;
+        }
+        let ready = until(&wave, |state| state.status == WaveLinkStatus::Ready).await;
+        assert_eq!(
+            ready.generation, generation,
+            "same-generation readiness must not replay rejected jobs"
+        );
+        release.send(()).unwrap();
+        blocked_job.await.unwrap().unwrap();
+        audio.run(|_| Ok(())).await.unwrap();
+        for _ in 0..4 {
+            peer.getter().await;
+        }
+        assert!(fake.writes().is_empty());
+        wave.shutdown();
+        peer.closed().await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_admission_rejects_initial_sync_before_fifo() {
+        unavailable_wave_link_admission(false).await;
+    }
+
+    #[tokio::test]
+    async fn wave_link_admission_rejects_same_generation_resync_before_fifo() {
+        unavailable_wave_link_admission(true).await;
+    }
     use AudioDeviceKind::*;
 
     fn mic_target() -> AudioTarget {
