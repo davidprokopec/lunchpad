@@ -1,12 +1,8 @@
 name: Release
 
 # Tag a commit `vX.Y.Z` (matching the version in package.json, Cargo.toml and
-# tauri.conf.json) to build macOS (Apple Silicon + Intel) and Windows, sign the
-# updater artifacts and publish a draft GitHub release with `latest.json`.
-#
-# Required secrets:
-#   TAURI_SIGNING_PRIVATE_KEY            updater signing key (contents of ~/.tauri/lunchpad.key)
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password (empty if the key has none)
+# tauri.conf.json) to build macOS (Apple Silicon + Intel) and Windows and create
+# a draft GitHub release. No updater artifacts or updater signing key are needed.
 # Optional: tell the docs site and the community hub about the release, so each opens a
 # pull request that syncs its action data (tools/actions-contract.ts is attached to every
 # release as actions.json):
@@ -214,7 +210,7 @@ jobs:
   sync:
     name: Tell the docs and the hub
     needs: [draft, build]
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' && github.repository == 'ruohki/lunchpad'
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch a sync to lunchpad-docs and lunchpad-hub
