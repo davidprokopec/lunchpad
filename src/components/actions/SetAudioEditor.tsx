@@ -6,7 +6,7 @@ import { Slider } from "../Slider";
 import { useVariableSuggestions } from "./VariableFields";
 import { VariableNameField } from "./VariableNameField";
 import { useMediaStore } from "../../store/media";
-import { audioControllable } from "../../lib/systemAudio";
+import { audioControllable, audioTargetConfigured } from "../../lib/systemAudio";
 
 export function SetAudioEditor({ action, onChange, button }: { action: Extract<Action, { type: "setAudio" }>; onChange: (next: Action) => void; button: Button }) {
   const { t } = useTranslation();
@@ -14,7 +14,9 @@ export function SetAudioEditor({ action, onChange, button }: { action: Extract<A
   const level = action.mode === "setVolume" || action.mode === "adjustVolume";
   const adjust = action.mode === "adjustVolume";
   const waveLink = useMediaStore((s) => s.waveLink);
-  const allowedModes = SET_AUDIO_MODES.filter((mode) => action.target.type !== "waveLink" || audioControllable(action.target, null, mode === "setVolume" || mode === "adjustVolume" ? "volume" : "mute", waveLink));
+  // Choose the operation before discovery: a blank volume target must not hide
+  // Mute and trap the user away from mute-only inputs.
+  const allowedModes = SET_AUDIO_MODES.filter((mode) => action.target.type !== "waveLink" || !audioTargetConfigured(action.target) || audioControllable(action.target, null, mode === "setVolume" || mode === "adjustVolume" ? "volume" : "mute", waveLink));
   return <div className="flex flex-col gap-3">
     <AudioTargetField value={action.target} control={level ? "volume" : "mute"} onChange={(target) => { if (target) onChange({ ...action, target }); }} />
     <div className="flex max-w-xs flex-col gap-1 text-xs text-stage-400">
