@@ -15,11 +15,32 @@ pub const PROFILE_VERSION: u32 = 1;
 pub const DEFAULT_PAGE_ID: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "ProfileData")]
 pub struct Profile {
     pub version: u32,
     pub active_page: String,
     pub pages: Vec<Page>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_groups: Vec<super::audio::AudioGroup>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileData {
+    version: u32,
+    active_page: String,
+    pages: Vec<Page>,
+    #[serde(default)]
+    audio_groups: Vec<super::audio::AudioGroup>,
+}
+
+impl TryFrom<ProfileData> for Profile {
+    type Error = String;
+    fn try_from(data: ProfileData) -> Result<Self, Self::Error> {
+        let profile = Self { version: data.version, active_page: data.active_page, pages: data.pages, audio_groups: data.audio_groups };
+        super::groups::validate_profile(&profile)?;
+        Ok(profile)
+    }
 }
 
 impl Default for Profile {
@@ -28,6 +49,7 @@ impl Default for Profile {
             version: PROFILE_VERSION,
             active_page: DEFAULT_PAGE_ID.into(),
             pages: vec![Page::new(DEFAULT_PAGE_ID, "Default")],
+            audio_groups: Vec::new(),
         }
     }
 }
@@ -438,6 +460,9 @@ impl Fader {
     /// for when it comes back), and `None` ("unavailable") while the target is missing.
     pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
         let Some(target) = &self.bound else { return Some(self.value) };
+        if let AudioTarget::Group { group_id } = target {
+            return live.audio_groups.iter().find(|g| &g.group_id == group_id)?.summary.volume.map(|v| self.min + (self.max - self.min) * v);
+        }
         let state = live.resolve_audio(target)?;
         if !state.can_set_volume {
             return None;
@@ -710,7 +735,7 @@ mod tests {
 
     #[test]
     fn normalize_fixes_missing_active_page() {
-        let mut p = Profile { version: 0, active_page: "gone".into(), pages: vec![] };
+        let mut p = Profile { version: 0, active_page: "gone".into(), pages: vec![], audio_groups: vec![] };
         p.normalize();
         assert_eq!(p.active_page, DEFAULT_PAGE_ID);
         assert_eq!(p.version, PROFILE_VERSION);

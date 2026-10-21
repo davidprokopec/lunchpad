@@ -1,12 +1,12 @@
 //! Hub commands: signing in, the inbox, and turning a delivery into pages and
 //! buttons after the user has reviewed it.
 
-use super::profile::{apply_import, check_export_format, mutate, with_export_meta, ImportMode, ImportReview};
+use super::profile::{apply_import, check_export_format, embed_group_dependencies, groups_in, mutate, with_export_meta, ImportMode, ImportReview};
 use super::{err, AppState, CmdResult};
 use crate::hub::{BackupInfo, Delivery, HubState, ShareResult, SharedItem};
 use crate::profile::legacy::ImportReport;
 use crate::profile::store::ProfileError;
-use crate::profile::{Button, Page, PlacedButton, Profile};
+use crate::profile::{groups, Button, Page, PlacedButton, Profile};
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
@@ -30,7 +30,7 @@ pub enum ApplyTarget {
 /// The pages a delivery holds, in the shape the reviewer reads.
 fn pages_of(delivery: &Delivery, target: Option<&ApplyTarget>) -> Result<Vec<Page>, String> {
     check_export_format(&delivery.content)?;
-    match delivery.kind.as_str() {
+    let pages = match delivery.kind.as_str() {
         "page" => serde_json::from_value::<Page>(delivery.content.clone()).map(|p| vec![p]).map_err(|e| format!("the page could not be read: {e}")),
         "profile" => serde_json::from_value::<Profile>(delivery.content.clone()).map(|p| p.pages).map_err(|e| format!("the configuration could not be read: {e}")),
         "button" => {
@@ -42,7 +42,9 @@ fn pages_of(delivery: &Delivery, target: Option<&ApplyTarget>) -> Result<Vec<Pag
             Ok(vec![Page { id: "hub".into(), name: delivery.title.clone(), buttons: vec![PlacedButton { x, y, button }], faders: Vec::new() }])
         }
         other => Err(format!("unknown kind of delivery: {other}")),
-    }
+    }?;
+    groups::dependencies(&pages, &groups_in(&delivery.content)?)?;
+    Ok(pages)
 }
 
 fn counts(pages: &[Page]) -> (usize, usize) {
@@ -98,11 +100,17 @@ fn content_of(state: &AppState, target: &ShareTarget) -> CmdResult<(&'static str
             ShareTarget::Button { page_id, x, y } => {
                 let page = store.profile.page(page_id).ok_or_else(|| format!("page {page_id} not found"))?;
                 let button = page.get(*x, *y).ok_or_else(|| "there is no button on that pad; share it again from where it is now".to_string())?;
-                ("button", serde_json::to_value(button).map_err(err)?)
+                let mut value = serde_json::to_value(button).map_err(err)?;
+                let mut exported = Page::new("button", "button");
+                exported.set(*x, *y, button.clone());
+                embed_group_dependencies(&mut value, &[exported], &store.profile.audio_groups)?;
+                ("button", value)
             }
             ShareTarget::Page { page_id } => {
                 let page = store.profile.page(page_id).ok_or_else(|| format!("page {page_id} not found"))?;
-                ("page", serde_json::to_value(page).map_err(err)?)
+                let mut value = serde_json::to_value(page).map_err(err)?;
+                embed_group_dependencies(&mut value, std::slice::from_ref(page), &store.profile.audio_groups)?;
+                ("page", value)
             }
         }
     };
@@ -246,26 +254,29 @@ pub async fn hub_review_delivery(id: String, target: Option<ApplyTarget>, state:
     let pages = pages_of(&delivery, target.as_ref())?;
     let (buttons, actions) = counts(&pages);
     let findings = crate::profile::review::review(&pages);
-    Ok(ImportReview { pages: pages.len(), buttons, actions, findings, content: pages })
+    let audio_groups = groups_in(&delivery.content)?;
+    Ok(ImportReview { pages: pages.len(), buttons, actions, findings, content: pages, audio_groups })
 }
 
 /// Put a reviewed delivery into the profile and tell the hub it was applied.
 #[tauri::command]
 pub async fn hub_apply_delivery(id: String, target: ApplyTarget, app: AppHandle, state: State<'_, AppState>) -> CmdResult<ImportReport> {
     let delivery = state.hub.delivery(&id).ok_or_else(|| "that delivery is gone".to_string())?;
-    let pages = pages_of(&delivery, Some(&target))?;
+    let mut pages = pages_of(&delivery, Some(&target))?;
+    let definitions = groups_in(&delivery.content)?;
     let (buttons, actions) = counts(&pages);
     let page_count = pages.len();
     match (&target, delivery.kind.as_str()) {
         (ApplyTarget::Button { page_id, x, y }, "button") => {
-            let button = pages.into_iter().next().and_then(|p| p.buttons.into_iter().next()).map(|b| b.button).ok_or_else(|| "the button is empty".to_string())?;
             let (page_id, x, y) = (page_id.clone(), *x, *y);
             mutate(&app, &state, true, move |p| {
-                let page = p.page_mut(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?;
+                let page = p.page(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?;
                 if page.fader_at(x, y).is_some() {
                     return Err(ProfileError::Invalid("that pad belongs to a fader".into()));
                 }
-                page.set(x, y, button);
+                groups::import_dependencies(p, &mut pages, definitions).map_err(ProfileError::Invalid)?;
+                let button = pages.into_iter().next().and_then(|p| p.buttons.into_iter().next()).map(|b| b.button).ok_or_else(|| ProfileError::Invalid("the button is empty".into()))?;
+                p.page_mut(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?.set(x, y, button);
                 Ok(())
             })?;
         }
@@ -276,6 +287,7 @@ pub async fn hub_apply_delivery(id: String, target: ApplyTarget, app: AppHandle,
                 page.name = delivery.title.clone();
             }
             mutate(&app, &state, true, move |p| {
+                groups::import_dependencies(p, std::slice::from_mut(&mut page), definitions).map_err(ProfileError::Invalid)?;
                 p.pages.push(page);
                 Ok(())
             })?;
@@ -283,6 +295,8 @@ pub async fn hub_apply_delivery(id: String, target: ApplyTarget, app: AppHandle,
         (ApplyTarget::Profile { mode }, "profile") => {
             let mode = *mode;
             mutate(&app, &state, true, move |p| {
+                if mode == ImportMode::Replace { p.audio_groups.clear(); }
+                groups::import_dependencies(p, &mut pages, definitions).map_err(ProfileError::Invalid)?;
                 apply_import(p, pages, mode);
                 Ok(())
             })?;

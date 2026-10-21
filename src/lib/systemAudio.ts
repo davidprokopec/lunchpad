@@ -1,4 +1,4 @@
-import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState } from "./api";
+import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary } from "./api";
 import { waveLinkControl } from "./waveLink";
 import { fineTuneApp, fineTuneReason } from "./fineTune";
 
@@ -6,6 +6,7 @@ export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "def
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
 
 export function audioTargetConfigured(target: AudioTarget): boolean {
+  if (target.type === "group") return !!target.groupId.trim();
   if (target.type === "fineTune") return target.target.type === "app" ? !!target.target.appId : !!target.target.deviceUid;
   if (target.type === "app") return !!target.app.id;
   if (target.type !== "waveLink") return true;
@@ -34,6 +35,7 @@ export function audioActionConfigured(action: Action): boolean {
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
 export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
   if (!target) return null;
+  if (target.type === "group") return null;
   if (target.type === "fineTune") return target.target.type === "app" ? fineTuneApp(target.target.appId, fineTune) : null;
   if (target.type === "waveLink") {
     if (waveLink?.status !== "ready") return null;
@@ -53,6 +55,7 @@ export function audioState(target: AudioTarget | null | undefined, status: Audio
 }
 
 export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume", waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
+  if (target.type === "group") return false;
   if (target.type === "fineTune") return target.target.type === "app" && !fineTuneReason(target.target, fineTune);
   if (target.type === "waveLink") {
     const found = waveLink?.status === "ready" ? waveLinkControl(target.target, waveLink) : null;
@@ -61,6 +64,23 @@ export function audioControllable(target: AudioTarget, status: AudioStatus | nul
   const state = audioState(target, status);
   if (target.type === "app") return !!state && !!status && (control === "volume" ? status.canSetAppVolume : status.canMuteApps);
   return !!state && (!("canSetVolume" in state) || (control === "volume" ? state.canSetVolume : state.canMute || state.emulated));
+}
+
+export function aggregateGroup(members: AudioGroupMemberReport[]): AudioGroupSummary {
+  const volumes = members.flatMap((member) => member.volume !== null && Number.isFinite(member.volume) ? [member.volume] : []);
+  const min = volumes.length ? Math.min(...volumes) : null;
+  const max = volumes.length ? Math.max(...volumes) : null;
+  const muted = members.filter((member) => member.muted === true).length;
+  const unmuted = members.filter((member) => member.muted === false).length;
+  const allMuted = members.length > 0 && muted === members.length;
+  return {
+    volume: !volumes.length ? null : allMuted ? 0 : volumes.reduce((sum, volume) => sum + volume, 0) / volumes.length,
+    min, max,
+    mixed: min !== null && max !== null && max > min + 0.01,
+    coverage: !volumes.length ? "unavailable" : volumes.length === members.length ? "complete" : "partial",
+    mute: allMuted ? "all" : members.length > 0 && unmuted === members.length ? "none" : muted > 0 && unmuted > 0 ? "partial" : "unknown",
+    readable: volumes.length, muted, unknownMute: members.length - muted - unmuted,
+  };
 }
 
 /** FineTune snapshots remain readable even when capture permission prevents writes. */

@@ -467,7 +467,7 @@ export function summarize(t: TFunction, action: Action, pages: Page[]): string {
     }
     case "setAudio": {
       const target = action.target;
-      const name = target.type === "fineTune" ? "FineTune" : target.type === "waveLink" ? "Wave Link" : target.type === "app" ? target.app.name || t("audio.chooseApp") : target.device.type === "named" ? target.device.label : t(`audio.${target.device.type}`);
+      const name = target.type === "group" ? target.groupId : target.type === "fineTune" ? "FineTune" : target.type === "waveLink" ? "Wave Link" : target.type === "app" ? target.app.name || t("audio.chooseApp") : target.device.type === "named" ? target.device.label : t(`audio.${target.device.type}`);
       const mode = t(`audio.modes.${action.mode}`);
       const volume = action.volumeFrom ? `{{${action.volumeFrom}}}` : `${action.mode === "adjustVolume" && action.volume >= 0 ? "+" : ""}${Math.round(action.volume)} %`;
       return `${name} · ${mode}${action.mode === "setVolume" || action.mode === "adjustVolume" ? ` ${volume}` : ""}`;

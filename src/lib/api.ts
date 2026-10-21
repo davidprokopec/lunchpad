@@ -616,7 +616,42 @@ export interface AppRef {
   name: string;
 }
 /** A device, app or Wave Link control whose volume and mute Lunchpad follows or sets. */
-export type AudioTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef } | { type: "waveLink"; target: WaveLinkTarget } | { type: "fineTune"; target: FineTuneTarget };
+export type AudioMemberTarget = { type: "device"; device: DeviceRef } | { type: "app"; app: AppRef } | { type: "waveLink"; target: WaveLinkTarget } | { type: "fineTune"; target: FineTuneTarget };
+export type AudioTarget = AudioMemberTarget | { type: "group"; groupId: string };
+export interface AudioGroup { id: string; name: string; members: AudioMemberTarget[] }
+export interface AudioGroupMemberReport {
+  target: AudioMemberTarget;
+  volume: number | null;
+  muted: boolean | null;
+  canSetVolume: boolean;
+  canMute: boolean;
+  reason: string | null;
+}
+export type AudioGroupOutcome = "pending" | "confirmed" | "failed" | "unconfirmed" | "skipped";
+export interface AudioGroupOperation {
+  id: number;
+  members: { target: AudioMemberTarget; outcome: AudioGroupOutcome; message: string | null }[];
+}
+export interface AudioGroupSummary {
+  volume: number | null;
+  min: number | null;
+  max: number | null;
+  mixed: boolean;
+  coverage: "complete" | "partial" | "unavailable";
+  mute: "all" | "none" | "partial" | "unknown";
+  readable: number;
+  muted: number;
+  unknownMute: number;
+}
+export interface AudioGroupReport {
+  groupId: string;
+  revision: number;
+  members: AudioGroupMemberReport[];
+  summary: AudioGroupSummary;
+  restoreOwned: boolean;
+  busy: boolean;
+  operation: AudioGroupOperation | null;
+}
 /** `holdMute` goes in both the pressed and the released list: a tap toggles, a hold (the button's holdMs) mutes only while held. */
 export type SetAudioMode = "setVolume" | "adjustVolume" | "mute" | "unmute" | "toggleMute" | "holdMute";
 export const SET_AUDIO_MODES: SetAudioMode[] = ["setVolume", "adjustVolume", "mute", "unmute", "toggleMute", "holdMute"];
@@ -915,6 +950,7 @@ export interface ImportFinding {
 
 /** What an import would bring, before anything is applied. */
 export interface ImportReview {
+  audioGroups: AudioGroup[];
   pages: number;
   buttons: number;
   actions: number;
@@ -1113,6 +1149,7 @@ export interface Page {
 }
 
 export interface Profile {
+  audioGroups?: AudioGroup[];
   version: number;
   activePage: string;
   pages: Page[];
@@ -1191,6 +1228,9 @@ export const api = {
   sendRawMidi: (bytes: number[]) => invoke<void>("send_raw_midi", { bytes }),
 
   getProfile: () => invoke<Profile>("get_profile"),
+  setAudioGroup: (group: AudioGroup) => invoke<void>("set_audio_group", { group }),
+  removeAudioGroup: (groupId: string) => invoke<void>("remove_audio_group", { groupId }),
+  getAudioGroups: () => invoke<AudioGroupReport[]>("get_audio_groups"),
   setActivePage: (pageId: string) => invoke<void>("set_active_page", { pageId }),
   addPage: (name: string) => invoke<Page>("add_page", { name }),
   renamePage: (pageId: string, name: string) => invoke<void>("rename_page", { pageId, name }),
@@ -1368,6 +1408,7 @@ export const events = {
     listen<InputUnavailable>("input:unavailable", (e) => cb(e.payload)),
   /** The system audio changed (coalesced); same payload as `audioStatus`. */
   onSystemAudio: (cb: (status: AudioStatus) => void): Promise<UnlistenFn> => listen<AudioStatus>("system-audio:changed", (e) => cb(e.payload)),
+  onAudioGroups: (cb: (reports: AudioGroupReport[]) => void): Promise<UnlistenFn> => listen<AudioGroupReport[]>("audio-groups:changed", (e) => cb(e.payload)),
   onWaveLinkState: (cb: (state: WaveLinkState) => void): Promise<UnlistenFn> => listen<WaveLinkState>("wave-link:state", (e) => cb(e.payload)),
   onFineTuneState: (cb: (state: FineTuneState) => void): Promise<UnlistenFn> => listen<FineTuneState>("fine-tune:state", (e) => cb(e.payload)),
   onObsState: (cb: (state: ObsState) => void): Promise<UnlistenFn> => listen<ObsState>("obs:state", (e) => cb(e.payload)),

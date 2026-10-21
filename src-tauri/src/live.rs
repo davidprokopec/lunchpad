@@ -30,6 +30,7 @@ pub struct LiveStatus {
     pub system: SystemAudioState,
     pub wave_link: crate::wavelink::WaveLinkState,
     pub fine_tune: crate::finetune::FineTuneState,
+    pub audio_groups: Vec<crate::system_audio::AudioGroupReport>,
 }
 
 pub type SharedLive = Arc<Mutex<LiveStatus>>;
@@ -205,6 +206,9 @@ impl StateLink {
             LinkProvider::Slobs => &live.slobs,
             // Muted and there; a missing device or app (or no audio at all) is not lit.
             LinkProvider::System => {
+                if let Some(crate::profile::AudioTarget::Group { group_id }) = &self.target {
+                    return self.kind == LinkKind::AudioMuted && live.audio_groups.iter().any(|g| &g.group_id == group_id && g.summary.mute == crate::system_audio::AudioGroupMute::All);
+                }
                 return self.kind == LinkKind::AudioMuted
                     && self
                         .target

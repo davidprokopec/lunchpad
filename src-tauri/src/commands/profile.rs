@@ -89,6 +89,32 @@ mod button_import_tests {
 }
 
 #[cfg(test)]
+mod group_export_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn portable_pages_and_buttons_carry_dependencies_and_missing_definitions_are_rejected() {
+        let definition: AudioGroup = serde_json::from_value(json!({"id":"g","name":"Comms","members":[{"type":"app","app":{"id":"app"}}]})).unwrap();
+        let mut page = Page::new("p", "Page");
+        page.faders.push(Fader { bound: Some(AudioTarget::Group { group_id: "g".into() }), ..Fader::default() });
+        let mut value = serde_json::to_value(&page).unwrap();
+        assert!(pages_in(&value.to_string()).unwrap_err().contains("dependency"));
+        embed_group_dependencies(&mut value, std::slice::from_ref(&page), std::slice::from_ref(&definition)).unwrap();
+        assert_eq!(groups_in(&value).unwrap(), vec![definition.clone()]);
+        assert_eq!(pages_in(&value.to_string()).unwrap(), vec![page]);
+        let button = Button { state_link: Some(StateLink { provider: LinkProvider::System, kind: LinkKind::AudioMuted, scene: String::new(), source: String::new(), target: Some(AudioTarget::Group { group_id: "g".into() }), wave_link_mix_id: None }), ..Button::default() };
+        let mut exported = Page::new("button", "button"); exported.set(0, 0, button.clone());
+        let mut value = serde_json::to_value(&button).unwrap();
+        assert!(button_in(&value.to_string()).is_err());
+        embed_group_dependencies(&mut value, &[exported], &[definition]).unwrap();
+        assert_eq!(button_in(&value.to_string()).unwrap(), button);
+        value["audioGroups"][0]["members"] = json!([]);
+        assert!(button_in(&value.to_string()).is_err());
+    }
+}
+
+#[cfg(test)]
 mod version_tests {
     use super::check_export_format;
 
@@ -229,6 +255,34 @@ pub async fn missing_sound_files(state: State<'_, AppState>) -> CmdResult<Vec<St
 #[tauri::command]
 pub async fn get_profile(state: State<'_, AppState>) -> CmdResult<Profile> {
     Ok(state.profile.lock().profile.clone())
+}
+
+#[tauri::command]
+pub async fn get_audio_groups(state: State<'_, AppState>) -> CmdResult<Vec<crate::system_audio::AudioGroupReport>> {
+    Ok(state.system_audio.refresh_groups())
+}
+
+#[tauri::command]
+pub async fn set_audio_group(group: AudioGroup, app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    mutate(&app, &state, true, |p| {
+        groups::validate_groups(std::slice::from_ref(&group)).map_err(ProfileError::Invalid)?;
+        if let Some(existing) = p.audio_groups.iter_mut().find(|g| g.id == group.id) { *existing = group; }
+        else { p.audio_groups.push(group); }
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub async fn remove_audio_group(group_id: String, app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    mutate(&app, &state, true, |p| {
+        let locations: Vec<_> = groups::references(&p.pages).into_iter().filter(|(id, _)| id == &group_id).map(|(_, location)| location).collect();
+        if !locations.is_empty() {
+            return Err(ProfileError::Invalid(format!("audio group {group_id} is referenced by {}", locations.join("; "))));
+        }
+        let index = p.audio_groups.iter().position(|g| g.id == group_id).ok_or_else(|| ProfileError::Invalid(format!("no audio group {group_id}")))?;
+        p.audio_groups.remove(index);
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -432,6 +486,10 @@ pub(crate) fn apply_import(p: &mut Profile, mut pages: Vec<Page>, mode: ImportMo
 /// single exported page).
 #[tauri::command]
 pub async fn import_legacy_json(json: String, mode: ImportMode, app: AppHandle, state: State<'_, AppState>) -> CmdResult<ImportReport> {
+    let value = parse_checked(&json)?;
+    if value.get("audioGroups").is_some() {
+        return Err("This file contains audio groups; use the current page/profile importer.".into());
+    }
     let (pages, report) = import_legacy(&json)?;
     mutate(&app, &state, true, |p| {
         apply_import(p, pages, mode);
@@ -452,7 +510,9 @@ pub async fn export_page(page_id: String, state: State<'_, AppState>) -> CmdResu
     let mut value = {
         let store = state.profile.lock();
         let page = store.profile.page(&page_id).ok_or_else(|| format!("page {page_id} not found"))?;
-        serde_json::to_value(page).map_err(err)?
+        let mut value = serde_json::to_value(page).map_err(err)?;
+        embed_group_dependencies(&mut value, std::slice::from_ref(page), &store.profile.audio_groups)?;
+        value
     };
     crate::profile::images::embed_looks(&mut value)?;
     serde_json::to_string_pretty(&with_export_meta(value)).map_err(err)
@@ -468,17 +528,33 @@ pub struct ImportReview {
     pub findings: Vec<crate::profile::review::Finding>,
     /// The pages as they would be imported, for reading before confirming.
     pub content: Vec<Page>,
+    pub audio_groups: Vec<AudioGroup>,
+}
+
+pub(crate) fn groups_in(value: &serde_json::Value) -> Result<Vec<AudioGroup>, String> {
+    let groups: Vec<AudioGroup> = value.get("audioGroups").map(|v| serde_json::from_value(v.clone())).transpose().map_err(err)?.unwrap_or_default();
+    groups::validate_groups(&groups)?;
+    Ok(groups)
+}
+
+pub(crate) fn embed_group_dependencies(value: &mut serde_json::Value, pages: &[Page], definitions: &[AudioGroup]) -> Result<(), String> {
+    let dependencies = groups::dependencies(pages, definitions)?;
+    if !dependencies.is_empty() { value["audioGroups"] = serde_json::to_value(dependencies).map_err(err)?; }
+    Ok(())
 }
 
 /// The pages a file holds, whichever format it is in (nothing is applied).
 fn pages_in(json: &str) -> Result<Vec<Page>, String> {
     let value = parse_checked(json)?;
+    let definitions = groups_in(&value)?;
     if let Ok(page) = serde_json::from_value::<Page>(value.clone()) {
+        groups::dependencies(std::slice::from_ref(&page), &definitions)?;
         return Ok(vec![page]);
     }
-    if let Ok(profile) = serde_json::from_value::<Profile>(value) {
-        return Ok(profile.pages);
+    if value.get("pages").is_some() {
+        return serde_json::from_value::<Profile>(value).map(|p| p.pages).map_err(err);
     }
+    if !definitions.is_empty() { return Err("audio group dependencies require a current page/profile export".into()); }
     import_legacy(json).map(|(pages, _)| pages)
 }
 
@@ -492,7 +568,8 @@ pub async fn review_import_json(json: String) -> CmdResult<ImportReview> {
         .flat_map(|p| p.buttons.iter().map(|b| b.button.down.len() + b.button.up.len() + b.button.hold.len()).chain(p.faders.iter().map(|f| f.on_change.len() + f.on_touch.len() + f.on_release.len())))
         .sum();
     let findings = crate::profile::review::review(&pages);
-    Ok(ImportReview { pages: pages.len(), buttons, actions, findings, content: pages })
+    let audio_groups = groups_in(&parse_checked(&json)?)?;
+    Ok(ImportReview { pages: pages.len(), buttons, actions, findings, content: pages, audio_groups })
 }
 
 #[tauri::command]
@@ -513,7 +590,12 @@ fn button_in(json: &str) -> Result<Button, String> {
     if value.get("pages").is_some() || value.get("buttons").is_some() {
         return Err("This file holds a page or a whole configuration, not a single button. Import it under Settings → Pages & backup.".into());
     }
-    serde_json::from_value::<Button>(value).map_err(|e| format!("the button could not be read: {e}"))
+    let definitions = groups_in(&value)?;
+    let button = serde_json::from_value::<Button>(value).map_err(|e| format!("the button could not be read: {e}"))?;
+    let mut page = Page::new("button", "button");
+    page.set(0, 0, button.clone());
+    groups::dependencies(&[page], &definitions)?;
+    Ok(button)
 }
 
 /// Look over a button export before it lands on the pad at (x, y).
@@ -528,7 +610,8 @@ pub async fn review_button_file(path: String, x: u8, y: u8) -> CmdResult<ImportR
     let pages = vec![Page { id: "file".into(), name, buttons: vec![PlacedButton { x, y, button }], faders: Vec::new() }];
     let actions = pages[0].buttons[0].button.down.len() + pages[0].buttons[0].button.up.len() + pages[0].buttons[0].button.hold.len();
     let findings = crate::profile::review::review(&pages);
-    Ok(ImportReview { pages: 0, buttons: 1, actions, findings, content: pages })
+    let audio_groups = groups_in(&parse_checked(&json)?)?;
+    Ok(ImportReview { pages: 0, buttons: 1, actions, findings, content: pages, audio_groups })
 }
 
 /// Put a button export on the pad at (x, y), replacing what is there.
@@ -536,13 +619,18 @@ pub async fn review_button_file(path: String, x: u8, y: u8) -> CmdResult<ImportR
 pub async fn import_button_file(page_id: String, x: u8, y: u8, path: String, app: AppHandle, state: State<'_, AppState>) -> CmdResult<ImportReport> {
     let json = std::fs::read_to_string(&path).map_err(|e| format!("could not read {path}: {e}"))?;
     let button = button_in(&json)?;
+    let definitions = groups_in(&parse_checked(&json)?)?;
     let actions = button.down.len() + button.up.len() + button.hold.len();
     mutate(&app, &state, true, move |p| {
-        let page = p.page_mut(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?;
+        let page = p.page(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?;
         if page.fader_at(x, y).is_some() {
             return Err(ProfileError::Invalid("that pad belongs to a fader".into()));
         }
-        page.set(x, y, button);
+        let mut imported = Page::new("button", "button");
+        imported.set(x, y, button);
+        groups::import_dependencies(p, std::slice::from_mut(&mut imported), definitions).map_err(ProfileError::Invalid)?;
+        let button = imported.buttons.remove(0).button;
+        p.page_mut(&page_id).ok_or_else(|| ProfileError::PageNotFound(page_id.clone()))?.set(x, y, button);
         Ok(ImportReport { pages: 0, buttons: 1, actions, warnings: vec![] })
     })
 }
@@ -551,15 +639,18 @@ pub async fn import_button_file(page_id: String, x: u8, y: u8, path: String, app
 #[tauri::command]
 pub async fn import_page_json(json: String, app: AppHandle, state: State<'_, AppState>) -> CmdResult<ImportReport> {
     let value = parse_checked(&json)?;
+    let definitions = groups_in(&value)?;
     if looks_like_button(&value) {
         return Err("This file holds a single button. Right-click the pad it should go on and choose Import button…".into());
     }
-    if let Ok(profile) = serde_json::from_value::<Profile>(value.clone()) {
-        let pages = profile.pages;
+    if value.get("pages").is_some() {
+        let profile = serde_json::from_value::<Profile>(value.clone()).map_err(err)?;
+        let mut pages = profile.pages;
         let buttons = pages.iter().map(|p| p.buttons.len()).sum();
         let actions = pages.iter().flat_map(|p| p.buttons.iter().map(|b| b.button.down.len() + b.button.up.len() + b.button.hold.len())).sum();
         let count = pages.len();
         return mutate(&app, &state, true, |p| {
+            groups::import_dependencies(p, &mut pages, profile.audio_groups).map_err(ProfileError::Invalid)?;
             apply_import(p, pages, ImportMode::Append);
             Ok(ImportReport { pages: count, buttons, actions, warnings: vec![] })
         });
@@ -570,6 +661,7 @@ pub async fn import_page_json(json: String, app: AppHandle, state: State<'_, App
             let actions = page.buttons.iter().map(|b| b.button.down.len() + b.button.up.len()).sum();
             page.id = uuid::Uuid::new_v4().to_string();
             return mutate(&app, &state, true, |p| {
+                groups::import_dependencies(p, std::slice::from_mut(&mut page), definitions).map_err(ProfileError::Invalid)?;
                 p.pages.push(page);
                 Ok(ImportReport { pages: 1, buttons, actions, warnings: vec![] })
             });
@@ -595,7 +687,11 @@ pub async fn export_button_file(page_id: String, x: u8, y: u8, path: String, sta
         let store = state.profile.lock();
         let page = store.profile.page(&page_id).ok_or_else(|| format!("page {page_id} not found"))?;
         let button = page.get(x, y).ok_or_else(|| "there is no button on that pad".to_string())?;
-        serde_json::to_value(button).map_err(err)?
+        let mut value = serde_json::to_value(button).map_err(err)?;
+        let mut exported = Page::new("button", "button");
+        exported.set(x, y, button.clone());
+        embed_group_dependencies(&mut value, &[exported], &store.profile.audio_groups)?;
+        value
     };
     crate::profile::images::embed_looks(&mut value)?;
     let json = serde_json::to_string_pretty(&with_export_meta(value)).map_err(err)?;
@@ -646,6 +742,8 @@ pub async fn restore_profile_backup(app: AppHandle, state: State<'_, AppState>) 
         store.profile.clone()
     };
     state.manager.lock().request_repaint();
+    state.engine.prune_fader_variables();
+    state.engine.reconcile_audio_bindings();
     Ok(profile)
 }
 

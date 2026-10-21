@@ -310,6 +310,14 @@ pub fn run() {
                 system_audio: Some(system_audio.clone()),
             };
             let engine = MacroEngine::new(profile.clone(), running_pads, sink, services, runtime);
+            {
+                let app = app.handle().clone();
+                let render = manager.lock().render_slot();
+                system_audio.set_group_notifier(Arc::new(move |reports| {
+                    let _ = app.emit("audio-groups:changed", reports);
+                    if let Some(render) = render.lock().as_ref() { render.repaint(); }
+                }));
+            }
             // Shared variables survive restarts.
             if let Ok(text) = std::fs::read_to_string(config_dir.join("variables.json")) {
                 match serde_json::from_str::<std::collections::HashMap<String, String>>(&text) {
@@ -320,6 +328,7 @@ pub fn run() {
                     Err(e) => tracing::warn!(error = %e, "variables.json unreadable, starting empty"),
                 }
             }
+            engine.reconcile_audio_bindings();
             {
                 let for_buttons = engine.clone();
                 manager.lock().add_button_listener(Arc::new(move |event| for_buttons.on_button(event)));
@@ -410,6 +419,9 @@ pub fn run() {
             send_raw_midi,
             // profile
             get_profile,
+            set_audio_group,
+            remove_audio_group,
+            get_audio_groups,
             set_active_page,
             add_page,
             rename_page,

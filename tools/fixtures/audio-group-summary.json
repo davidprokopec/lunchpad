@@ -1,0 +1,10 @@
+[
+  { "name": "inclusive decimal tolerance", "members": [{"volume":0.5,"muted":false},{"volume":0.51,"muted":false}], "expected": {"volume":0.505,"min":0.5,"max":0.51,"mixed":false,"coverage":"complete","mute":"none","readable":2,"muted":0,"unknownMute":0} },
+  { "name": "unrounded above tolerance", "members": [{"volume":0.5,"muted":false},{"volume":0.510001,"muted":false}], "expected": {"volume":0.5050005,"min":0.5,"max":0.510001,"mixed":true,"coverage":"complete","mute":"none","readable":2,"muted":0,"unknownMute":0} },
+  { "name": "partial mute includes stored level", "members": [{"volume":0.8,"muted":true},{"volume":0.2,"muted":false}], "expected": {"volume":0.5,"min":0.2,"max":0.8,"mixed":true,"coverage":"complete","mute":"partial","readable":2,"muted":1,"unknownMute":0} },
+  { "name": "all configured known muted", "members": [{"volume":0.8,"muted":true},{"volume":0.2,"muted":true}], "expected": {"volume":0,"min":0.2,"max":0.8,"mixed":true,"coverage":"complete","mute":"all","readable":2,"muted":2,"unknownMute":0} },
+  { "name": "unknown is not all muted", "members": [{"volume":0.8,"muted":true},{"volume":null,"muted":null}], "expected": {"volume":0.8,"min":0.8,"max":0.8,"mixed":false,"coverage":"partial","mute":"unknown","readable":1,"muted":1,"unknownMute":1} },
+  { "name": "readable level unknown mute", "members": [{"volume":0.4,"muted":null},{"volume":0.4,"muted":false}], "expected": {"volume":0.4,"min":0.4,"max":0.4,"mixed":false,"coverage":"complete","mute":"unknown","readable":2,"muted":0,"unknownMute":1} },
+  { "name": "no readable level has no position", "members": [{"volume":null,"muted":true},{"volume":null,"muted":true}], "expected": {"volume":null,"min":null,"max":null,"mixed":false,"coverage":"unavailable","mute":"all","readable":0,"muted":2,"unknownMute":0} },
+  { "name": "partial known mute with missing third", "members": [{"volume":0.2,"muted":true},{"volume":0.4,"muted":false},{"volume":null,"muted":null}], "expected": {"volume":0.30000000000000004,"min":0.2,"max":0.4,"mixed":true,"coverage":"partial","mute":"partial","readable":2,"muted":1,"unknownMute":1} }
+]

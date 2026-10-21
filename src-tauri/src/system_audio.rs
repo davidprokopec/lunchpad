@@ -18,6 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
+mod groups;
+pub use groups::*;
+
 /// How long a release waits for its press to have taken the mute state.
 const HOLD_SLOT_WAIT: Duration = Duration::from_secs(1);
 
@@ -181,7 +184,7 @@ pub struct SystemAudioState {
 }
 
 /// What a target addresses in a snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Resolved {
     Device {
         id: String,
@@ -215,7 +218,7 @@ impl SystemAudioState {
     /// The target's state, or `None` while it is not there (or audio is unavailable).
     pub fn resolve(&self, target: &AudioTarget) -> Option<TargetState> {
         match target {
-            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } => None,
+            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } | AudioTarget::Group { .. } => None,
             AudioTarget::Device { device } => {
                 if !self.available {
                     return None;
@@ -327,7 +330,7 @@ pub fn report(status: AudioStatus, state: &SystemAudioState, profile: &Profile) 
                 }
             }
             AudioTarget::Device { .. } => {}
-            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } => {}
+            AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. } | AudioTarget::Group { .. } => {}
             AudioTarget::App {
                 app: AppRef { id, name },
             } => {
@@ -390,6 +393,9 @@ pub fn saved_targets(profile: &Profile) -> Vec<AudioTarget> {
             }
         }
     }
+    for group in &profile.audio_groups {
+        for member in &group.members { add(&member.target()); }
+    }
     out
 }
 
@@ -450,6 +456,7 @@ fn fresh(port: &dyn AudioControl, target: &AudioTarget) -> Result<TargetState, S
 
 fn describe(target: &AudioTarget) -> String {
     match target {
+        AudioTarget::Group { group_id } => format!("audio group {group_id}"),
         AudioTarget::FineTune { target } => format!("FineTune {target:?}"),
         AudioTarget::WaveLink { target } => format!("Wave Link {target:?}"),
         AudioTarget::Device {
@@ -719,6 +726,9 @@ pub struct SystemAudio {
     jobs: Sender<Job>,
     holds: Arc<HoldMutes>,
     physical: Arc<Mutex<Vec<std::sync::Weak<PhysicalMute>>>>,
+    groups: Arc<Mutex<groups::GroupRuntime>>,
+    group_refresh: Arc<Mutex<()>>,
+    group_notifier: Arc<Mutex<Option<groups::GroupNotifier>>>,
 }
 
 impl SystemAudio {
@@ -770,6 +780,9 @@ impl SystemAudio {
                 stored: watch::channel(0).0,
             }),
             physical: Default::default(),
+            groups: Default::default(),
+            group_refresh: Default::default(),
+            group_notifier: Default::default(),
         }
     }
 
@@ -799,6 +812,9 @@ impl SystemAudio {
     }
 
     fn generation(&self, target: &AudioTarget) -> Result<Option<u64>, String> {
+        if matches!(target, AudioTarget::Group { .. }) {
+            return Err("audio group mute, hold and relative volume are unsupported in this milestone".into());
+        }
         if matches!(target, AudioTarget::FineTune { .. }) {
             self.fine_tune_generation().map(Some)
         } else if matches!(target, AudioTarget::WaveLink { .. }) {
@@ -984,6 +1000,12 @@ impl SystemAudio {
 
     /// A fader's level (0..1) from a press: unmutes a muted target first, then sets the volume.
     pub fn set_level(&self, target: AudioTarget, volume: f32) {
+        if let AudioTarget::Group { group_id } = &target {
+            if let Err(error) = self.start_group_volume(group_id, volume, true) {
+                tracing::warn!(%error, "audio group fader ignored");
+            }
+            return;
+        }
         let generation = match self.generation(&target) {
             Ok(generation) => generation,
             Err(error) => {
@@ -1059,6 +1081,12 @@ impl SystemAudio {
         mode: SetAudioMode,
         amount: f32,
     ) -> Result<(), String> {
+        if let AudioTarget::Group { group_id } = &target {
+            if mode != SetAudioMode::SetVolume {
+                return Err("audio group mute, hold and relative volume are unsupported in this milestone".into());
+            }
+            return self.start_group_volume(group_id, amount / 100.0, false)?.await.map_err(|_| "the system audio writer has stopped".to_string())?;
+        }
         let generation = self.generation(&target)?;
         self.run_writer(move |writer| {
             let state = writer.fresh(&target, generation)?;

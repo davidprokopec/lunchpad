@@ -16,8 +16,11 @@ pub type SharedProfile = Arc<Mutex<ProfileStore>>;
 pub fn mutate<T>(store: &SharedProfile, kind: SaveKind, f: impl FnOnce(&mut Profile) -> Result<T, ProfileError>) -> Result<(T, Profile), ProfileError> {
     let (out, profile, flusher) = {
         let mut guard = store.lock();
-        let out = f(&mut guard.profile)?;
-        guard.profile.normalize();
+        let mut next = guard.profile.clone();
+        let out = f(&mut next)?;
+        next.normalize();
+        super::groups::validate_profile(&next).map_err(ProfileError::Invalid)?;
+        guard.profile = next;
         guard.save(kind)?;
         (out, guard.profile.clone(), guard.flusher())
     };

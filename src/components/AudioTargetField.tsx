@@ -11,7 +11,7 @@ import { fineTuneReason } from "../lib/fineTune";
 import { platformOptionAvailable } from "../lib/platform";
 
 type Source = "manual" | "device" | "app" | "waveLink" | "fineTune";
-const targetKey = (target: AudioTarget): string => target.type === "fineTune" ? `fineTune:${JSON.stringify(target.target)}` : target.type === "waveLink" ? waveLinkKey(target.target) : target.type === "app" ? `app:${target.app.id}` : target.device.type === "named" ? `device:${target.device.kind}:${target.device.id || target.device.label}` : target.device.type;
+const targetKey = (target: AudioTarget): string => target.type === "group" ? `group:${target.groupId}` : target.type === "fineTune" ? `fineTune:${JSON.stringify(target.target)}` : target.type === "waveLink" ? waveLinkKey(target.target) : target.type === "app" ? `app:${target.app.id}` : target.device.type === "named" ? `device:${target.device.kind}:${target.device.id || target.device.label}` : target.device.type;
 
 /** The same explicit device/app picker for faders, actions and active-state links. */
 export function AudioTargetField({ value, onChange, manual = false, control = "volume" }: {
@@ -29,6 +29,7 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
   const fineTune = useMediaStore((s) => s.fineTune);
   const loadFineTune = useMediaStore((s) => s.loadFineTune);
   useEffect(() => { if (value?.type !== "fineTune") void refresh(); }, [refresh, value?.type]);
+  if (value?.type === "group") return <div className="text-xs text-stage-400">Audio group · {value.groupId}</div>;
   const source: Source = value?.type ?? (manual ? "manual" : "device");
   const targets: { target: AudioTarget; label: string }[] = source === "fineTune" ? [] : source === "waveLink"
     ? (waveLink?.status === "ready" ? waveLink.controls : []).filter((item) => control === "volume" ? item.canSetLevel && item.level !== null : item.canMute && item.muted !== null).map((item) => ({ target: { type: "waveLink", target: item.target }, label: `${t(`waveLink.kinds.${item.target.type}`)} · ${item.name}` }))

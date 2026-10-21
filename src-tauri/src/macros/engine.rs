@@ -384,7 +384,7 @@ impl MacroEngine {
                 let pair = button.filter(|b| b.run_mode == RunMode::Parallel && !b.loop_down && b.hold.is_empty()).and_then(|b| {
                     let ([down], [up]) = (b.down.as_slice(), b.up.as_slice()) else { return None };
                     match (&down.kind, &up.kind) {
-                        (ActionKind::SetAudio { target, mode: SetAudioMode::HoldMute, .. }, ActionKind::SetAudio { target: released, mode: SetAudioMode::HoldMute, .. }) if target == released && down.wait && up.wait => Some((target, Arc::new([down.id.clone(), up.id.clone()]))),
+                        (ActionKind::SetAudio { target, mode: SetAudioMode::HoldMute, .. }, ActionKind::SetAudio { target: released, mode: SetAudioMode::HoldMute, .. }) if target == released && !matches!(target, AudioTarget::Group { .. }) && down.wait && up.wait => Some((target, Arc::new([down.id.clone(), up.id.clone()]))),
                         _ => None,
                     }
                 });
@@ -572,12 +572,25 @@ impl MacroEngine {
     /// (the LEDs show it as muted or unavailable), and a level within a thousandth of the
     /// range of the current one is the echo of a press and changes nothing.
     pub fn follow_system_audio(&self, state: &crate::system_audio::SystemAudioState) {
+        if let Some(audio) = &self.inner.services.system_audio { audio.refresh_groups(); }
         let bound: Vec<(String, Fader)> = {
             let store = self.inner.profile.lock();
             store.profile.pages.iter().flat_map(|p| p.faders.iter().filter(|f| f.bound.is_some()).map(|f| (p.id.clone(), f.clone()))).collect()
         };
         for (page_id, fader) in bound {
             let Some(target) = &fader.bound else { continue };
+            if let AudioTarget::Group { group_id } = target {
+                let report = self.inner.services.system_audio.as_ref().and_then(|audio| audio.group_report(group_id));
+                if let Some(volume) = report.and_then(|g| g.summary.volume) {
+                    let value = fader.min + (fader.max - fader.min) * volume;
+                    if (fader.value - value).abs() > (fader.max - fader.min).abs() / 1000.0 {
+                        let mut at = fader.clone(); at.value = value;
+                        let hit = FaderHit { id: fader.id.clone(), key: fader.variable_key(), step: at.level_step(), steps: at.steps(), value, min: fader.min, max: fader.max, decimals: fader.decimals, display: at.display_text(), bound: fader.bound.clone().map(Arc::new) };
+                        self.fader_pressed_from(&page_id, fader.x, fader.y, hit, 127, None, FaderOrigin::Os);
+                    }
+                }
+                continue;
+            }
             let resolved = if matches!(
                 target,
                 AudioTarget::WaveLink { .. } | AudioTarget::FineTune { .. }
@@ -618,6 +631,8 @@ impl MacroEngine {
 
     pub fn reconcile_audio_bindings(&self) {
         if let Some(audio) = &self.inner.services.system_audio {
+            let groups = self.inner.profile.lock().profile.audio_groups.clone();
+            audio.configure_groups(&groups);
             self.follow_system_audio(&audio.snapshot());
         }
     }
@@ -633,7 +648,7 @@ impl MacroEngine {
     #[allow(clippy::too_many_arguments)]
     fn fader_pressed_from(&self, page_id: &str, x: u8, y: u8, hit: FaderHit, velocity: u8, run: Option<ActionList>, origin: FaderOrigin) {
         let audio = match (&hit.bound, origin) {
-            (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)) {
+            (Some(target), FaderOrigin::User) => match self.inner.services.system_audio.as_ref().filter(|sa| matches!(target.as_ref(), AudioTarget::Group { .. }) || sa.cached(target).is_some_and(|s| s.can_set_volume)) {
                 Some(sa) => Some((sa.clone(), AudioTarget::clone(target))),
                 None => {
                     tracing::warn!(fader = %hit.id, target = ?target,
@@ -644,6 +659,7 @@ impl MacroEngine {
                             AudioTarget::Device { .. } => sa.cached(target).is_some(),
                             AudioTarget::WaveLink { .. } => sa.cached(target).is_some(),
                             AudioTarget::FineTune { .. } => sa.cached(target).is_some(),
+                            AudioTarget::Group { .. } => false,
                         }),
                         can_set_volume = self.inner.services.system_audio.as_ref().is_some_and(|sa| sa.cached(target).is_some_and(|s| s.can_set_volume)),
                         reason = "audio service missing, target unresolved/not present, or volume capability unavailable",
@@ -2921,6 +2937,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
             assert_eq!(r.fake.writes().len(), 1, "still one write");
             assert_eq!(r.engine.globals().get("runs").map(String::as_str), Some("1"), "still one run");
+        }
+
+        #[tokio::test]
+        async fn group_fader_physical_volume_and_external_mean_have_no_feedback_actions() {
+            use crate::profile::{AudioGroup, AudioMemberTarget};
+            let r = rig(false, false);
+            r.engine.set_globals(HashMap::from([("restored".into(), "keep".into())]));
+            let target = AudioTarget::Group { group_id: "comms".into() };
+            r.profile.lock().profile.audio_groups.push(AudioGroup { id: "comms".into(), name: "Comms".into(), members: vec![AudioMemberTarget::Device { device: DeviceRef::DefaultInput }, AudioMemberTarget::Device { device: DeviceRef::DefaultOutput }] });
+            bound_fader(&r.profile, target);
+            r.engine.reconcile_audio_bindings();
+            r.fake.change(|devices, _| { devices[0].volume = 0.2; devices[0].muted = true; devices[1].volume = 0.6; });
+            r.bridge.refresh();
+            finish_input(&r).await;
+            let report = r.bridge.audio.group_report("comms").unwrap();
+            assert_eq!(fader_value(&r.profile), report.summary.volume.unwrap() * 100.0);
+            assert!(report.summary.mixed);
+            assert_eq!(report.summary.mute, crate::system_audio::AudioGroupMute::Partial);
+            assert!(!r.engine.globals().contains_key("runs"));
+            assert_eq!(r.engine.globals().get("restored").map(String::as_str), Some("keep"));
+            assert!(r.fake.writes().is_empty());
+            press(&r.engine, 2);
+            finish_input(&r).await;
+            assert_eq!(r.fake.writes(), vec![FakeWrite::Muted("mic".into(), false), FakeWrite::Volume("mic".into(), 0.5), FakeWrite::Volume("spk".into(), 0.5)]);
+            assert_eq!(r.engine.globals().get("runs").map(String::as_str), Some("1"));
+            r.fake.change(|devices, _| { devices[0].volume = 0.1; devices[1].volume = 0.9; });
+            r.bridge.refresh(); finish_input(&r).await;
+            assert_eq!(r.engine.globals().get("runs").map(String::as_str), Some("1"));
+            assert_eq!(r.fake.writes().len(), 3);
         }
 
         #[tokio::test]

@@ -68,6 +68,49 @@ pub enum AudioTarget {
     FineTune {
         target: crate::finetune::FineTuneTarget,
     },
+    Group {
+        #[serde(rename = "groupId")]
+        group_id: String,
+    },
+}
+
+/// Group members cannot refer to another group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum AudioMemberTarget {
+    Device { device: DeviceRef },
+    App { app: AppRef },
+    WaveLink { target: crate::wavelink::WaveLinkTarget },
+    FineTune { target: crate::finetune::FineTuneTarget },
+}
+
+impl AudioMemberTarget {
+    pub fn target(&self) -> AudioTarget {
+        match self {
+            Self::Device { device } => AudioTarget::Device { device: device.clone() },
+            Self::App { app } => AudioTarget::App { app: app.clone() },
+            Self::WaveLink { target } => AudioTarget::WaveLink { target: target.clone() },
+            Self::FineTune { target } => AudioTarget::FineTune { target: target.clone() },
+        }
+    }
+
+    pub fn identity(&self) -> Self {
+        let mut member = self.clone();
+        match &mut member {
+            Self::Device { device: DeviceRef::Named { label, .. } } => label.clear(),
+            Self::App { app } => app.name.clear(),
+            _ => {}
+        }
+        member
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioGroup {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<AudioMemberTarget>,
 }
 
 #[cfg(test)]

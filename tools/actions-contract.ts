@@ -87,7 +87,7 @@ const TYPE_SOURCES: Record<string, string> = {
   "src-tauri/src/macros/model.rs":
     "CompareOp VarScope HttpMethod HttpResponse HttpHeader HttpBodyMode HttpFilePart HttpAuth ButtonRef ButtonTrigger Keystroke KeyEvent ObsTarget ObsMode VisibilityMode MuteMode VolumeUnit SystemVolumeMode SystemVolumeTarget SetAudioMode StudioMode WindowTarget WindowOp ObsHotkeyBy ScreenPick MouseStep ScrollAxis LoopMode LoopCheck",
   "src-tauri/src/profile/model.rs": "PadColor",
-  "src-tauri/src/profile/audio.rs": "AudioTarget DeviceRef AppRef AudioDeviceKind",
+  "src-tauri/src/profile/audio.rs": "AudioTarget AudioMemberTarget AudioGroup DeviceRef AppRef AudioDeviceKind",
   "src-tauri/src/wavelink/model.rs": "WaveLinkTarget",
   "src-tauri/src/finetune/model.rs": "FineTuneTarget FineTuneRoutingRequest",
   "src-tauri/src/desktop/mod.rs": "TitleMatch",

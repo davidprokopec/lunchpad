@@ -1,12 +1,14 @@
 import { emptyButton, newActionId, type Action, type AudioTarget, type Button, type PadColor } from "./api";
 
 export function muteCaption(target: AudioTarget, mic: string, output: string): string {
+  if (target.type === "group") return target.groupId;
   if (target.type === "waveLink") return "Wave Link";
   if (target.type === "fineTune") return "FineTune";
   return target.type === "app" ? target.app.name.slice(0, 12) : target.device.type === "named" ? target.device.label.slice(0, 12) : target.device.type === "defaultInput" ? mic : output;
 }
 
 export function muteButton({ target, caption, color, mutedColor }: { target: AudioTarget; caption: string; color: PadColor; mutedColor: PadColor }): Button {
+  if (target.type === "group") throw new Error("Audio group mute is unsupported in this milestone");
   const action = (): Action => ({ id: newActionId(), wait: true, type: "setAudio", target: structuredClone(target), mode: "holdMute", volume: 50, volumeFrom: null });
   return {
     ...emptyButton(),
