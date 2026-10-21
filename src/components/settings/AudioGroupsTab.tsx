@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { AudioGroup, Page } from "../../lib/api";
 import { audioGroupUses, type AudioGroupUse } from "../../lib/audioGroups";
@@ -20,11 +20,14 @@ export function AudioGroupsTab() {
   const { t } = useTranslation();
   const groups = useProfileStore((s) => s.profile?.audioGroups) ?? NO_GROUPS;
   const pages = useProfileStore((s) => s.profile?.pages) ?? NO_PAGES;
-  const [editing, setEditing] = useState<{ group: AudioGroup; key: number } | null>(null);
+  const [editing, setEditing] = useState<{ group: AudioGroup; key: number; isNew: boolean } | null>(null);
   const [pending, setPending] = useState(false);
-  const edit = (group: AudioGroup) => setEditing((current) => ({ group, key: (current?.key ?? 0) + 1 }));
+  const edit = (group: AudioGroup) => setEditing((current) => ({ group, key: (current?.key ?? 0) + 1, isNew: !groups.some((item) => item.id === group.id) }));
   const close = () => setEditing(null);
-  const isNew = !!editing && !groups.some((group) => group.id === editing.group.id);
+  // Fixed when editing starts: an existing group that disappears closes its editor, it never becomes a new draft.
+  const isNew = !!editing?.isNew;
+  const editedGone = !!editing && !editing.isNew && !groups.some((group) => group.id === editing.group.id);
+  useEffect(() => { if (editedGone) setEditing(null); }, [editedGone]);
   const editor = editing && <AudioGroupEditor key={editing.key} initial={editing.group} onPendingChange={setPending} onSaved={close} onDeleted={close} onCancel={close} />;
 
   return (
@@ -41,7 +44,7 @@ export function AudioGroupsTab() {
       <ul className="flex flex-col gap-2" aria-label={t("settings.tabs.audioGroups")}>
         {groups.map((group) => {
           const uses = audioGroupUses(pages, group.id);
-          const open = editing?.group.id === group.id;
+          const open = !isNew && editing?.group.id === group.id;
           return (
             <li key={group.id} aria-label={group.name} className={"flex flex-col gap-3 rounded-lg border px-3 py-2.5 " + (open ? "border-accent-500/50 bg-stage-800/70" : "border-stage-700 bg-stage-800/40")}>
               <div className="flex items-start justify-between gap-3">

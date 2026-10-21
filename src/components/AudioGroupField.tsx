@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, fineTuneAppCatalogue, type AudioGroup, type AudioMemberTarget } from "../lib/api";
 import { audioGroupFeedback, audioGroupValidation, audioMemberKey } from "../lib/audioGroups";
 import { useMediaStore } from "../store/media";
@@ -65,6 +65,12 @@ export function AudioGroupEditor({ initial, onSaved, onDeleted, onCancel, onPend
   const [confirmDelete, setConfirmDelete] = useState(false);
   const setPending = (value: boolean) => { setPendingState(value); onPendingChange?.(value); };
   const saved = groups.some((item) => item.id === draft.id);
+  // Whether this session edits an existing group, fixed when it opens. If that
+  // group then disappears (Undo, another editor, a profile switch), close the
+  // draft instead of letting it turn into a "new" group that recreates the old ID.
+  const [editsExisting] = useState(saved);
+  const gone = editsExisting && !saved;
+  useEffect(() => { if (gone) onCancel(); }, [gone, onCancel]);
   const validation = audioGroupValidation(draft);
   const duplicate = !!candidate && draft.members.some((member) => audioMemberKey(member) === audioMemberKey(candidate));
   const candidateError = candidate ? audioGroupValidation({ id: "candidate", name: "candidate", members: [candidate] }) : "Choose a target.";
@@ -86,7 +92,7 @@ export function AudioGroupEditor({ initial, onSaved, onDeleted, onCancel, onPend
       </div>
       {validation && <p className="text-xs text-stage-500">{validation}</p>}
       <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" variant="primary" disabled={!!validation} onClick={() => void run(() => api.setAudioGroup({ ...draft, name: draft.name.trim() }), () => onSaved(draft.id))}>{pending ? "Saving…" : "Save group"}</Button>
+        <Button size="sm" variant="primary" disabled={!!validation || gone} onClick={() => void run(() => api.setAudioGroup({ ...draft, name: draft.name.trim() }), () => onSaved(draft.id))}>{pending ? "Saving…" : "Save group"}</Button>
         <Button size="sm" onClick={onCancel}>Cancel</Button>
         {saved && <Button size="sm" variant="danger" className="ml-auto" onClick={() => setConfirmDelete(true)}>Delete group</Button>}
       </div>
