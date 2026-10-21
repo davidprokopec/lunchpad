@@ -1,6 +1,7 @@
 import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary, AudioGroupReport } from "./api";
 import { waveLinkControl } from "./waveLink";
 import { fineTuneApp, fineTuneReason } from "./fineTune";
+import { faderMutedColor, faderMutedLevel } from "./fader";
 
 export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "defaultInput" } };
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
@@ -97,8 +98,20 @@ export function audioFaderReadable(target: AudioTarget, status: AudioStatus | nu
   return target.type === "fineTune" ? !!audioState(target, status, waveLink, fineTune) : audioControllable(target, status, "volume", waveLink);
 }
 
-export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): Fader {
-  if (!fader.bound) return fader;
+/**
+ * How a bound fader looks with the latest observed state. Muted normally shows
+ * the minimum. With "keep level" (`mutedLevel`) a confirmed mute (a single
+ * target, or a group whose every member is known muted and has a readable
+ * level) keeps the stored level and is painted in `mutedColor`. Mirrors
+ * `Fader::render_state` in Rust. Display only: nothing is written.
+ */
+export function audioFaderView(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): { fader: Fader; mutedColor: [number, number, number] | null } {
+  if (!fader.bound) return { fader, mutedColor: null };
   const state = audioFaderReadable(fader.bound, status, waveLink, fineTune, groups) ? audioState(fader.bound, status, waveLink, fineTune, groups) : null;
-  return { ...fader, value: state && !state.muted && state.volume !== null ? fader.min + (fader.max - fader.min) * state.volume : fader.min };
+  if (state?.muted && faderMutedLevel(fader)) return { fader, mutedColor: faderMutedColor(fader) };
+  return { fader: { ...fader, value: state && !state.muted && state.volume !== null ? fader.min + (fader.max - fader.min) * state.volume : fader.min }, mutedColor: null };
+}
+
+export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): Fader {
+  return audioFaderView(fader, status, waveLink, fineTune, groups).fader;
 }

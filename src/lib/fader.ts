@@ -62,9 +62,18 @@ export function faderColorAt(f: Fader, step: number): [number, number, number] {
   return [mix(f.colorA[0], f.colorB[0]), mix(f.colorA[1], f.colorB[1]), mix(f.colorA[2], f.colorB[2])];
 }
 
-/** What a pad shows: its blend up to the level, dimmed above it. */
-export function faderPadRgb(f: Fader, step: number): [number, number, number] {
-  const c = faderColorAt(f, step);
+export const DEFAULT_MUTED_COLOR: [number, number, number] = [255, 0, 0];
+
+/** Older profiles omit these fields: off and red, as the `Fader` defaults in Rust. */
+export const faderMutedLevel = (f: Fader): boolean => f.mutedLevel ?? false;
+export const faderMutedColor = (f: Fader): [number, number, number] => f.mutedColor ?? DEFAULT_MUTED_COLOR;
+
+/**
+ * What a pad shows: its blend up to the level, dimmed above it. With `color`
+ * (the "keep level" mute look) every pad uses that one colour instead.
+ */
+export function faderPadRgb(f: Fader, step: number, color?: [number, number, number] | null): [number, number, number] {
+  const c = color ?? faderColorAt(f, step);
   if (step <= faderLevelStep(f)) return c;
   const k = Math.min(100, f.dim) / 100;
   return [Math.round(c[0] * k), Math.round(c[1] * k), Math.round(c[2] * k)];
@@ -121,6 +130,8 @@ export function newFader(x: number, y: number, layout: Layout | null): Fader {
     length: control ? 1 : Math.min(4, maxFaderLength(layout, x, y, direction)),
     colorA: [0, 96, 255],
     colorB: [255, 64, 32],
+    mutedLevel: false,
+    mutedColor: [...DEFAULT_MUTED_COLOR],
     dim: 12,
     min: 0,
     max: 100,

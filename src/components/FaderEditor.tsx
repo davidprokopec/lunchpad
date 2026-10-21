@@ -2,12 +2,12 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { emptyButton, FADER_VARIABLES, type Button, type Fader, type FaderDirection, type Layout, type Page } from "../lib/api";
-import { faderVariable, faderPadRgb, faderPads, formatFaderValue, hexToRgb, isControlCell, maxFaderLength, rgbToHex } from "../lib/fader";
+import { faderMutedColor, faderMutedLevel, faderVariable, faderPadRgb, faderPads, formatFaderValue, hexToRgb, isControlCell, maxFaderLength, rgbToHex } from "../lib/fader";
 import { useDeviceStore } from "../store/device";
 import { useProfileStore } from "../store/profile";
 import { useVariablesStore } from "../store/variables";
 import { useMediaStore } from "../store/media";
-import { audioActionConfigured, audioControllable, audioFader, audioFaderReadable, audioState, audioTargetConfigured } from "../lib/systemAudio";
+import { audioActionConfigured, audioControllable, audioFaderReadable, audioFaderView, audioState, audioTargetConfigured } from "../lib/systemAudio";
 import { AudioTargetField } from "./AudioTargetField";
 import { ActionsTab } from "./actions/ActionsTab";
 import { RgbField } from "./RgbField";
@@ -150,7 +150,8 @@ function FaderForm({
   const waveLink = useMediaStore((s) => s.waveLink);
   const fineTune = useMediaStore((s) => s.fineTune);
   const groups = useMediaStore((s) => s.audioGroups);
-  const shown = audioFader(fader, audio, waveLink, fineTune, groups);
+  const { fader: shown, mutedColor: shownMutedColor } = audioFaderView(fader, audio, waveLink, fineTune, groups);
+  const keepMutedLevel = faderMutedLevel(fader);
   const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune, groups);
   const displayUnavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
   const dirty = JSON.stringify(fader) !== JSON.stringify(initial);
@@ -272,7 +273,7 @@ function FaderForm({
           <div className="text-xs text-stage-400">{t("fader.preview")}</div>
           <div className="flex gap-1">
             {pads.map(([x, y], i) => {
-              const [r, g, b] = displayUnavailable ? (i === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shown, i);
+              const [r, g, b] = displayUnavailable ? (i === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shown, i, shownMutedColor);
               return <div key={`${x},${y}`} className="h-8 flex-1 rounded-md" style={{ backgroundColor: `rgb(${r}, ${g}, ${b})` }} title={`${x + 1}, ${y + 1}`} />;
             })}
             <div className="ml-2 self-center text-xs text-stage-400">{displayUnavailable ? t("audio.unavailableShort") : formatFaderValue(shown)}</div>
@@ -290,6 +291,25 @@ function FaderForm({
             {t("fader.dim")}
             <Slider value={fader.dim} min={0} max={60} onChange={(dim) => setFader({ ...fader, dim })} format={(v) => `${v} %`} ariaLabel={t("fader.dim")} />
           </div>
+        </section>
+        )}
+
+        {fader.bound && (
+        <section className="flex flex-col gap-2">
+          <div className="grid grid-cols-3 items-end gap-3">
+            <div className="flex flex-col gap-1 text-xs text-stage-400">
+              {t("fader.mutedLook")}
+              <Select<"dim" | "keep">
+                size="sm"
+                ariaLabel={t("fader.mutedLook")}
+                value={keepMutedLevel ? "keep" : "dim"}
+                options={[{ value: "dim", label: t("fader.mutedLooks.dim") }, { value: "keep", label: t("fader.mutedLooks.keep") }]}
+                onChange={(look) => setFader({ ...fader, mutedLevel: look === "keep", mutedColor: faderMutedColor(fader) })}
+              />
+            </div>
+            {keepMutedLevel && !control && <RgbField label={t("fader.mutedColor")} value={rgbToHex(faderMutedColor(fader))} onChange={(hex) => setFader({ ...fader, mutedColor: hexToRgb(hex) })} />}
+          </div>
+          <p className="text-xs text-stage-500">{t(keepMutedLevel ? "fader.mutedLookKeepHint" : "fader.mutedLookDimHint")}</p>
         </section>
         )}
 

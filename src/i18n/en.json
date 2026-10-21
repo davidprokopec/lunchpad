@@ -1052,6 +1052,14 @@
     "colorA": "Colour at the minimum",
     "colorB": "Colour at the maximum",
     "dim": "Brightness above the level",
+    "mutedLook": "Muted appearance",
+    "mutedLooks": {
+      "dim": "Dim to zero",
+      "keep": "Keep level in mute colour"
+    },
+    "mutedColor": "Mute colour",
+    "mutedLookDimHint": "While the target is muted, the fader shows zero.",
+    "mutedLookKeepHint": "While the target is muted, the fader keeps showing the level it had before, in the mute colour. A group counts as muted only when every member is muted. Changing this only changes how the fader looks; it never changes the volume or mute.",
     "min": "Value at the first pad",
     "max": "Value at the last pad",
     "unit": "Unit",

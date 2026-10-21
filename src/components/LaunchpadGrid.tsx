@@ -25,7 +25,7 @@ import { buttonsOutside, cornerRadius, cornersOf, isControl, isKey, legendSize, 
 import { PadLabel } from "./PadLabel";
 import { Description } from "./Description";
 import { Tooltip } from "./Tooltip";
-import { audioControllable, audioFader, audioFaderReadable } from "../lib/systemAudio";
+import { audioControllable, audioFaderReadable, audioFaderView } from "../lib/systemAudio";
 import { audioGroupFeedback } from "../lib/audioGroups";
 
 interface Props {
@@ -533,6 +533,12 @@ function Keyboard({ keys, height, columns, cell, renderPad }: { keys: PadSpec[];
 /** A strip of the fader's colours following the pointer while it is moved. */
 function FaderGhost({ fader, cell }: { fader: Fader; cell: number }) {
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const audio = useMediaStore((s) => s.systemAudio);
+  const waveLink = useMediaStore((s) => s.waveLink);
+  const fineTune = useMediaStore((s) => s.fineTune);
+  const groups = useMediaStore((s) => s.audioGroups);
+  // Only the muted look is taken from the live view; the ghost otherwise keeps showing the stored level as before.
+  const mutedColor = audioFaderView(fader, audio, waveLink, fineTune, groups).mutedColor;
   useEffect(() => {
     const onMove = (e: PointerEvent) => setPos({ x: e.clientX, y: e.clientY });
     window.addEventListener("pointermove", onMove);
@@ -546,7 +552,7 @@ function FaderGhost({ fader, cell }: { fader: Fader; cell: number }) {
   return createPortal(
     <div aria-hidden className={clsx("pointer-events-none fixed z-50 flex gap-0.5 opacity-90", vertical ? "flex-col" : "flex-row")} style={{ left: pos.x + 12, top: pos.y + 12 }}>
       {ordered.map((step) => {
-        const [r, g, b] = faderPadRgb(fader, step);
+        const [r, g, b] = faderPadRgb(fader, step, mutedColor);
         return <div key={step} className="rounded-sm shadow" style={{ width: size, height: size, backgroundColor: `rgb(${r}, ${g}, ${b})` }} />;
       })}
     </div>,
@@ -711,10 +717,10 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
   const fineTune = useMediaStore((s) => s.fineTune);
   const groups = useMediaStore((s) => s.audioGroups);
   const unavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
-  const shownFader = audioFader(fader, audio, waveLink, fineTune, groups);
+  const { fader: shownFader, mutedColor } = audioFaderView(fader, audio, waveLink, fineTune, groups);
   const groupReport = fader.bound?.type === "group" ? groups.find((group) => fader.bound?.type === "group" && group.groupId === fader.bound.groupId) : undefined;
   const key = corners === "key";
-  const blend = unavailable ? (step === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shownFader, step);
+  const blend = unavailable ? (step === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shownFader, step, mutedColor);
   const shown = limited ? limitedRgb({ r: blend[0], g: blend[1], b: blend[2] }) : { r: blend[0], g: blend[1], b: blend[2] };
   const { r, g, b } = shown;
   const isLevel = step === (unavailable ? 0 : faderLevelStep(shownFader));
@@ -727,7 +733,7 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
     >
       {isLevel && (
         <span className="px-1 text-center font-semibold leading-none" style={{ fontSize: Math.max(8, cell * (key ? 0.16 : 0.2)), color: bright ? "#111" : "#fff", textShadow: bright ? undefined : "0 1px 2px rgba(0,0,0,0.5)" }}>
-          {fader.bound?.type === "group" ? audioGroupFeedback(groupReport, true) : unavailable ? t("audio.unavailableShort") : formatFaderValue(shownFader)}
+          {fader.bound?.type === "group" && !mutedColor ? audioGroupFeedback(groupReport, true) : unavailable ? t("audio.unavailableShort") : formatFaderValue(shownFader)}
         </span>
       )}
       {step === 0 && !isLevel && fader.name && (
@@ -767,9 +773,11 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
   const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune, s.audioGroups));
   const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune, groups);
   const displayUnavailable = !!fader?.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
-  const shownFader = fader ? audioFader(fader, audio, waveLink, fineTune, groups) : null;
+  const view = fader ? audioFaderView(fader, audio, waveLink, fineTune, groups) : null;
+  const shownFader = view?.fader ?? null;
   const groupReport = fader?.bound?.type === "group" ? groups.find((group) => fader.bound?.type === "group" && group.groupId === fader.bound.groupId) : undefined;
-  const groupLabel = fader?.bound?.type === "group" ? audioGroupFeedback(groupReport, true) : null;
+  // A muted group with "keep level" shows its retained level, like a single target.
+  const groupLabel = fader?.bound?.type === "group" && !view?.mutedColor ? audioGroupFeedback(groupReport, true) : null;
   const missing = useProfileStore((s) => s.missingFiles);
   const hasMissing = !!button && [...button.down, ...button.up, ...button.hold].some((a) => a.type === "playSound" && missing.includes(a.file));
   const [mouseDown, setMouseDown] = useState(false);
