@@ -1,4 +1,5 @@
-import { fineTuneAppCatalogue, type FineTuneState, type FineTuneTarget } from "./api";
+import { fineTuneAppCatalogue, type FineTuneDevice, type FineTuneState, type FineTuneTarget } from "./api";
+import { resolveDevice, type DeviceMatch } from "./deviceIdentity";
 
 /** Never resolve a persisted app ID to the first of several current processes. */
 export function fineTuneApp(appId: string, state: FineTuneState | null) {
@@ -6,9 +7,20 @@ export function fineTuneApp(appId: string, state: FineTuneState | null) {
   return apps.length === 1 && (state?.capabilities?.includes("managedApps") || apps[0].active) ? apps[0] : null;
 }
 
+/**
+ * The live device a saved output/input target resolves to, and how (exact UID,
+ * driver-prefix swap, or unique label). Mirrors `FineTuneState::device` in Rust.
+ * Use `device.uid` for comparisons with the snapshot; the saved UID is unchanged.
+ */
+export function fineTuneDevice(target: FineTuneTarget, state: FineTuneState | null): { device: FineTuneDevice; match: DeviceMatch } | null {
+  if (target.type === "app" || !target.deviceUid || state?.status !== "ready" || !state.snapshot) return null;
+  const found = resolveDevice(target.deviceUid, target.label, target.type, state.snapshot.devices.map((device) => ({ device, id: device.uid, name: device.name, kind: device.direction })));
+  return found && { device: found.device.device, match: found.match };
+}
+
 export function fineTuneReason(target: FineTuneTarget, state: FineTuneState | null): string | null {
   if (state?.status !== "ready" || !state.snapshot) return "notReady";
-  if (target.type !== "app") return state.snapshot.devices.some((d) => d.uid === target.deviceUid && d.direction === target.type) ? null : "missingDevice";
+  if (target.type !== "app") return fineTuneDevice(target, state) ? null : "missingDevice";
   if (!target.appId) return "chooseApp";
   const apps = fineTuneAppCatalogue(state).filter((app) => app.appId === target.appId);
   if (apps.length > 1) return "ambiguous";

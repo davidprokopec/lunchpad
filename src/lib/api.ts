@@ -194,8 +194,8 @@ export interface FineTuneSettings {
 
 export type FineTuneTarget =
   | { type: "app"; appId: string }
-  | { type: "output"; deviceUid: string }
-  | { type: "input"; deviceUid: string };
+  | { type: "output"; deviceUid: string; label?: string }
+  | { type: "input"; deviceUid: string; label?: string };
 
 export type FineTuneRoutingRequest = { mode: "followDefault" } | { mode: "single"; deviceUID: string };
 export type FineTuneRouting = FineTuneRoutingRequest | { mode: "multi"; deviceUIDs: string[] };
@@ -751,8 +751,8 @@ export type ActionKind =
   | { type: "setAudio"; target: AudioTarget; mode: SetAudioMode; volume: number; volumeFrom: string | null }
   | { type: "waveLinkSetMainOutput"; outputDeviceId: string; outputId: string }
   | { type: "fineTuneSetAppRouting"; appId: string; routing: FineTuneRoutingRequest }
-  | { type: "fineTuneSetDefaultOutput"; deviceUid: string }
-  | { type: "fineTuneSetPreferredInput"; deviceUid: string }
+  | { type: "fineTuneSetDefaultOutput"; deviceUid: string; label?: string }
+  | { type: "fineTuneSetPreferredInput"; deviceUid: string; label?: string }
   | { type: "waveLinkSetMonitoredMix"; outputDeviceId: string; outputId: string; mixId: string }
   | { type: "stopAllSounds" }
   | { type: "setAudioDevice"; target: SystemVolumeTarget; device: string }

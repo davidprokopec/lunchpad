@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, fineTuneAppCatalogue, type AudioGroup, type AudioMemberTarget } from "../lib/api";
 import { audioGroupFeedback, audioGroupValidation, audioMemberKey } from "../lib/audioGroups";
+import { fineTuneDevice } from "../lib/fineTune";
 import { useMediaStore } from "../store/media";
 import { useProfileStore } from "../store/profile";
 import { AudioTargetField } from "./AudioTargetField";
@@ -35,8 +36,7 @@ export function useMemberLabel() {
       return `FineTune · ${app?.name ?? id}${app ? "" : " · Saved / unavailable"}`;
     }
     if (member.type === "fineTune" && member.target.type !== "app") {
-      const uid = member.target.deviceUid;
-      return `FineTune · ${fineTune?.snapshot?.devices.find((device) => device.uid === uid)?.name ?? uid} · Read-only`;
+      return `FineTune · ${fineTuneDevice(member.target, fineTune)?.device.name ?? member.target.label ?? member.target.deviceUid} · Read-only`;
     }
     const key = audioMemberKey(member);
     const name = waveLink?.controls.find((control) => audioMemberKey({ type: "waveLink", target: control.target }) === key)?.name;

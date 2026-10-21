@@ -23,8 +23,8 @@ pub fn validate_groups(groups: &[AudioGroup]) -> Result<(), String> {
                 AudioMemberTarget::App { app } => !app.id.trim().is_empty(),
                 AudioMemberTarget::FineTune { target } => match target {
                     crate::finetune::FineTuneTarget::App { app_id } => !app_id.trim().is_empty(),
-                    crate::finetune::FineTuneTarget::Input { device_uid }
-                    | crate::finetune::FineTuneTarget::Output { device_uid } => {
+                    crate::finetune::FineTuneTarget::Input { device_uid, .. }
+                    | crate::finetune::FineTuneTarget::Output { device_uid, .. } => {
                         !device_uid.trim().is_empty()
                     }
                 },

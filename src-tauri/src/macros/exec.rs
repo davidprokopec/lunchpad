@@ -374,7 +374,7 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                     .await,
             );
         }
-        ActionKind::FineTuneSetDefaultOutput { device_uid } => {
+        ActionKind::FineTuneSetDefaultOutput { device_uid, label } => {
             let Some(audio) = services.system_audio.as_ref() else {
                 return unavailable(action);
             };
@@ -382,11 +382,14 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                 action,
                 "FineTune",
                 audio
-                    .fine_tune_write(crate::finetune::Mutation::DefaultOutput(device_uid.clone()))
+                    .fine_tune_write(crate::finetune::Mutation::DefaultOutput(
+                        device_uid.clone(),
+                        label.clone(),
+                    ))
                     .await,
             );
         }
-        ActionKind::FineTuneSetPreferredInput { device_uid } => {
+        ActionKind::FineTuneSetPreferredInput { device_uid, label } => {
             let Some(audio) = services.system_audio.as_ref() else {
                 return unavailable(action);
             };
@@ -396,6 +399,7 @@ pub async fn execute_external(ctx: &RunContext, action: &Action) {
                 audio
                     .fine_tune_write(crate::finetune::Mutation::PreferredInput(
                         device_uid.clone(),
+                        label.clone(),
                     ))
                     .await,
             );

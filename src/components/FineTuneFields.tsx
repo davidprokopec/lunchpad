@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { fineTuneAppCatalogue, type Action } from "../lib/api";
-import { fineTuneApp, fineTunePlayback, fineTuneReason, fineTuneRoutingReason } from "../lib/fineTune";
+import { fineTuneApp, fineTuneDevice, fineTunePlayback, fineTuneReason, fineTuneRoutingReason } from "../lib/fineTune";
 import { useMediaStore } from "../store/media";
 import { Select } from "./Select";
 import { isMacOS } from "../lib/platform";
@@ -32,20 +32,26 @@ export function FineTuneAppField({ value, onChange }: { value: string; onChange:
   </div>;
 }
 
-/** Device selection/state only. FineTune does not expose device level writes. */
-export function FineTuneDeviceField({ value, direction, onChange, selection = true }: { value: string; direction: "input" | "output"; onChange: (deviceUid: string) => void; selection?: boolean }) {
+/**
+ * Device selection/state only. FineTune does not expose device level writes.
+ * `onChange` also reports the chosen device's name, saved as the fallback `label`.
+ * A saved UID that resolves by driver swap or label is not reported missing
+ * (`fineTuneDevice(...).match` tells exact from fallback).
+ */
+export function FineTuneDeviceField({ value, label, direction, onChange, selection = true }: { value: string; label?: string; direction: "input" | "output"; onChange: (deviceUid: string, label: string | undefined) => void; selection?: boolean }) {
   const { t } = useTranslation();
   const state = useMediaStore((s) => s.fineTune);
   const load = useMediaStore((s) => s.loadFineTune);
   useEffect(() => { if (isMacOS()) void load(); }, [load]);
   if (!isMacOS()) return <p role="status">{value} · {t("fineTune.status.unsupported")}</p>;
   const devices = state?.status === "ready" ? state.snapshot?.devices.filter((d) => d.direction === direction && (!selection || d.capabilities.selectable)) ?? [] : [];
+  const resolved = value ? fineTuneDevice({ type: direction, deviceUid: value, label }, state) : null;
   const options = devices.map((d) => ({ value: d.uid, label: d.name }));
   if (value && !options.some((option) => option.value === value)) options.push({ value, label: `${value} · ${t("audio.unavailableShort")}` });
   return <div className="flex min-w-0 flex-col gap-1 text-xs text-stage-400">
     {t(`fineTune.${direction}`)}
-    <Select size="sm" ariaLabel={t(`fineTune.${direction}`)} value={value || null} options={options} placeholder={t("fineTune.chooseDevice")} onChange={onChange} />
-    {(state?.status !== "ready" || (value && !devices.some((d) => d.uid === value))) && <p role="status" className="text-xs text-warn">{t(state?.status !== "ready" ? "fineTune.notReady" : "fineTune.missingDevice")}</p>}
+    <Select size="sm" ariaLabel={t(`fineTune.${direction}`)} value={value || null} options={options} placeholder={t("fineTune.chooseDevice")} onChange={(uid) => onChange(uid, devices.find((d) => d.uid === uid)?.name ?? (uid === value ? label : undefined))} />
+    {(state?.status !== "ready" || (value && !(resolved && devices.includes(resolved.device)))) && <p role="status" className="text-xs text-warn">{t(state?.status !== "ready" ? "fineTune.notReady" : "fineTune.missingDevice")}</p>}
   </div>;
 }
 

@@ -125,7 +125,7 @@ export function ActionEditor({ action, onChange, pages, layout, button }: Props)
       return <FineTuneRoutingEditor action={action} onChange={onChange} />;
     case "fineTuneSetDefaultOutput":
     case "fineTuneSetPreferredInput":
-      return <FineTuneDeviceField direction={action.type === "fineTuneSetDefaultOutput" ? "output" : "input"} value={action.deviceUid} onChange={(deviceUid) => onChange({ ...action, deviceUid })} />;
+      return <FineTuneDeviceField direction={action.type === "fineTuneSetDefaultOutput" ? "output" : "input"} value={action.deviceUid} label={action.label} onChange={(deviceUid, label) => onChange({ ...action, deviceUid, label })} />;
     case "launchApplication":
       return <LaunchEditor action={action} onChange={onChange} button={button} />;
     case "hotkey":

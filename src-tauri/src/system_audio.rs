@@ -224,17 +224,24 @@ impl SystemAudioState {
                     return None;
                 }
                 let kind = device.kind();
-                let found = self
-                    .devices
-                    .iter()
-                    .filter(|d| d.present && d.kind == kind)
-                    .find(|d| match device {
-                        DeviceRef::DefaultInput | DeviceRef::DefaultOutput => d.is_default,
-                        DeviceRef::Named { id, label, .. } if id.is_empty() => {
-                            d.name.eq_ignore_ascii_case(label.trim())
-                        }
-                        DeviceRef::Named { id, .. } => d.id == *id,
-                    })?;
+                let mut present = self.devices.iter().filter(|d| d.present && d.kind == kind);
+                let found = match device {
+                    DeviceRef::DefaultInput | DeviceRef::DefaultOutput => {
+                        present.find(|d| d.is_default)
+                    }
+                    DeviceRef::Named { id, label, .. } if id.is_empty() => {
+                        present.find(|d| d.name.eq_ignore_ascii_case(label.trim()))
+                    }
+                    // A saved id that is gone may still name the same device under
+                    // another driver prefix, or by its unique label; never rewritten.
+                    DeviceRef::Named { id, label, .. } => crate::profile::resolve_device(
+                        id,
+                        Some(label.as_str()),
+                        kind,
+                        present.map(|d| (d, d.id.as_str(), d.name.as_str(), d.kind)),
+                    )
+                    .map(|(d, _)| d),
+                }?;
                 Some(TargetState {
                     key: Resolved::Device {
                         id: found.id.clone(),
@@ -1553,11 +1560,11 @@ mod tests {
             .await
             .is_err());
         assert!(audio
-            .fine_tune_write(Mutation::DefaultOutput("out".into()))
+            .fine_tune_write(Mutation::DefaultOutput("out".into(), None))
             .await
             .is_err());
         assert!(audio
-            .fine_tune_write(Mutation::PreferredInput("in".into()))
+            .fine_tune_write(Mutation::PreferredInput("in".into(), None))
             .await
             .is_err());
         assert!(audio
@@ -2224,6 +2231,83 @@ mod tests {
             json["devices"][0].get("isDefault").is_some()
                 && json["devices"][0].get("canMute").is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn named_devices_follow_a_driver_swap_and_write_the_live_id() {
+        let apple_out = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+        let apple_in = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2";
+        let logi_out = "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+        let logi_in = "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2";
+        let fake = Arc::new(FakeAudio::new(
+            vec![
+                FakeAudio::device(logi_out, Output, true, 0.5),
+                FakeAudio::device(logi_in, Input, true, 0.5),
+            ],
+            vec![],
+        ));
+        let named = |id: &str, kind, label: &str| AudioTarget::Device {
+            device: DeviceRef::Named {
+                id: id.into(),
+                kind,
+                label: label.into(),
+            },
+        };
+        let state = read_state(&*fake);
+        assert_eq!(
+            state.resolve(&named(apple_out, Output, "")).map(|s| s.key),
+            Some(Resolved::Device {
+                id: logi_out.into(),
+                kind: Output
+            })
+        );
+        // :2 saved as an output is the wrong direction.
+        assert!(state.resolve(&named(apple_in, Output, "")).is_none());
+        let audio = SystemAudio::new(fake.clone(), SharedLive::default());
+        audio
+            .apply(
+                named(apple_out, Output, "PRO X 2"),
+                SetAudioMode::SetVolume,
+                30.0,
+            )
+            .await
+            .unwrap();
+        audio
+            .apply(named(apple_in, Input, "PRO X 2"), SetAudioMode::Mute, 0.0)
+            .await
+            .unwrap();
+        // Label fallback for an id that is otherwise gone.
+        fake.change(|d, _| d[0].name = "Headset".into());
+        audio
+            .apply(
+                named("gone", Output, "headset"),
+                SetAudioMode::SetVolume,
+                40.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.writes(),
+            vec![
+                FakeWrite::Volume(logi_out.into(), 0.3),
+                FakeWrite::Muted(logi_in.into(), true),
+                FakeWrite::Volume(logi_out.into(), 0.4),
+            ]
+        );
+        // A second driver claiming the same remainder: ambiguous, never written.
+        fake.change(|d, _| {
+            d.push(FakeAudio::device(
+                "OtherDriver:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1",
+                Output,
+                false,
+                0.5,
+            ))
+        });
+        assert!(audio
+            .apply(named(apple_out, Output, ""), SetAudioMode::SetVolume, 10.0)
+            .await
+            .is_err());
+        assert_eq!(fake.writes().len(), 3);
     }
 
     #[tokio::test]

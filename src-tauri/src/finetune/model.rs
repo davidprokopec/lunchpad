@@ -7,9 +7,20 @@ use serde::{Deserialize, Serialize};
     rename_all_fields = "camelCase"
 )]
 pub enum FineTuneTarget {
-    App { app_id: String },
-    Output { device_uid: String },
-    Input { device_uid: String },
+    App {
+        app_id: String,
+    },
+    /// `label` is the device name when it was chosen, the fallback match when the UID is gone.
+    Output {
+        device_uid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    Input {
+        device_uid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,20 +268,54 @@ impl FineTuneState {
         match target {
             FineTuneTarget::App { app_id } => self.app(app_id).err(),
             _ if self.status != FineTuneStatus::Ready => Some("FineTune is not ready".into()),
-            FineTuneTarget::Output { device_uid } | FineTuneTarget::Input { device_uid } => {
-                let direction = if matches!(target, FineTuneTarget::Output { .. }) {
-                    crate::profile::AudioDeviceKind::Output
-                } else {
-                    crate::profile::AudioDeviceKind::Input
-                };
-                (!self.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot
-                        .devices
-                        .iter()
-                        .any(|d| d.uid == *device_uid && d.direction == direction)
-                }))
-                .then(|| "FineTune device is missing".into())
-            }
+            _ => self
+                .device(target)
+                .is_none()
+                .then(|| "FineTune device is missing".into()),
         }
+    }
+
+    /// The live device a saved output/input target means (see
+    /// [`crate::profile::resolve_device`]); `None` for apps or when not ready.
+    pub fn device(
+        &self,
+        target: &FineTuneTarget,
+    ) -> Option<(&FineTuneDevice, crate::profile::DeviceMatch)> {
+        let (device_uid, label, direction) = match target {
+            FineTuneTarget::App { .. } => return None,
+            FineTuneTarget::Output { device_uid, label } => {
+                (device_uid, label, crate::profile::AudioDeviceKind::Output)
+            }
+            FineTuneTarget::Input { device_uid, label } => {
+                (device_uid, label, crate::profile::AudioDeviceKind::Input)
+            }
+        };
+        if self.status != FineTuneStatus::Ready {
+            return None;
+        }
+        self.snapshot
+            .as_ref()?
+            .resolve_device(device_uid, label.as_deref(), direction)
+    }
+}
+
+impl FineTuneSnapshot {
+    pub fn resolve_device(
+        &self,
+        device_uid: &str,
+        label: Option<&str>,
+        direction: crate::profile::AudioDeviceKind,
+    ) -> Option<(&FineTuneDevice, crate::profile::DeviceMatch)> {
+        if device_uid.is_empty() {
+            return None;
+        }
+        crate::profile::resolve_device(
+            device_uid,
+            label,
+            direction,
+            self.devices
+                .iter()
+                .map(|d| (d, d.uid.as_str(), d.name.as_str(), d.direction)),
+        )
     }
 }

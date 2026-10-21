@@ -202,6 +202,28 @@ async fn native_absolute_volume_uses_current_logical_id_but_pins_default_alias()
 }
 
 #[tokio::test]
+async fn driver_swapped_member_is_admitted_once_under_its_live_id() {
+    let apple = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+    let logi = "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+    let fake = Arc::new(FakeAudio::new(
+        vec![FakeAudio::device(logi, AudioDeviceKind::Output, true, 0.7)],
+        vec![],
+    ));
+    // The saved id and the live id are the same endpoint: one write, not two.
+    let audio = setup(fake.clone(), vec![member(apple), member(logi)]);
+    let report = audio.group_report("g").unwrap();
+    assert_eq!(report.members[0].volume, Some(0.7f32.into()));
+    assert_eq!(report.members[0].target, member(apple));
+    audio
+        .start_group_volume("g", 0.25, false)
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fake.writes(), vec![FakeWrite::Volume(logi.into(), 0.25)]);
+}
+
+#[tokio::test]
 async fn admitted_member_missing_at_execution_is_skipped_without_reappearance_write() {
     let fake = Arc::new(FakeAudio::new(
         vec![FakeAudio::device("out", AudioDeviceKind::Output, true, 0.7)],
@@ -566,6 +588,7 @@ async fn managed_inactive_fine_tune_volume_uses_protocol_readback_and_permission
         &AudioMemberTarget::FineTune {
             target: crate::finetune::FineTuneTarget::Output {
                 device_uid: "out".into(),
+                label: None,
             },
         },
         &SystemAudioState::default(),

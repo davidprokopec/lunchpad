@@ -2,6 +2,7 @@ import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneSt
 import { waveLinkControl } from "./waveLink";
 import { fineTuneApp, fineTuneReason } from "./fineTune";
 import { faderMutedColor, faderMutedLevel } from "./fader";
+import { resolveDevice } from "./deviceIdentity";
 
 export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "defaultInput" } };
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
@@ -55,8 +56,10 @@ export function audioState(target: AudioTarget | null | undefined, status: Audio
   }
   if (!status.available) return null;
   const ref = target.device;
+  // A saved id may come back under another driver prefix or only by its label (see deviceIdentity.ts).
+  if (ref.type === "named" && ref.id) return resolveDevice(ref.id, ref.label, ref.kind, status.devices.filter((d) => d.present))?.device ?? null;
   return status.devices.find((d) => d.present && (ref.type === "named"
-    ? d.kind === ref.kind && (ref.id ? d.id === ref.id : d.name.toLowerCase() === ref.label.trim().toLowerCase())
+    ? d.kind === ref.kind && d.name.toLowerCase() === ref.label.trim().toLowerCase()
     : d.isDefault && d.kind === (ref.type === "defaultInput" ? "input" : "output"))) ?? null;
 }
 

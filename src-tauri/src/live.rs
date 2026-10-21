@@ -144,18 +144,21 @@ impl StateLink {
                 let Some(snapshot) = state.snapshot.as_ref() else {
                     return false;
                 };
+                // Compare against the live UID the saved reference resolves to.
+                let live_uid = state.device(target).map(|(device, _)| &device.uid);
                 return match (&self.kind, target) {
                     (LinkKind::AudioMuted, FineTuneTarget::App { app_id }) => {
                         state.app(app_id).is_ok_and(|app| app.muted)
                     }
-                    (LinkKind::FineTuneDefaultOutput, FineTuneTarget::Output { device_uid }) => {
-                        snapshot.default_output.as_ref() == Some(device_uid)
+                    (LinkKind::FineTuneDefaultOutput, FineTuneTarget::Output { .. }) => {
+                        live_uid.is_some() && snapshot.default_output.as_ref() == live_uid
                     }
-                    (LinkKind::FineTunePreferredInput, FineTuneTarget::Input { device_uid }) => {
-                        snapshot.input_policy.preferred_device_uid.as_ref() == Some(device_uid)
+                    (LinkKind::FineTunePreferredInput, FineTuneTarget::Input { .. }) => {
+                        live_uid.is_some()
+                            && snapshot.input_policy.preferred_device_uid.as_ref() == live_uid
                     }
-                    (LinkKind::FineTuneDefaultInput, FineTuneTarget::Input { device_uid }) => {
-                        snapshot.default_input.as_ref() == Some(device_uid)
+                    (LinkKind::FineTuneDefaultInput, FineTuneTarget::Input { .. }) => {
+                        live_uid.is_some() && snapshot.default_input.as_ref() == live_uid
                     }
                     _ => false,
                 };
@@ -250,6 +253,62 @@ impl StateLink {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fine_tune_links_follow_a_driver_swapped_device_without_rewriting_it() {
+        use crate::finetune::*;
+        use crate::profile::AudioTarget;
+        let apple_out = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+        let apple_in = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2";
+        let snapshot: FineTuneSnapshot =
+            serde_json::from_value(crate::finetune::tests::swapped_snapshot()).unwrap();
+        let mut live = LiveStatus {
+            fine_tune: FineTuneState {
+                status: FineTuneStatus::Ready,
+                snapshot: Some(snapshot),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let link = |kind, target| StateLink {
+            provider: LinkProvider::FineTune,
+            kind,
+            target: Some(AudioTarget::FineTune { target }),
+            scene: String::new(),
+            source: String::new(),
+            wave_link_mix_id: None,
+        };
+        let output = |uid: &str| FineTuneTarget::Output {
+            device_uid: uid.into(),
+            label: None,
+        };
+        let input = |uid: &str| FineTuneTarget::Input {
+            device_uid: uid.into(),
+            label: None,
+        };
+        let links = [
+            link(LinkKind::FineTuneDefaultOutput, output(apple_out)),
+            link(LinkKind::FineTunePreferredInput, input(apple_in)),
+            link(LinkKind::FineTuneDefaultInput, input(apple_in)),
+        ];
+        for l in &links {
+            assert!(l.is_active(&live), "{:?}", l.kind);
+        }
+        // The saved reference is untouched by resolution.
+        assert_eq!(
+            links[0].target,
+            Some(AudioTarget::FineTune {
+                target: output(apple_out)
+            })
+        );
+        // Wrong direction (:2 saved as output) is not lit.
+        assert!(!link(LinkKind::FineTuneDefaultOutput, output(apple_in)).is_active(&live));
+        // Another output becoming default turns the resolved link off.
+        let snapshot = live.fine_tune.snapshot.as_mut().unwrap();
+        snapshot.default_output = Some("BuiltInSpeakerDevice".into());
+        assert!(!links[0].is_active(&live));
+    }
+
     #[cfg(unix)]
     #[test]
     fn fine_tune_links_follow_only_ready_snapshot_visible_targets() {
@@ -277,18 +336,21 @@ mod tests {
                 LinkKind::FineTuneDefaultOutput,
                 FineTuneTarget::Output {
                     device_uid: "out".into(),
+                    label: None,
                 },
             ),
             (
                 LinkKind::FineTunePreferredInput,
                 FineTuneTarget::Input {
                     device_uid: "in".into(),
+                    label: None,
                 },
             ),
             (
                 LinkKind::FineTuneDefaultInput,
                 FineTuneTarget::Input {
                     device_uid: "in".into(),
+                    label: None,
                 },
             ),
         ] {
@@ -325,6 +387,7 @@ mod tests {
             target: Some(AudioTarget::FineTune {
                 target: FineTuneTarget::Output {
                     device_uid: "out".into(),
+                    label: None,
                 },
             }),
             scene: String::new(),

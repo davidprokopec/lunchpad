@@ -1,5 +1,5 @@
 import type { AudioStatus, ObsState, SlobsState, StateLink, WaveLinkState, FineTuneState, AudioGroupReport } from "./api";
-import { fineTuneReason } from "./fineTune";
+import { fineTuneDevice, fineTuneReason } from "./fineTune";
 import { audioControllable, audioState } from "./systemAudio";
 
 /**
@@ -14,8 +14,10 @@ export function isLinkActive(link: StateLink | null | undefined, obs: ObsState |
     const target = link.target.target;
     if (link.kind === "audioMuted") return audioState(link.target, audio, waveLink, fineTune)?.muted === true;
     if (fineTuneReason(target, fineTune)) return false;
-    if (target.type === "output") return link.kind === "fineTuneDefaultOutput" && fineTune.snapshot.defaultOutput === target.deviceUid;
-    if (target.type === "input") return link.kind === "fineTunePreferredInput" ? fineTune.snapshot.inputPolicy.preferredDeviceUID === target.deviceUid : link.kind === "fineTuneDefaultInput" && fineTune.snapshot.defaultInput === target.deviceUid;
+    const uid = fineTuneDevice(target, fineTune)?.device.uid;
+    if (!uid) return false;
+    if (target.type === "output") return link.kind === "fineTuneDefaultOutput" && fineTune.snapshot.defaultOutput === uid;
+    if (target.type === "input") return link.kind === "fineTunePreferredInput" ? fineTune.snapshot.inputPolicy.preferredDeviceUID === uid : link.kind === "fineTuneDefaultInput" && fineTune.snapshot.defaultInput === uid;
     return false;
   }
   if (link.provider === "waveLink") {

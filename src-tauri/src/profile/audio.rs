@@ -99,6 +99,11 @@ impl AudioMemberTarget {
         match &mut member {
             Self::Device { device: DeviceRef::Named { label, .. } } => label.clear(),
             Self::App { app } => app.name.clear(),
+            Self::FineTune {
+                target:
+                    crate::finetune::FineTuneTarget::Output { label, .. }
+                    | crate::finetune::FineTuneTarget::Input { label, .. },
+            } => *label = None,
             _ => {}
         }
         member

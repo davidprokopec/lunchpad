@@ -216,24 +216,12 @@ fn observe(
                         }
                         Err(error) => report.reason = Some(error),
                     },
-                    crate::finetune::FineTuneTarget::Input { device_uid }
-                    | crate::finetune::FineTuneTarget::Output { device_uid } => {
+                    crate::finetune::FineTuneTarget::Input { .. }
+                    | crate::finetune::FineTuneTarget::Output { .. } => {
                         if let Some(reason) = fine.target_reason(target) {
                             report.reason = Some(reason);
                         } else {
-                            let direction = if matches!(
-                                target,
-                                crate::finetune::FineTuneTarget::Input { .. }
-                            ) {
-                                AudioDeviceKind::Input
-                            } else {
-                                AudioDeviceKind::Output
-                            };
-                            if let Some(device) = fine.snapshot.as_ref().and_then(|snapshot| {
-                                snapshot.devices.iter().find(|device| {
-                                    device.uid == *device_uid && device.direction == direction
-                                })
-                            }) {
+                            if let Some((device, _)) = fine.device(target) {
                                 report.volume = device
                                     .capabilities
                                     .volume_readable

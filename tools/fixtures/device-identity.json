@@ -1,0 +1,67 @@
+[
+  { "name": "exact id wins",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": "PRO X 2", "kind": "output" },
+    "live": [
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2", "kind": "output" },
+      { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2", "kind": "output" }
+    ],
+    "expected": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "match": "exact" } },
+  { "name": "Apple to Logitech driver swap, :1 output",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": null, "kind": "output" },
+    "live": [
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "output" },
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2", "name": "PRO X 2 LIGHTSPEED", "kind": "input" },
+      { "id": "BuiltInSpeakerDevice", "name": "MacBook Pro Speakers", "kind": "output" }
+    ],
+    "expected": { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "match": "driver" } },
+  { "name": "Logitech to Apple driver swap, :2 input",
+    "saved": { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2", "label": null, "kind": "input" },
+    "live": [
+      { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "output" },
+      { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2", "name": "PRO X 2 LIGHTSPEED", "kind": "input" }
+    ],
+    "expected": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2", "match": "driver" } },
+  { "name": "wrong direction stays unresolved",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": "PRO X 2 LIGHTSPEED", "kind": "input" },
+    "live": [
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "output" }
+    ],
+    "expected": null },
+  { "name": "two drivers with the same remainder are ambiguous, no label fallback",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": "PRO X 2", "kind": "output" },
+    "live": [
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2", "kind": "output" },
+      { "id": "OtherDriver:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2", "kind": "output" }
+    ],
+    "expected": null },
+  { "name": "label fallback, case and spacing insensitive",
+    "saved": { "id": "old-uid", "label": " usb mic ", "kind": "input" },
+    "live": [
+      { "id": "new-uid", "name": "USB Mic", "kind": "input" },
+      { "id": "spk", "name": "USB Mic", "kind": "output" }
+    ],
+    "expected": { "id": "new-uid", "match": "label" } },
+  { "name": "ambiguous label stays unresolved",
+    "saved": { "id": "old-uid", "label": "USB Mic", "kind": "input" },
+    "live": [
+      { "id": "a", "name": "USB Mic", "kind": "input" },
+      { "id": "b", "name": "usb mic", "kind": "input" }
+    ],
+    "expected": null },
+  { "name": "no label means no name fallback",
+    "saved": { "id": "old-uid", "label": null, "kind": "input" },
+    "live": [ { "id": "new-uid", "name": "USB Mic", "kind": "input" } ],
+    "expected": null },
+  { "name": "Windows endpoint ids are never prefix-stripped",
+    "saved": { "id": "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}", "label": null, "kind": "output" },
+    "live": [ { "id": "{0.0.0.00000000}.{99999999-2222-3333-4444-555555555555}", "name": "Speakers", "kind": "output" } ],
+    "expected": null },
+  { "name": "Windows endpoint can still fall back to its unique label",
+    "saved": { "id": "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}", "label": "Speakers", "kind": "output" },
+    "live": [ { "id": "{0.0.0.00000000}.{99999999-2222-3333-4444-555555555555}", "name": "Speakers", "kind": "output" } ],
+    "expected": { "id": "{0.0.0.00000000}.{99999999-2222-3333-4444-555555555555}", "match": "label" } },
+  { "name": "short colon ids are not prefix-stripped",
+    "saved": { "id": "00-11-22-33-44-55:output", "label": null, "kind": "output" },
+    "live": [ { "id": "aa-11-22-33-44-55:output", "name": "AirPods", "kind": "output" } ],
+    "expected": null }
+]

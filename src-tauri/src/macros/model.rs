@@ -514,10 +514,16 @@ pub enum ActionKind {
     #[serde(rename_all = "camelCase")]
     FineTuneSetDefaultOutput {
         device_uid: String,
+        /// Device name when it was chosen; matched when the UID is gone
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     FineTuneSetPreferredInput {
         device_uid: String,
+        /// Device name when it was chosen; matched when the UID is gone
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Set a discovered mix on a qualified Wave Link output.
     #[serde(rename_all = "camelCase")]

@@ -40,8 +40,9 @@ pub(crate) enum Mutation {
     Volume(String, f64),
     Mute(String, bool),
     Routing(String, FineTuneRoutingRequest),
-    DefaultOutput(String),
-    PreferredInput(String),
+    /// Saved device UID and optional saved label, resolved against the snapshot at write time.
+    DefaultOutput(String, Option<String>),
+    PreferredInput(String, Option<String>),
 }
 
 enum Command {
@@ -683,25 +684,23 @@ fn mutation_params(
         .snapshot
         .as_ref()
         .ok_or("FineTune snapshot unavailable")?;
-    let device = |uid: &str, direction| {
-        if uid.is_empty()
-            || !snapshot
-                .devices
-                .iter()
-                .any(|d| d.uid == uid && d.direction == direction && d.capabilities.selectable)
-        {
-            Err("FineTune device is missing or not selectable".to_string())
-        } else {
-            Ok(())
-        }
+    // The saved reference is resolved against the snapshot the write is fenced on;
+    // the matched live UID is what FineTune is asked to select.
+    let device = |uid: &str, label: Option<&str>, direction| {
+        snapshot
+            .resolve_device(uid, label, direction)
+            .map(|(d, _)| d)
+            .filter(|d| d.capabilities.selectable)
+            .map(|d| d.uid.clone())
+            .ok_or_else(|| "FineTune device is missing or not selectable".to_string())
     };
     match mutation {
-        Mutation::DefaultOutput(uid) => {
-            device(&uid, AudioDeviceKind::Output)?;
+        Mutation::DefaultOutput(uid, label) => {
+            let uid = device(&uid, label.as_deref(), AudioDeviceKind::Output)?;
             Ok(("setDefaultOutput", json!({"deviceUID":uid})))
         }
-        Mutation::PreferredInput(uid) => {
-            device(&uid, AudioDeviceKind::Input)?;
+        Mutation::PreferredInput(uid, label) => {
+            let uid = device(&uid, label.as_deref(), AudioDeviceKind::Input)?;
             Ok(("setPreferredInput", json!({"deviceUID":uid})))
         }
         mutation => {
@@ -733,9 +732,14 @@ fn mutation_params(
                     if matches!(app.routing.requested, FineTuneRouting::Multi { .. }) {
                         return Err("FineTune multi routing is read-only".into());
                     }
-                    if let FineTuneRoutingRequest::Single { device_uid } = &routing {
-                        device(device_uid, AudioDeviceKind::Output)?;
-                    }
+                    let routing = match routing {
+                        FineTuneRoutingRequest::Single { device_uid } => {
+                            FineTuneRoutingRequest::Single {
+                                device_uid: device(&device_uid, None, AudioDeviceKind::Output)?,
+                            }
+                        }
+                        routing => routing,
+                    };
                     params["routing"] = serde_json::to_value(routing).map_err(|e| e.to_string())?;
                     "setAppRouting"
                 }

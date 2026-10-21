@@ -31,8 +31,14 @@ test("FineTune target and routing metadata preserve frozen UID spelling", () => 
   expect(data.types.AudioTarget.variants?.find((variant) => variant.value === "fineTune")?.fields).toEqual([{ name: "target", type: "FineTuneTarget" }]);
   expect(data.types.FineTuneTarget.tag).toBe("type");
   expect(data.types.FineTuneTarget.variants?.map((variant) => [variant.value, variant.fields.map((field) => field.name)])).toEqual([
-    ["app", ["appId"]], ["output", ["deviceUid"]], ["input", ["deviceUid"]],
+    ["app", ["appId"]], ["output", ["deviceUid", "label"]], ["input", ["deviceUid", "label"]],
   ]);
+  // The fallback label is optional, so profiles without it stay valid.
+  for (const variant of data.types.FineTuneTarget.variants?.filter((v) => v.value !== "app") ?? []) expect(variant.fields.find((field) => field.name === "label")).toMatchObject({ type: "text", nullable: true, optional: true });
+  for (const type of ["fineTuneSetDefaultOutput", "fineTuneSetPreferredInput"]) {
+    expect(data.payloads[type].fields.map((field) => field.name)).toEqual(["deviceUid", "label"]);
+    expect(data.payloads[type].fields[1]).toMatchObject({ nullable: true, optional: true });
+  }
   expect(data.types.FineTuneRoutingRequest.tag).toBe("mode");
   expect(data.types.FineTuneRoutingRequest.variants?.map((variant) => [variant.value, variant.fields.map((field) => field.name)])).toEqual([
     ["followDefault", []], ["single", ["deviceUID"]],

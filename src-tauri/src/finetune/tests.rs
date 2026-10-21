@@ -497,12 +497,14 @@ async fn disabled_integration_never_connects_and_enable_disable_reenable_is_fenc
     assert!(disabled.target_reason(&target).is_some());
     assert!(disabled
         .target_reason(&FineTuneTarget::Output {
-            device_uid: "out".into()
+            device_uid: "out".into(),
+            label: None,
         })
         .is_some());
     assert!(disabled
         .target_reason(&FineTuneTarget::Input {
-            device_uid: "in".into()
+            device_uid: "in".into(),
+            label: None,
         })
         .is_some());
     assert!(fine
@@ -691,8 +693,8 @@ async fn missing_ambiguous_permission_and_device_validation_never_write() {
     .unwrap_err()
     .contains("permission"));
     for mutation in [
-        Mutation::DefaultOutput("in".into()),
-        Mutation::PreferredInput("missing".into()),
+        Mutation::DefaultOutput("in".into(), None),
+        Mutation::PreferredInput("missing".into(), None),
     ] {
         let handle = fine.clone();
         assert!(
@@ -871,12 +873,12 @@ async fn routing_and_device_selection_use_exact_wire_fields_and_snapshot_policy(
             json!({"appId":"app","pid":123,"routing":{"mode":"single","deviceUID":"out"}}),
         ),
         (
-            Mutation::DefaultOutput("out".into()),
+            Mutation::DefaultOutput("out".into(), None),
             "setDefaultOutput",
             json!({"deviceUID":"out"}),
         ),
         (
-            Mutation::PreferredInput("in".into()),
+            Mutation::PreferredInput("in".into(), None),
             "setPreferredInput",
             json!({"deviceUID":"in"}),
         ),
@@ -926,4 +928,150 @@ fn full_snapshot_schema_requires_nullable_fields_and_roundtrips_exact_uid_keys()
         .unwrap()
         .remove("muted");
     assert!(serde_json::from_value::<FineTuneSnapshot>(invalid).is_err());
+}
+
+const APPLE_OUT: &str = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+const APPLE_IN: &str = "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2";
+const LOGI_OUT: &str = "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1";
+const LOGI_IN: &str = "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:2";
+
+/// The headset after a replug under the Logitech driver.
+pub(crate) fn swapped_snapshot() -> Value {
+    let mut state = snapshot();
+    state["devices"][0]["uid"] = json!(LOGI_OUT);
+    state["devices"][0]["name"] = json!("PRO X 2");
+    state["devices"][1]["uid"] = json!(LOGI_IN);
+    state["devices"][1]["name"] = json!("PRO X 2");
+    state["defaultOutput"] = json!(LOGI_OUT);
+    state["defaultInput"] = json!(LOGI_IN);
+    state["inputPolicy"]["preferredDeviceUID"] = json!(LOGI_IN);
+    state["inputPolicy"]["lockedDeviceUID"] = json!(LOGI_IN);
+    state["apps"][0]["routing"]["appliedDeviceUIDs"] = json!([LOGI_OUT]);
+    state
+}
+
+#[tokio::test]
+async fn saved_uids_resolve_across_a_driver_swap_and_write_the_live_uid() {
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.accept().await;
+    peer.snapshot = swapped_snapshot();
+    peer.hello().await;
+    let request = peer.request().await;
+    peer.snapshot_reply(&request).await;
+    until(&fine, |state| state.status == FineTuneStatus::Ready).await;
+    let state = fine.state();
+    let generation = state.generation;
+    let output = FineTuneTarget::Output {
+        device_uid: APPLE_OUT.into(),
+        label: None,
+    };
+    assert!(state.target_reason(&output).is_none());
+    let (device, matched) = state.device(&output).unwrap();
+    assert_eq!(
+        (device.uid.as_str(), matched),
+        (LOGI_OUT, crate::profile::DeviceMatch::Driver)
+    );
+    for (mutation, method, params) in [
+        (
+            Mutation::DefaultOutput(APPLE_OUT.into(), None),
+            "setDefaultOutput",
+            json!({"deviceUID":LOGI_OUT}),
+        ),
+        (
+            Mutation::PreferredInput(APPLE_IN.into(), None),
+            "setPreferredInput",
+            json!({"deviceUID":LOGI_IN}),
+        ),
+        (
+            Mutation::DefaultOutput("gone".into(), Some("pro x 2".into())),
+            "setDefaultOutput",
+            json!({"deviceUID":LOGI_OUT}),
+        ),
+        (
+            Mutation::Routing(
+                "app".into(),
+                FineTuneRoutingRequest::Single {
+                    device_uid: APPLE_OUT.into(),
+                },
+            ),
+            "setAppRouting",
+            json!({"appId":"app","pid":123,"routing":{"mode":"single","deviceUID":LOGI_OUT}}),
+        ),
+    ] {
+        let handle = fine.clone();
+        let write = tokio::task::spawn_blocking(move || handle.write(generation, mutation));
+        let request = peer.request().await;
+        assert_eq!(request["method"], method);
+        assert_eq!(request["params"], params);
+        peer.reply(&request, json!({"accepted":true})).await;
+        peer.getter().await;
+        write.await.unwrap().unwrap();
+    }
+    // A second driver claiming the same headset makes the saved UID ambiguous: never guessed.
+    let mut other = peer.snapshot["devices"][0].clone();
+    other["uid"] = json!("OtherDriver:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1");
+    other["isDefault"] = json!(false);
+    peer.snapshot["devices"].as_array_mut().unwrap().push(other);
+    peer.revision += 1;
+    peer.event().await;
+    until(&fine, |state| state.server_revision == Some(peer.revision)).await;
+    assert!(fine.state().target_reason(&output).is_some());
+    for mutation in [
+        Mutation::DefaultOutput(APPLE_OUT.into(), Some("PRO X 2".into())),
+        // The :2 input never stands in for an output.
+        Mutation::DefaultOutput(APPLE_IN.into(), None),
+        Mutation::PreferredInput(APPLE_OUT.into(), None),
+    ] {
+        let handle = fine.clone();
+        let error = tokio::task::spawn_blocking(move || handle.write(generation, mutation))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+    }
+    fine.refresh();
+    peer.getter().await;
+    fine.shutdown();
+    peer.closed().await;
+}
+
+#[test]
+fn device_targets_roundtrip_with_and_without_a_label() {
+    let labelled = json!({"type":"output","deviceUid":APPLE_OUT,"label":"PRO X 2"});
+    let target: FineTuneTarget = serde_json::from_value(labelled.clone()).unwrap();
+    assert_eq!(
+        target,
+        FineTuneTarget::Output {
+            device_uid: APPLE_OUT.into(),
+            label: Some("PRO X 2".into())
+        }
+    );
+    assert_eq!(serde_json::to_value(&target).unwrap(), labelled);
+    // Old profiles have no label and must write back byte-identical.
+    let old = r#"{"type":"fineTune","target":{"type":"input","deviceUid":"in"}}"#;
+    let parsed: crate::profile::AudioTarget = serde_json::from_str(old).unwrap();
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+    for (old, kind) in [
+        (
+            r#"{"type":"fineTuneSetDefaultOutput","deviceUid":"out"}"#,
+            "fineTuneSetDefaultOutput",
+        ),
+        (
+            r#"{"type":"fineTuneSetPreferredInput","deviceUid":"in"}"#,
+            "fineTuneSetPreferredInput",
+        ),
+    ] {
+        let action: crate::macros::ActionKind = serde_json::from_str(old).unwrap();
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["type"], kind);
+        assert_eq!(value.as_object().unwrap().len(), 2, "{value}");
+        let with_label: crate::macros::ActionKind =
+            serde_json::from_value(json!({"type":kind,"deviceUid":"out","label":"Speakers"}))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&with_label).unwrap()["label"],
+            "Speakers"
+        );
+    }
 }
