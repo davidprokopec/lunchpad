@@ -469,7 +469,8 @@ impl Fader {
 
     /// The level the pads show. An unbound fader shows its value; a bound one shows its
     /// value while the target is there, the minimum while muted unless retained-level
-    /// appearance is enabled, and `None` ("unavailable") while the target is missing.
+    /// appearance is enabled, and `None` ("unavailable") while the target is missing or
+    /// not readable. A visible FineTune app stays readable without write permission.
     pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
         self.render_state(live).map(|(value, _)| value)
     }
@@ -483,7 +484,12 @@ impl Fader {
             return Some((if muted_look { self.value } else { self.min + (self.max - self.min) * volume }, muted_look));
         }
         let state = live.resolve_audio(target)?;
-        if !state.can_set_volume {
+        let readable = match target {
+            AudioTarget::FineTune { .. } => true,
+            AudioTarget::WaveLink { target } => state.can_set_volume && live.wave_link.control(target).is_some_and(|control| control.level.is_some()),
+            _ => state.can_set_volume,
+        };
+        if !readable {
             return None;
         }
         let muted_look = self.muted_level && state.muted;

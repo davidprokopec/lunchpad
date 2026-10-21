@@ -235,6 +235,63 @@ mod tests {
         assert_eq!(plain.render_value(&empty), Some(30.0));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_only_fine_tune_app_renders_observed_state_in_both_muted_modes() {
+        use crate::finetune::{FineTuneCapturePermission, FineTuneSnapshot, FineTuneState, FineTuneStatus, FineTuneTarget};
+        use crate::profile::{AudioTarget, Fader};
+        let inputs = inputs();
+        let layout = driver_for(LaunchpadModel::LaunchpadMk2).layout();
+        let mut snapshot: FineTuneSnapshot = serde_json::from_value(crate::finetune::tests::snapshot()).unwrap();
+        snapshot.permission.audio_capture = FineTuneCapturePermission::Denied;
+        inputs.live.lock().fine_tune = FineTuneState { status: FineTuneStatus::Ready, snapshot: Some(snapshot), ..Default::default() };
+        let target = AudioTarget::FineTune { target: FineTuneTarget::App { app_id: "app".into() } };
+        {
+            let live = inputs.live.lock();
+            assert!(live.fine_tune.writable_app("app").is_err(), "writes stay rejected");
+            assert!(!live.resolve_audio(&target).unwrap().can_set_volume, "fader presses stay rejected");
+        }
+        let base = Fader { id: "ft".into(), x: 0, y: 0, length: 5, min: 0.0, max: 100.0, value: 50.0, dim: 25, muted_color: [200, 80, 40], bound: Some(target), ..Fader::default() };
+        for muted_level in [false, true] {
+            let fader = Fader { muted_level, ..base.clone() };
+            inputs.profile.lock().profile.pages[0].faders = vec![fader.clone()];
+            inputs.live.lock().fine_tune.snapshot.as_mut().unwrap().apps[0].muted = false;
+            let frame = build_frame(&layout, &inputs);
+            for (step, pad) in fader.pads().iter().enumerate() {
+                let [r, g, b] = fader.pad_rgb(step);
+                assert_eq!(frame[pad], LedColor::Rgb(Color::new(r, g, b)), "unmuted shows the stored level, not unavailable");
+            }
+            inputs.live.lock().fine_tune.snapshot.as_mut().unwrap().apps[0].muted = true;
+            let frame = build_frame(&layout, &inputs);
+            let zero = Fader { value: 0.0, ..fader.clone() };
+            for (step, pad) in fader.pads().iter().enumerate() {
+                let expected = if !muted_level {
+                    let [r, g, b] = zero.pad_rgb(step);
+                    if r == 0 && g == 0 && b == 0 { LedColor::Off } else { LedColor::Rgb(Color::new(r, g, b)) }
+                } else if step <= 2 {
+                    LedColor::Rgb(Color::new(200, 80, 40))
+                } else {
+                    LedColor::Rgb(Color::new(50, 20, 10))
+                };
+                assert_eq!(frame[pad], expected, "muted_level={muted_level} step={step}");
+            }
+            assert_eq!(inputs.profile.lock().profile.pages[0].faders[0].value, 50.0);
+        }
+    }
+
+    #[test]
+    fn wave_link_control_without_a_level_is_unavailable_not_zero() {
+        use crate::profile::{AudioTarget, Fader};
+        use crate::wavelink::{WaveLinkControl, WaveLinkState, WaveLinkStatus, WaveLinkTarget};
+        let target = WaveLinkTarget::Channel { channel_id: "c".into() };
+        let control = WaveLinkControl { target: target.clone(), name: "C".into(), level: None, muted: Some(true), can_set_level: true, can_mute: true, reason: None, gain: None };
+        let mut live = crate::live::LiveStatus { wave_link: WaveLinkState { status: WaveLinkStatus::Ready, controls: vec![control], ..Default::default() }, ..Default::default() };
+        let fader = Fader { value: 60.0, muted_level: true, bound: Some(AudioTarget::WaveLink { target }), ..Fader::default() };
+        assert_eq!(fader.render_value(&live), None);
+        live.wave_link.controls[0].level = Some(0.6);
+        assert_eq!(fader.render_value(&live), Some(60.0));
+    }
+
     #[test]
     fn muted_fader_frames_use_retained_level_and_custom_color_in_every_direction() {
         use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef, Fader, FaderDirection};
