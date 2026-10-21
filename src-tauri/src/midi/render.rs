@@ -234,4 +234,40 @@ mod tests {
         let plain = Fader { bound: None, value: 30.0, ..dimmed };
         assert_eq!(plain.render_value(&empty), Some(30.0));
     }
+
+    #[test]
+    fn muted_fader_frames_use_retained_level_and_custom_color_in_every_direction() {
+        use crate::profile::{AudioDeviceKind, AudioTarget, DeviceRef, Fader, FaderDirection};
+        use crate::system_audio::{FakeAudio, SystemAudioState};
+        let inputs = inputs();
+        let layout = driver_for(LaunchpadModel::LaunchpadMk2).layout();
+        let mut mic = FakeAudio::device("m", AudioDeviceKind::Input, true, 0.1);
+        mic.muted = true;
+        inputs.live.lock().system = SystemAudioState { available: true, devices: vec![mic], ..Default::default() };
+        for direction in [FaderDirection::Up, FaderDirection::Down, FaderDirection::Left, FaderDirection::Right] {
+            for (min, max, value) in [(-60.0, 20.0, -20.0), (20.0, -60.0, -20.0)] {
+                let fader = Fader { id: "muted".into(), x: 3, y: 3, length: 5, direction, min, max, value, dim: 25, muted_level: true, muted_color: [200, 80, 40], bound: Some(AudioTarget::Device { device: DeviceRef::DefaultInput }), ..Fader::default() };
+                inputs.profile.lock().profile.pages[0].faders = vec![fader.clone()];
+                let frame = build_frame(&layout, &inputs);
+                for (step, pad) in fader.pads().iter().enumerate() {
+                    assert_eq!(frame[pad], LedColor::Rgb(if step <= 2 { Color::new(200, 80, 40) } else { Color::new(50, 20, 10) }));
+                }
+                let ordinary = Fader { muted_level: false, ..fader.clone() };
+                inputs.profile.lock().profile.pages[0].faders = vec![ordinary.clone()];
+                let default_frame = build_frame(&layout, &inputs);
+                let zero = Fader { value: min, ..ordinary.clone() };
+                for (step, pad) in fader.pads().iter().enumerate() {
+                    let [r, g, b] = zero.pad_rgb(step);
+                    assert_eq!(default_frame[pad], LedColor::Rgb(Color::new(r, g, b)));
+                }
+                inputs.live.lock().system.devices[0].muted = false;
+                let unmuted = inputs.live.lock().clone();
+                for step in 0..5 { assert_eq!(fader.render_rgb(step, &unmuted), ordinary.render_rgb(step, &unmuted)); }
+                inputs.live.lock().system.devices[0].muted = true;
+                let unavailable = crate::live::LiveStatus::default();
+                for step in 0..5 { assert_eq!(fader.render_rgb(step, &unavailable), ordinary.render_rgb(step, &unavailable)); }
+                assert_eq!(inputs.profile.lock().profile.pages[0].faders[0].value, value);
+            }
+        }
+    }
 }

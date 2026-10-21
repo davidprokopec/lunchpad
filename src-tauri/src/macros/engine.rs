@@ -581,7 +581,7 @@ impl MacroEngine {
             let Some(target) = &fader.bound else { continue };
             if let AudioTarget::Group { group_id } = target {
                 let report = self.inner.services.system_audio.as_ref().and_then(|audio| audio.group_report(group_id));
-                if let Some(volume) = report.and_then(|g| g.summary.volume) {
+                if let Some(volume) = report.filter(|g| g.summary.mute != crate::system_audio::AudioGroupMute::All).and_then(|g| g.summary.volume) {
                     let value = fader.min + (fader.max - fader.min) * volume;
                     if (fader.value - value).abs() > (fader.max - fader.min).abs() / 1000.0 {
                         let mut at = fader.clone(); at.value = value;
@@ -2966,6 +2966,58 @@ mod tests {
             r.bridge.refresh(); finish_input(&r).await;
             assert_eq!(r.engine.globals().get("runs").map(String::as_str), Some("1"));
             assert_eq!(r.fake.writes().len(), 3);
+        }
+
+        #[tokio::test]
+        async fn all_muted_group_follow_retains_level_in_both_appearance_modes() {
+            use crate::profile::{AudioGroup, AudioMemberTarget};
+            use crate::system_audio::AudioGroupMute;
+            for muted_level in [false, true] {
+                let r = rig(false, false);
+                r.profile.lock().profile.audio_groups.push(AudioGroup { id: "comms".into(), name: "Comms".into(), members: vec![AudioMemberTarget::Device { device: DeviceRef::DefaultInput }, AudioMemberTarget::Device { device: DeviceRef::DefaultOutput }] });
+                bound_fader(&r.profile, AudioTarget::Group { group_id: "comms".into() });
+                {
+                    let mut store = r.profile.lock();
+                    let fader = &mut store.profile.pages[0].faders[0];
+                    fader.min = -60.0; fader.max = 20.0; fader.muted_level = muted_level;
+                }
+                r.fake.change(|devices, _| { devices[0].volume = 0.25; devices[1].volume = 0.75; });
+                r.engine.reconcile_audio_bindings();
+                assert_eq!(fader_value(&r.profile), -20.0);
+                r.fake.change(|devices, _| { for device in devices { device.muted = true; device.volume = 0.0; } });
+                r.bridge.refresh(); finish_input(&r).await;
+                assert_eq!(r.bridge.audio.group_report("comms").unwrap().summary.volume, Some(0.0));
+                assert_eq!(fader_value(&r.profile), -20.0, "mute zero is display-only");
+                let fader = r.profile.lock().profile.pages[0].faders[0].clone();
+                let live = crate::live::LiveStatus { audio_groups: vec![r.bridge.audio.group_report("comms").unwrap()], ..Default::default() };
+                assert_eq!(fader.render_value(&live), Some(if muted_level { -20.0 } else { -60.0 }));
+                if muted_level {
+                    assert_eq!(fader.render_rgb(2, &live), [255, 0, 0]);
+                    assert_eq!(fader.render_rgb(3, &live), [31, 0, 0]);
+                } else {
+                    let zero = Fader { value: -60.0, ..fader.clone() };
+                    for step in 0..fader.steps() { assert_eq!(fader.render_rgb(step, &live), zero.pad_rgb(step)); }
+                }
+                assert_eq!(r.engine.globals().get("fader.mic").map(String::as_str), Some("-20"));
+                r.fake.change(|devices, _| { devices[0].volume = 0.25; devices[1].volume = 0.25; devices[1].muted = false; });
+                r.bridge.refresh();
+                assert_eq!(r.bridge.audio.group_report("comms").unwrap().summary.mute, AudioGroupMute::Partial);
+                assert_eq!(fader_value(&r.profile), -40.0);
+                let partial = r.profile.lock().profile.pages[0].faders[0].clone();
+                let live = crate::live::LiveStatus { audio_groups: vec![r.bridge.audio.group_report("comms").unwrap()], ..Default::default() };
+                let ordinary = Fader { muted_level: false, ..partial.clone() };
+                for step in 0..partial.steps() { assert_eq!(partial.render_rgb(step, &live), ordinary.render_rgb(step, &live)); }
+                r.fake.change(|devices, _| { devices.retain(|device| device.id == "mic"); devices[0].volume = 0.75; });
+                r.bridge.refresh(); finish_input(&r).await;
+                assert_eq!(r.bridge.audio.group_report("comms").unwrap().summary.mute, AudioGroupMute::Unknown);
+                assert_eq!(fader_value(&r.profile), 0.0);
+                let unknown = r.profile.lock().profile.pages[0].faders[0].clone();
+                let live = crate::live::LiveStatus { audio_groups: vec![r.bridge.audio.group_report("comms").unwrap()], ..Default::default() };
+                let ordinary = Fader { muted_level: false, ..unknown.clone() };
+                for step in 0..unknown.steps() { assert_eq!(unknown.render_rgb(step, &live), ordinary.render_rgb(step, &live)); }
+                assert!(!r.engine.globals().contains_key("runs"));
+                assert!(r.fake.writes().is_empty());
+            }
         }
 
         #[tokio::test]

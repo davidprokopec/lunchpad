@@ -1120,6 +1120,8 @@ export interface Fader {
   length: number;
   colorA: [number, number, number];
   colorB: [number, number, number];
+  mutedLevel?: boolean;
+  mutedColor?: [number, number, number];
   /** brightness (percent) of pads above the level */
   dim: number;
   min: number;

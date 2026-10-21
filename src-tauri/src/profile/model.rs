@@ -269,6 +269,10 @@ pub struct Fader {
     pub color_a: [u8; 3],
     #[serde(default = "default_color_b")]
     pub color_b: [u8; 3],
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted_level: bool,
+    #[serde(default = "default_muted_color", skip_serializing_if = "is_default_muted_color")]
+    pub muted_color: [u8; 3],
     /// Brightness (percent) of the pads above the level
     #[serde(default = "default_dim")]
     pub dim: u8,
@@ -322,6 +326,12 @@ fn default_color_a() -> [u8; 3] {
 fn default_color_b() -> [u8; 3] {
     [255, 64, 32]
 }
+fn default_muted_color() -> [u8; 3] {
+    [255, 0, 0]
+}
+fn is_default_muted_color(color: &[u8; 3]) -> bool {
+    *color == default_muted_color()
+}
 fn default_dim() -> u8 {
     12
 }
@@ -341,6 +351,8 @@ impl Default for Fader {
             length: 4,
             color_a: default_color_a(),
             color_b: default_color_b(),
+            muted_level: false,
+            muted_color: default_muted_color(),
             dim: default_dim(),
             min: 0.0,
             max: default_max(),
@@ -456,25 +468,34 @@ impl Fader {
     }
 
     /// The level the pads show. An unbound fader shows its value; a bound one shows its
-    /// value while the target is there, the minimum while it is muted (the value is kept
-    /// for when it comes back), and `None` ("unavailable") while the target is missing.
+    /// value while the target is there, the minimum while muted unless retained-level
+    /// appearance is enabled, and `None` ("unavailable") while the target is missing.
     pub fn render_value(&self, live: &LiveStatus) -> Option<f64> {
-        let Some(target) = &self.bound else { return Some(self.value) };
+        self.render_state(live).map(|(value, _)| value)
+    }
+
+    fn render_state(&self, live: &LiveStatus) -> Option<(f64, bool)> {
+        let Some(target) = &self.bound else { return Some((self.value, false)) };
         if let AudioTarget::Group { group_id } = target {
-            return live.audio_groups.iter().find(|g| &g.group_id == group_id)?.summary.volume.map(|v| self.min + (self.max - self.min) * v);
+            let summary = &live.audio_groups.iter().find(|g| &g.group_id == group_id)?.summary;
+            let volume = summary.volume?;
+            let muted_look = self.muted_level && summary.mute == crate::system_audio::AudioGroupMute::All;
+            return Some((if muted_look { self.value } else { self.min + (self.max - self.min) * volume }, muted_look));
         }
         let state = live.resolve_audio(target)?;
         if !state.can_set_volume {
             return None;
         }
-        Some(if state.muted { self.min } else { self.value })
+        let muted_look = self.muted_level && state.muted;
+        Some((if state.muted && !muted_look { self.min } else { self.value }, muted_look))
     }
 
     /// What a pad shows with the live state (see [`Fader::render_value`]). An unavailable
     /// fader lights only its first pad, dimmed.
     pub fn render_rgb(&self, step: usize, live: &LiveStatus) -> [u8; 3] {
-        match self.render_value(live) {
-            Some(value) => self.pad_rgb_at(step, value),
+        match self.render_state(live) {
+            Some((_, true)) => if step <= self.level_step() { self.muted_color } else { self.dimmed(self.muted_color) },
+            Some((value, false)) => self.pad_rgb_at(step, value),
             None if step == 0 => self.dimmed(self.color_at(0)),
             None => [0, 0, 0],
         }
@@ -644,6 +665,21 @@ impl PadColor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn muted_fader_fields_default_for_old_json_and_roundtrip_custom_values() {
+        let mut old = serde_json::to_value(super::Fader::default()).unwrap();
+        old.as_object_mut().unwrap().remove("mutedLevel");
+        old.as_object_mut().unwrap().remove("mutedColor");
+        let restored: super::Fader = serde_json::from_value(old).unwrap();
+        assert!(!restored.muted_level);
+        assert_eq!(restored.muted_color, [255, 0, 0]);
+        let custom = super::Fader { muted_level: true, muted_color: [120, 40, 80], ..restored };
+        let json = serde_json::to_value(&custom).unwrap();
+        assert_eq!(json["mutedLevel"], true);
+        assert_eq!(json["mutedColor"], serde_json::json!([120, 40, 80]));
+        assert_eq!(serde_json::from_value::<super::Fader>(json).unwrap(), custom);
+    }
 
     #[test]
     fn profile_round_trip() {
