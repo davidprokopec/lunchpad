@@ -466,19 +466,21 @@ impl SystemAudio {
             let mut errors = Vec::new();
             let mut attempted = false;
             for member in admitted {
-                let current_operation = audio
-                    .groups
-                    .lock()
-                    .operations
-                    .get(&id)
-                    .is_some_and(|op| op.id == operation_id);
-                let (outcome, message) = if !current_operation {
+                let operation_valid = || {
+                    audio
+                        .groups
+                        .lock()
+                        .operations
+                        .get(&id)
+                        .is_some_and(|op| op.id == operation_id)
+                };
+                let (outcome, message) = if !operation_valid() {
                     (
                         AudioGroupOutcome::Skipped,
                         Some("audio group changed before execution".into()),
                     )
                 } else {
-                    execute_member(writer, &member, volume, unmute)
+                    execute_member(writer, &member, volume, unmute, &operation_valid)
                 };
                 attempted |= outcome != AudioGroupOutcome::Skipped;
                 if matches!(
@@ -552,6 +554,7 @@ fn execute_member(
     member: &AdmittedMember,
     volume: f32,
     unmute: bool,
+    operation_valid: &impl Fn() -> bool,
 ) -> (AudioGroupOutcome, Option<String>) {
     if matches!(member.target, AudioMemberTarget::App { .. })
         && writer.port.status().permission != AudioPermission::Granted
@@ -586,6 +589,12 @@ fn execute_member(
         );
     }
     if unmute && observed.report.muted == Some(true) && observed.report.can_mute {
+        if !operation_valid() {
+            return (
+                AudioGroupOutcome::Skipped,
+                Some("audio group operation invalidated; unmute and volume not written".into()),
+            );
+        }
         if let Err(error) = writer.set_muted(&member.key, false) {
             return (
                 AudioGroupOutcome::Failed,
@@ -617,6 +626,9 @@ fn execute_member(
                 ),
             );
         }
+    }
+    if !operation_valid() {
+        return (if unmute && observed.report.muted == Some(true) && observed.report.can_mute { AudioGroupOutcome::Unconfirmed } else { AudioGroupOutcome::Skipped }, Some("audio group operation invalidated; volume not written (any already-dispatched unmute is not rolled back)".into()));
     }
     if let Err(error) = writer.set_volume(&member.key, volume) {
         return (AudioGroupOutcome::Unconfirmed, Some(error));

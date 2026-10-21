@@ -712,6 +712,89 @@ async fn unmute_ack_without_confirmed_unmute_skips_volume_but_not_healthy_member
     peer.closed().await;
 }
 
+#[cfg(unix)]
+async fn invalidate_group_during_unmute(remove: bool) {
+    use crate::finetune::tests::{until, Fixture};
+    use serde_json::json;
+    let fixture = Fixture::new().await;
+    let fine = fixture.start(true);
+    let mut peer = fixture.ready_managed(&fine).await;
+    peer.snapshot["managedApps"][0]["muted"] = json!(true);
+    peer.revision += 1;
+    peer.event().await;
+    until(&fine, |state| state.app("app").is_ok_and(|app| app.muted)).await;
+    let fake = Arc::new(FakeAudio::new(
+        vec![FakeAudio::device("out", AudioDeviceKind::Output, true, 0.7)],
+        vec![],
+    ));
+    let audio = SystemAudio::with_integrations(
+        fake.clone(),
+        SharedLive::default(),
+        None,
+        Some(fine.clone()),
+    );
+    audio.configure_groups(&[group(vec![fine_member(), member("out")])]);
+    let mut response = audio.start_group_volume("g", 0.25, true).unwrap();
+    let unmute = peer.request().await;
+    assert_eq!(unmute["method"], "setAppMute");
+    if remove {
+        audio.configure_groups(&[]);
+    } else {
+        audio.configure_groups(&[group(vec![member("out")])]);
+    }
+    audio.refresh_groups();
+    let replacement = if remove {
+        None
+    } else {
+        Some(audio.start_group_volume("g", 0.6, false).unwrap())
+    };
+    peer.reply(&unmute, json!({"accepted":true})).await;
+    let getter = peer.request().await;
+    assert_eq!(getter["method"], "getState");
+    peer.snapshot["managedApps"][0]["muted"] = json!(false);
+    peer.revision += 1;
+    peer.snapshot_reply(&getter).await;
+    let result = tokio::select! {
+        biased;
+        result = &mut response => result.unwrap(),
+        request = peer.request() => panic!("invalidated operation dispatched a new RPC: {request}"),
+    };
+    assert!(result.unwrap_err().contains("invalidated"));
+    if let Some(replacement) = replacement {
+        replacement.await.unwrap().unwrap();
+        assert_eq!(fake.writes(), vec![FakeWrite::Volume("out".into(), 0.6)]);
+        let report = audio.group_report("g").unwrap();
+        assert!(!report.busy);
+        assert_eq!(
+            report.operation.unwrap().members[0].outcome,
+            AudioGroupOutcome::Confirmed
+        );
+    } else {
+        assert!(fake.writes().is_empty());
+    }
+    audio.run_writer(|_| Ok(())).await.unwrap();
+    fine.refresh();
+    peer.getter().await;
+    assert!(
+        !fine.state().app("app").unwrap().muted,
+        "already-dispatched unmute is not rolled back"
+    );
+    fine.shutdown();
+    peer.closed().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn group_edit_during_unmute_prevents_old_volume_and_preserves_replacement_operation() {
+    invalidate_group_during_unmute(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn group_removal_during_unmute_prevents_remaining_mutations() {
+    invalidate_group_during_unmute(true).await;
+}
+
 #[tokio::test]
 async fn wave_link_failed_rpc_does_not_block_healthy_native_member() {
     use crate::wavelink::{
