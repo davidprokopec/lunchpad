@@ -85,6 +85,7 @@ interface ProfileStore {
 }
 
 let missingTimer: number | null = null;
+let profileReceipt = 0;
 
 async function guard<T>(set: (partial: Partial<ProfileStore>) => void, fn: () => Promise<T>): Promise<T | null> {
   try {
@@ -122,13 +123,15 @@ export const useProfileStore = create<ProfileStore>((set, get) => ({
   init: async () => {
     const unlisten = await Promise.all([
       events.onProfile((profile) => {
+        profileReceipt++;
         set({ profile });
         void get().refreshMissing();
       }),
       events.onHistory((history) => set({ history })),
     ]);
+    const receipt = profileReceipt;
     const profile = await api.getProfile();
-    set({ profile });
+    if (receipt === profileReceipt) set({ profile });
     void get().refreshMissing();
     void get().refreshHealth();
     api

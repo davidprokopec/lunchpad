@@ -140,7 +140,7 @@ function EditorForm({ pageId, x, y, initial, preset, limited, pages, layout, onC
   const [tab, setTab] = useState<Tab>("appearance");
   const muteSettingsRef = useRef<HTMLElement>(null);
   const [previewActive, setPreviewActive] = useState(false);
-  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune));
+  const linked = useMediaStore((s) => isLinkActive(button.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune, s.audioGroups));
   const pad = layout?.pads.find((p) => p.x === x && p.y === y);
   const ledKind = pad?.led ?? "rgb";
   /** A tap-only button (Arp, Scale): the device reports no release, so only the pressed list. */

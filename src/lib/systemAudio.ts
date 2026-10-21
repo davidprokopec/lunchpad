@@ -1,4 +1,4 @@
-import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary } from "./api";
+import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary, AudioGroupReport } from "./api";
 import { waveLinkControl } from "./waveLink";
 import { fineTuneApp, fineTuneReason } from "./fineTune";
 
@@ -33,9 +33,14 @@ export function audioActionConfigured(action: Action): boolean {
 }
 
 /** Resolve stable references against the latest OS snapshot, never a requested level. */
-export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
+export function audioState(target: AudioTarget | null | undefined, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []) {
   if (!target) return null;
-  if (target.type === "group") return null;
+  if (target.type === "group") {
+    const report = groups.find((group) => group.groupId === target.groupId);
+    if (!report) return null;
+    const summary = aggregateGroup(report.members);
+    return { volume: summary.volume, muted: summary.mute === "all" };
+  }
   if (target.type === "fineTune") return target.target.type === "app" ? fineTuneApp(target.target.appId, fineTune) : null;
   if (target.type === "waveLink") {
     if (waveLink?.status !== "ready") return null;
@@ -54,8 +59,11 @@ export function audioState(target: AudioTarget | null | undefined, status: Audio
     : d.isDefault && d.kind === (ref.type === "defaultInput" ? "input" : "output"))) ?? null;
 }
 
-export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume", waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
-  if (target.type === "group") return false;
+export function audioControllable(target: AudioTarget, status: AudioStatus | null, control: "volume" | "mute" = "volume", waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []) {
+  if (target.type === "group") {
+    const report = groups.find((group) => group.groupId === target.groupId);
+    return control === "volume" && !!report && !report.busy && report.members.some((member) => member.canSetVolume);
+  }
   if (target.type === "fineTune") return target.target.type === "app" && !fineTuneReason(target.target, fineTune);
   if (target.type === "waveLink") {
     const found = waveLink?.status === "ready" ? waveLinkControl(target.target, waveLink) : null;
@@ -84,12 +92,13 @@ export function aggregateGroup(members: AudioGroupMemberReport[]): AudioGroupSum
 }
 
 /** FineTune snapshots remain readable even when capture permission prevents writes. */
-export function audioFaderReadable(target: AudioTarget, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null) {
+export function audioFaderReadable(target: AudioTarget, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []) {
+  if (target.type === "group") return audioState(target, status, waveLink, fineTune, groups)?.volume != null;
   return target.type === "fineTune" ? !!audioState(target, status, waveLink, fineTune) : audioControllable(target, status, "volume", waveLink);
 }
 
-export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): Fader {
+export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): Fader {
   if (!fader.bound) return fader;
-  const state = audioFaderReadable(fader.bound, status, waveLink, fineTune) ? audioState(fader.bound, status, waveLink, fineTune) : null;
+  const state = audioFaderReadable(fader.bound, status, waveLink, fineTune, groups) ? audioState(fader.bound, status, waveLink, fineTune, groups) : null;
   return { ...fader, value: state && !state.muted && state.volume !== null ? fader.min + (fader.max - fader.min) * state.volume : fader.min };
 }

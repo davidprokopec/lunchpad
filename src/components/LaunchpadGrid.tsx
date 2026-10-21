@@ -26,6 +26,7 @@ import { PadLabel } from "./PadLabel";
 import { Description } from "./Description";
 import { Tooltip } from "./Tooltip";
 import { audioControllable, audioFader, audioFaderReadable } from "../lib/systemAudio";
+import { audioGroupFeedback } from "../lib/audioGroups";
 
 interface Props {
   layout: Layout;
@@ -708,8 +709,10 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
   const fineTune = useMediaStore((s) => s.fineTune);
-  const unavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
-  const shownFader = audioFader(fader, audio, waveLink, fineTune);
+  const groups = useMediaStore((s) => s.audioGroups);
+  const unavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
+  const shownFader = audioFader(fader, audio, waveLink, fineTune, groups);
+  const groupReport = fader.bound?.type === "group" ? groups.find((group) => fader.bound?.type === "group" && group.groupId === fader.bound.groupId) : undefined;
   const key = corners === "key";
   const blend = unavailable ? (step === 0 ? fader.colorA.map((c) => Math.round(c * Math.min(100, fader.dim) / 100)) : [0, 0, 0]) : faderPadRgb(shownFader, step);
   const shown = limited ? limitedRgb({ r: blend[0], g: blend[1], b: blend[2] }) : { r: blend[0], g: blend[1], b: blend[2] };
@@ -718,13 +721,13 @@ function FaderFace({ fader, step, cell, corners, limited }: { fader: Fader; step
   const bright = 0.299 * r + 0.587 * g + 0.114 * b > 150;
   return (
     <div
-      title={unavailable ? audio?.message || t("audio.unavailable") : undefined}
+      title={fader.bound?.type === "group" ? audioGroupFeedback(groupReport) : unavailable ? audio?.message || t("audio.unavailable") : undefined}
       className={clsx("relative flex h-full w-full justify-center overflow-hidden", key ? "items-end pb-[14%]" : "items-center")}
       style={{ backgroundColor: `rgb(${r}, ${g}, ${b})`, borderRadius: cornerRadius(corners, cell), boxShadow: isLevel && !key ? "inset 0 0 0 2px rgba(255,255,255,0.8)" : "inset 0 -3px 0 rgba(0,0,0,0.35)" }}
     >
       {isLevel && (
         <span className="px-1 text-center font-semibold leading-none" style={{ fontSize: Math.max(8, cell * (key ? 0.16 : 0.2)), color: bright ? "#111" : "#fff", textShadow: bright ? undefined : "0 1px 2px rgba(0,0,0,0.5)" }}>
-          {unavailable ? t("audio.unavailableShort") : formatFaderValue(shownFader)}
+          {fader.bound?.type === "group" ? audioGroupFeedback(groupReport, true) : unavailable ? t("audio.unavailableShort") : formatFaderValue(shownFader)}
         </span>
       )}
       {step === 0 && !isLevel && fader.name && (
@@ -760,10 +763,13 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
   const fineTune = useMediaStore((s) => s.fineTune);
-  const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune));
-  const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
-  const displayUnavailable = !!fader?.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
-  const shownFader = fader ? audioFader(fader, audio, waveLink, fineTune) : null;
+  const groups = useMediaStore((s) => s.audioGroups);
+  const linked = useMediaStore((s) => isLinkActive(button?.stateLink, s.obs, s.slobs, s.systemAudio, s.waveLink, s.fineTune, s.audioGroups));
+  const unavailable = !!fader?.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune, groups);
+  const displayUnavailable = !!fader?.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
+  const shownFader = fader ? audioFader(fader, audio, waveLink, fineTune, groups) : null;
+  const groupReport = fader?.bound?.type === "group" ? groups.find((group) => fader.bound?.type === "group" && group.groupId === fader.bound.groupId) : undefined;
+  const groupLabel = fader?.bound?.type === "group" ? audioGroupFeedback(groupReport, true) : null;
   const missing = useProfileStore((s) => s.missingFiles);
   const hasMissing = !!button && [...button.down, ...button.up, ...button.hold].some((a) => a.type === "playSound" && missing.includes(a.file));
   const [mouseDown, setMouseDown] = useState(false);
@@ -876,7 +882,8 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
       >
         <button
           type="button"
-          aria-label={displayUnavailable ? `${name}: ${t("audio.unavailableShort")}` : shownFader ? `${name}: ${formatFaderValue(shownFader)}` : name}
+          title={groupLabel ? audioGroupFeedback(groupReport) : undefined}
+          aria-label={groupLabel ? `${name}: ${groupLabel}` : displayUnavailable ? `${name}: ${t("audio.unavailableShort")}` : shownFader ? `${name}: ${formatFaderValue(shownFader)}` : name}
           onPointerDown={(e) => {
             const primary = e.button === 0 || (e.button === 2 && e.ctrlKey);
             if (!primary) return;
@@ -922,8 +929,8 @@ const Pad = memo(function Pad({ pad, cell, order, preview, limited, controlNumbe
           )}
           style={pad.shape === "knob" && pad.rows > 1 ? { paddingBottom: 4 } : { paddingTop: topInset, paddingBottom: 4 }}
         >
-          {pad.shape === "strip" ? <StripFace fraction={fraction} label={displayUnavailable ? t("audio.unavailableShort") : pad.label} cell={cell} centred={pad.centred} /> : <KnobFace fraction={fraction} cell={cell} />}
-          {pad.shape === "knob" && <span className="text-[9px] leading-none text-stage-500">{displayUnavailable ? t("audio.unavailableShort") : fader ? formatFaderValue(fader, fader.min + (fader.max - fader.min) * (fraction ?? 0)) : pad.label}</span>}
+          {pad.shape === "strip" ? <StripFace fraction={fraction} label={groupLabel ?? (displayUnavailable ? t("audio.unavailableShort") : pad.label)} cell={cell} centred={pad.centred} /> : <KnobFace fraction={fraction} cell={cell} />}
+          {pad.shape === "knob" && <span className="text-[9px] leading-none text-stage-500">{groupLabel ?? (displayUnavailable ? t("audio.unavailableShort") : fader ? formatFaderValue(fader, fader.min + (fader.max - fader.min) * (fraction ?? 0)) : pad.label)}</span>}
         </button>
       </div>
     );

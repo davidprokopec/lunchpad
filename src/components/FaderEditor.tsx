@@ -148,9 +148,10 @@ function FaderForm({
   const audio = useMediaStore((s) => s.systemAudio);
   const waveLink = useMediaStore((s) => s.waveLink);
   const fineTune = useMediaStore((s) => s.fineTune);
-  const shown = audioFader(fader, audio, waveLink, fineTune);
-  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune);
-  const displayUnavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune);
+  const groups = useMediaStore((s) => s.audioGroups);
+  const shown = audioFader(fader, audio, waveLink, fineTune, groups);
+  const unavailable = !!fader.bound && !audioControllable(fader.bound, audio, "volume", waveLink, fineTune, groups);
+  const displayUnavailable = !!fader.bound && !audioFaderReadable(fader.bound, audio, waveLink, fineTune, groups);
   const dirty = JSON.stringify(fader) !== JSON.stringify(initial);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
   const [tab, setTab] = useState<"fader" | "actions">("fader");
@@ -370,7 +371,7 @@ function FaderForm({
         </div>
         <div className="flex gap-2">
           <UiButton onClick={onCancel}>{t("common.cancel")}</UiButton>
-           <UiButton variant="primary" onClick={() => onSave(fader.bound && !unavailable && !audioState(fader.bound, audio, waveLink, fineTune)?.muted ? shown : fader)} disabled={!valid}>
+           <UiButton variant="primary" onClick={() => onSave(fader.bound && !unavailable && !audioState(fader.bound, audio, waveLink, fineTune, groups)?.muted ? shown : fader)} disabled={!valid}>
             {t("common.save")}
           </UiButton>
         </div>

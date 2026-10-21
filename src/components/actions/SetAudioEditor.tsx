@@ -19,7 +19,8 @@ export function SetAudioEditor({ action, onChange, button }: { action: Extract<A
   // Mute and trap the user away from mute-only inputs.
   const allowedModes = SET_AUDIO_MODES.filter((mode) => action.target.type === "group" ? mode === "setVolume" : (action.target.type !== "waveLink" && action.target.type !== "fineTune") || !audioTargetConfigured(action.target) || audioControllable(action.target, null, mode === "setVolume" || mode === "adjustVolume" ? "volume" : "mute", waveLink, fineTune));
   return <div className="flex flex-col gap-3">
-    <AudioTargetField value={action.target} control={level ? "volume" : "mute"} onChange={(target) => { if (target) onChange({ ...action, target }); }} />
+    <AudioTargetField value={action.target} control={level ? "volume" : "mute"} onChange={(target) => { if (target) onChange({ ...action, target, ...(target.type === "group" && action.target.type !== "group" ? { mode: "setVolume" as const } : {}) }); }} />
+    {action.target.type === "group" && action.mode !== "setVolume" && <p role="alert" className="text-xs text-warn">Unavailable group operation. Only Set volume is supported.</p>}
     <div className="flex max-w-xs flex-col gap-1 text-xs text-stage-400">
       {t("volume.mode")}
       <Select<SetAudioMode> size="sm" ariaLabel={t("volume.mode")} value={action.mode} options={[...allowedModes, ...(!allowedModes.includes(action.mode) ? [action.mode] : [])].map((mode) => ({ value: mode, label: t(`audio.modes.${mode}`) + (!allowedModes.includes(mode) ? ` · ${t("audio.unavailableShort")}` : "") }))} onChange={(mode) => onChange({ ...action, mode, volume: mode === "adjustVolume" ? 5 : Math.max(0, action.volume) })} />

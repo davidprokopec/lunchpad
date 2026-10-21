@@ -1,7 +1,12 @@
 import { create } from "zustand";
-import { api, events, type AudioDevices, type AudioStatus, type HaState, type ObsState, type SlobsState, type VoiceInfo, type WaveLinkState, type FineTuneState } from "../lib/api";
+import { api, events, type AudioDevices, type AudioStatus, type HaState, type ObsState, type SlobsState, type VoiceInfo, type WaveLinkState, type FineTuneState, type AudioGroupReport } from "../lib/api";
+import { mergeAudioGroupReports } from "../lib/audioGroups";
 
 interface MediaStore {
+  audioGroups: AudioGroupReport[];
+  audioGroupsError: string | null;
+  receiveAudioGroups: (reports: AudioGroupReport[]) => void;
+  loadAudioGroups: () => Promise<void>;
   fineTune: FineTuneState | null;
   fineTuneError: string | null;
   loadFineTune: () => Promise<void>;
@@ -43,8 +48,26 @@ interface MediaStore {
 }
 
 let systemAudioRevision = 0;
+let audioGroupsReceipt = 0;
+let audioGroupsFetch = 0;
 
 export const useMediaStore = create<MediaStore>((set, get) => ({
+  audioGroups: [],
+  audioGroupsError: null,
+  receiveAudioGroups: (reports) => {
+    audioGroupsReceipt++;
+    set({ audioGroups: mergeAudioGroupReports(get().audioGroups, reports), audioGroupsError: null });
+  },
+  loadAudioGroups: async () => {
+    const receipt = audioGroupsReceipt;
+    const request = ++audioGroupsFetch;
+    try {
+      const reports = await api.getAudioGroups();
+      if (receipt === audioGroupsReceipt && request === audioGroupsFetch) set({ audioGroups: mergeAudioGroupReports(get().audioGroups, reports), audioGroupsError: null });
+    } catch (error) {
+      if (receipt === audioGroupsReceipt && request === audioGroupsFetch) set({ audioGroupsError: String(error) });
+    }
+  },
   fineTune: null,
   fineTuneError: null,
   receiveFineTune: (fineTune) => {
@@ -95,6 +118,7 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
       }),
       events.onWaveLinkState((state) => get().receiveWaveLink(state)),
       events.onFineTuneState((state) => get().receiveFineTune(state)),
+      events.onAudioGroups((reports) => get().receiveAudioGroups(reports)),
     ]);
     void get().loadObs();
     void get().loadSlobs();
@@ -102,6 +126,7 @@ export const useMediaStore = create<MediaStore>((set, get) => ({
     void get().loadSystemAudio();
     void get().loadWaveLink();
     void get().loadFineTune();
+    void get().loadAudioGroups();
     return () => unlisten.forEach((fn) => fn());
   },
 

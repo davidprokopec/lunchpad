@@ -113,6 +113,8 @@ test("FineTune subscribes before read and only admits newer local receipts, not 
   let resolve!: (value: FineTuneState) => void;
   const initial = new Promise<FineTuneState>((yes) => { resolve = yes; }); const calls: string[] = [];
   events.onFineTuneState = async (cb) => { calls.push("subscribe"); listener = cb; return () => {}; };
+  events.onAudioGroups = async () => () => {};
+  api.getAudioGroups = async () => [];
   api.fineTuneState = () => { calls.push("read"); return initial; };
   events.onObsState = events.onSlobsState = events.onHomeAssistantState = events.onSystemAudio = events.onWaveLinkState = async () => () => {};
   api.obsState = async () => { throw new Error("fixture"); }; api.slobsState = api.obsState;

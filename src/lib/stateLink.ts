@@ -1,4 +1,4 @@
-import type { AudioStatus, ObsState, SlobsState, StateLink, WaveLinkState, FineTuneState } from "./api";
+import type { AudioStatus, ObsState, SlobsState, StateLink, WaveLinkState, FineTuneState, AudioGroupReport } from "./api";
 import { fineTuneReason } from "./fineTune";
 import { audioControllable, audioState } from "./systemAudio";
 
@@ -6,8 +6,9 @@ import { audioControllable, audioState } from "./systemAudio";
  * Whether a button's "active while" link currently holds. Mirrors
  * `StateLink::is_active` in src-tauri/src/live.rs, which drives the LEDs.
  */
-export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null): boolean {
+export function isLinkActive(link: StateLink | null | undefined, obs: ObsState | null, slobs: SlobsState | null, audio: AudioStatus | null = null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): boolean {
   if (!link) return false;
+  if (link.provider === "system" && link.kind === "audioMuted" && link.target?.type === "group") return audioState(link.target, audio, waveLink, fineTune, groups)?.muted === true;
   if (link.provider === "fineTune") {
     if (link.target?.type !== "fineTune" || fineTune?.status !== "ready" || !fineTune.snapshot) return false;
     const target = link.target.target;
