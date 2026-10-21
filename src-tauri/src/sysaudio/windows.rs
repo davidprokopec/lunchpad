@@ -318,11 +318,13 @@ impl Platform for WinPlatform {
             let manager: IAudioSessionManager2 = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|e| device_error("Activate(IAudioSessionManager2)", e))?;
-            // Session-created notifications only start once the session list
-            // has been enumerated at least once (documented quirk).
+            // Session-created notifications only start once
+            // IAudioSessionEnumerator::GetCount has been called (documented in
+            // IAudioSessionManager2::RegisterSessionNotification).
             manager
                 .GetSessionEnumerator()
-                .map_err(|e| device_error("GetSessionEnumerator", e))?;
+                .and_then(|list| list.GetCount())
+                .map_err(|e| device_error("IAudioSessionEnumerator::GetCount", e))?;
             let notification: IAudioSessionNotification = SessionCreated {
                 notifier: self.notifier.clone(),
             }
@@ -707,7 +709,7 @@ impl Backend for WinBackend {
         if self.sessions_dirty.swap(false, Ordering::AcqRel) {
             self.inventory.invalidate();
         }
-        Ok(self.inventory.snapshot(&mut self.platform, Instant::now()))
+        self.inventory.snapshot(&mut self.platform, Instant::now())
     }
 
     /// Every session of the app, on every endpoint, gets the new value.

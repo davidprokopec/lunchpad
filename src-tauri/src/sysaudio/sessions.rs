@@ -7,16 +7,26 @@
 //!   it is the default. The list is re-read when the topology is invalidated
 //!   (device added, removed, state or default change) and at least every
 //!   [`ENDPOINT_CHECK`] otherwise; vanished endpoints are dropped, new ones
-//!   opened. An endpoint whose session listing fails is dropped and reopened at
-//!   the next snapshot.
+//!   opened.
+//! * Listing failures: an endpoint whose session listing fails keeps its
+//!   sessions, reported with their last-read state, for that one snapshot and
+//!   the endpoint list is re-read (a removed endpoint is dropped then). A second
+//!   consecutive failure drops the endpoint and its sessions; it is reopened
+//!   at the next snapshot. When every open endpoint fails in the same
+//!   snapshot, the snapshot is an error so the engine keeps the last published
+//!   list (as with the single default endpoint before).
 //! * Sessions: keyed by `(endpoint id, session instance id)`, so equal instance
 //!   strings on different endpoints never alias. Expired sessions and sessions
 //!   no longer listed are dropped. Dropping a platform handle must unregister
 //!   its callbacks; sessions always drop before the endpoint that owns them.
-//! * Apps: sessions are grouped by app id with [`group`]: volume is the
-//!   loudest session, muted only when every session is, active when any is,
-//!   `process_count` counts sessions. Members are ordered by endpoint id, then
-//!   listing order, so the display name is deterministic.
+//! * Apps: sessions are grouped by app id with [`group`]. When the app has at
+//!   least one active session, its volume and mute summarise only the active
+//!   sessions (volume is the loudest, muted only when every one is), so a stale
+//!   inactive session left on another endpoint (e.g. after a channel move)
+//!   cannot mask the audible one. Without an active session every session
+//!   counts. `active` is true when any session is; `process_count` counts every
+//!   session. Members are ordered by endpoint id, then listing order, so the
+//!   display name is deterministic.
 //! * Writes: a volume or mute write is sent to every tracked session of the
 //!   app on every endpoint, with the same value. A session that disappeared
 //!   meanwhile (`NotFound`) is skipped; any other failure does not stop the
@@ -79,17 +89,22 @@ pub trait Platform {
 
 struct Tracked<S> {
     instance: String,
-    app_id: String,
-    name: String,
+    /// The session's app and its state as last read.
+    last: Member,
     session: S,
 }
 
 /// Field order is drop order: sessions unregister before their endpoint.
 struct Endpoint<P: Platform> {
     id: String,
+    /// Consecutive snapshots whose session listing failed.
+    failures: u32,
     sessions: Vec<Tracked<P::Session>>,
     endpoint: P::Endpoint,
 }
+
+/// Consecutive listing failures after which an endpoint is dropped.
+const MAX_LIST_FAILURES: u32 = 2;
 
 pub struct Inventory<P: Platform> {
     /// Sorted by endpoint id.
@@ -169,6 +184,7 @@ impl<P: Platform> Inventory<P> {
                 None => match platform.open_endpoint(&id) {
                     Ok(endpoint) => Endpoint {
                         id,
+                        failures: 0,
                         sessions: Vec::new(),
                         endpoint,
                     },
@@ -185,20 +201,27 @@ impl<P: Platform> Inventory<P> {
         self.last_error = error;
     }
 
-    /// The grouped app list across every open endpoint.
-    pub fn snapshot(&mut self, platform: &mut P, now: Instant) -> Vec<App> {
+    /// The grouped app list across every open endpoint. An error when every
+    /// open endpoint failed to list its sessions.
+    pub fn snapshot(&mut self, platform: &mut P, now: Instant) -> Result<Vec<App>, Error> {
         self.sync_endpoints(platform, now);
         let mut members = Vec::new();
-        let mut failed = Vec::new();
-        for (at, endpoint) in self.endpoints.iter_mut().enumerate() {
+        let mut failure: Option<Error> = None;
+        let mut listed_any = false;
+        for endpoint in &mut self.endpoints {
             let listed = match platform.list_sessions(&endpoint.endpoint) {
                 Ok(listed) => listed,
                 Err(e) => {
-                    self.last_error = Some(e.message);
-                    failed.push(at);
+                    endpoint.failures += 1;
+                    if endpoint.failures < MAX_LIST_FAILURES {
+                        members.extend(endpoint.sessions.iter().map(|s| s.last.clone()));
+                    }
+                    failure.get_or_insert(e);
                     continue;
                 }
             };
+            listed_any = true;
+            endpoint.failures = 0;
             let mut previous = std::mem::take(&mut endpoint.sessions);
             for listed in listed {
                 if listed.state == SessionState::Expired
@@ -209,36 +232,45 @@ impl<P: Platform> Inventory<P> {
                 {
                     continue;
                 }
-                let tracked = match previous.iter().position(|s| s.instance == listed.instance) {
+                let mut tracked = match previous.iter().position(|s| s.instance == listed.instance)
+                {
                     Some(at) => previous.swap_remove(at),
                     None => match platform.adopt(listed.handle) {
                         Some(adopted) => Tracked {
                             instance: listed.instance,
-                            app_id: adopted.app_id,
-                            name: adopted.name,
+                            last: Member {
+                                app_id: adopted.app_id,
+                                name: adopted.name,
+                                active: false,
+                                volume: 1.0,
+                                muted: false,
+                            },
                             session: adopted.session,
                         },
                         None => continue,
                     },
                 };
                 let (volume, muted) = platform.read(&tracked.session);
-                members.push(Member {
-                    app_id: tracked.app_id.clone(),
-                    name: tracked.name.clone(),
-                    active: listed.state == SessionState::Active,
-                    volume: volume.clamp(0.0, 1.0),
-                    muted,
-                });
+                tracked.last.active = listed.state == SessionState::Active;
+                tracked.last.volume = volume.clamp(0.0, 1.0);
+                tracked.last.muted = muted;
+                members.push(tracked.last.clone());
                 endpoint.sessions.push(tracked);
             }
             // Sessions no longer listed are dropped here, unregistering them.
             drop(previous);
         }
-        for at in failed.into_iter().rev() {
-            self.endpoints.remove(at);
+        if let Some(e) = &failure {
+            self.last_error = Some(e.message.clone());
+            // Re-read the endpoint list: a removed endpoint is dropped then.
             self.topology_due = true;
+            // Endpoints failing repeatedly are dropped, unregistering them.
+            self.endpoints.retain(|e| e.failures < MAX_LIST_FAILURES);
         }
-        group(members)
+        match failure {
+            Some(e) if !listed_any => Err(e),
+            _ => Ok(summarize(members)),
+        }
     }
 
     pub fn set_volume(&mut self, platform: &mut P, app: &str, volume: f32) -> Result<(), Error> {
@@ -264,7 +296,7 @@ impl<P: Platform> Inventory<P> {
             .endpoints
             .iter()
             .flat_map(|e| e.sessions.iter())
-            .filter(|s| s.app_id == app);
+            .filter(|s| s.last.app_id == app);
         for tracked in sessions {
             total += 1;
             let result = match write {
@@ -295,6 +327,26 @@ impl<P: Platform> Inventory<P> {
             None => Ok(()),
         }
     }
+}
+
+/// [`group`], with volume and mute taken from the active sessions of every
+/// app that has one.
+fn summarize(members: Vec<Member>) -> Vec<App> {
+    let audible: Vec<String> = members
+        .iter()
+        .filter(|m| m.active)
+        .map(|m| m.app_id.clone())
+        .collect();
+    let counts: Vec<String> = members.iter().map(|m| m.app_id.clone()).collect();
+    let mut apps = group(
+        members
+            .into_iter()
+            .filter(|m| m.active || !audible.contains(&m.app_id)),
+    );
+    for app in &mut apps {
+        app.process_count = counts.iter().filter(|id| **id == app.id).count() as u32;
+    }
+    apps
 }
 
 #[cfg(test)]
@@ -529,8 +581,11 @@ mod tests {
                 now: Instant::now(),
             }
         }
-        fn snapshot(&mut self) -> Vec<App> {
+        fn try_snapshot(&mut self) -> Result<Vec<App>, Error> {
             self.inventory.snapshot(&mut self.fake, self.now)
+        }
+        fn snapshot(&mut self) -> Vec<App> {
+            self.try_snapshot().expect("snapshot")
         }
         fn app(&mut self, id: &str) -> Option<App> {
             self.snapshot().into_iter().find(|a| a.id == id)
@@ -718,20 +773,92 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_endpoint_is_dropped_and_reopened_without_hiding_others() {
+    fn a_failing_endpoint_keeps_its_sessions_once_then_is_dropped_and_reopened() {
+        let mut ts = session("t", "teamspeak.exe");
+        ts.volume = 0.3;
+        ts.muted = true;
         let mut rig = Rig::new(world(&[
             (DEFAULT, vec![session("s", "spotify.exe")]),
-            (VOICE, vec![session("t", "teamspeak.exe")]),
+            (VOICE, vec![ts]),
         ]));
         rig.snapshot();
         rig.w().list_fails.push(VOICE.into());
+        rig.w().find(VOICE, "t").unwrap().volume = 0.9;
+
+        // First failure: last-read state kept, endpoint kept, list re-read.
+        let kept = rig.app("teamspeak.exe").expect("kept for one failed scan");
+        assert_eq!(
+            (kept.volume, kept.muted),
+            (0.3, true),
+            "last read, not a fresh read"
+        );
+        assert_eq!(rig.inventory.endpoint_ids(), [DEFAULT, VOICE]);
+        assert!(rig.registered().iter().any(|r| r.contains("voice")));
+        assert!(rig.inventory.topology_due);
+        // Writes still reach the kept sessions.
+        rig.set_mute("teamspeak.exe", false).unwrap();
+
+        // Second consecutive failure: dropped and unregistered.
         assert_eq!(ids(&rig.snapshot()), ["spotify.exe"]);
         assert_eq!(rig.inventory.endpoint_ids(), [DEFAULT]);
         assert!(!rig.registered().iter().any(|r| r.contains("voice")));
 
         rig.w().list_fails.clear();
         assert_eq!(ids(&rig.snapshot()), ["spotify.exe", "teamspeak.exe"]);
-        assert_eq!(rig.w().opens, 3);
+        assert_eq!(rig.w().opens, 3, "reopened once");
+    }
+
+    #[test]
+    fn a_recovered_listing_resets_the_failure_count() {
+        let mut rig = Rig::new(world(&[
+            (DEFAULT, vec![session("s", "spotify.exe")]),
+            (VOICE, vec![session("t", "teamspeak.exe")]),
+        ]));
+        rig.snapshot();
+        for _ in 0..3 {
+            rig.w().list_fails.push(VOICE.into());
+            assert!(rig.app("teamspeak.exe").is_some());
+            rig.w().list_fails.clear();
+            assert!(rig.app("teamspeak.exe").is_some());
+        }
+        assert_eq!(rig.w().opens, 2, "intermittent failures never reopen");
+    }
+
+    #[test]
+    fn a_failing_endpoint_that_was_removed_is_dropped_at_the_reread() {
+        let mut rig = Rig::new(world(&[
+            (DEFAULT, vec![session("s", "spotify.exe")]),
+            (VOICE, vec![session("t", "teamspeak.exe")]),
+        ]));
+        rig.snapshot();
+        rig.w().list_fails.push(VOICE.into());
+        rig.snapshot();
+        rig.w().endpoints.remove(VOICE);
+        assert_eq!(ids(&rig.snapshot()), ["spotify.exe"]);
+        assert_eq!(rig.inventory.endpoint_ids(), [DEFAULT]);
+    }
+
+    #[test]
+    fn when_every_endpoint_fails_the_snapshot_is_an_error() {
+        let mut rig = Rig::new(world(&[
+            (DEFAULT, vec![session("s", "spotify.exe")]),
+            (VOICE, vec![session("t", "teamspeak.exe")]),
+        ]));
+        rig.snapshot();
+        rig.w().list_fails = vec![DEFAULT.into(), VOICE.into()];
+        let e = rig.try_snapshot().unwrap_err();
+        assert_eq!(e.kind, ErrorKind::NotFound);
+        assert!(
+            rig.inventory.available(),
+            "endpoints kept for one failed scan"
+        );
+        // Persistent failure: still an error (the engine keeps its list), never
+        // an empty success, while endpoints keep reopening and failing.
+        for _ in 0..4 {
+            assert!(rig.try_snapshot().is_err());
+        }
+        rig.w().list_fails.clear();
+        assert_eq!(ids(&rig.snapshot()), ["spotify.exe", "teamspeak.exe"]);
     }
 
     #[test]
@@ -767,8 +894,11 @@ mod tests {
         assert_eq!(ids(&rig.snapshot()), ["teamspeak.exe"]);
     }
 
+    /// What a default-device change does on Windows: `DevicesChanged` sets the
+    /// sessions flag, `WinBackend::snapshot` turns it into `invalidate()`. That
+    /// wiring is Windows-only; this pins the inventory's half of it.
     #[test]
-    fn default_device_changes_do_not_disturb_tracked_sessions() {
+    fn topology_invalidation_reopens_and_readopts_nothing() {
         let mut rig = Rig::new(world(&[
             (DEFAULT, vec![session("s", "spotify.exe")]),
             (VOICE, vec![session("t", "teamspeak.exe")]),
@@ -803,12 +933,58 @@ mod tests {
         assert_eq!(
             (ts.volume, ts.muted),
             (1.0, false),
-            "GAME session still loud and unmuted"
+            "GAME session still active, loud and unmuted"
         );
         rig.w().find(GAME, "t").unwrap().muted = true;
         rig.w().find(GAME, "t").unwrap().volume = 0.1;
         let ts = rig.app("teamspeak.exe").unwrap();
         assert_eq!((ts.volume, ts.muted), (0.25, true));
+    }
+
+    #[test]
+    fn a_stale_inactive_session_does_not_mask_the_active_one() {
+        let mut stale = session("old", "teamspeak.exe");
+        stale.state = SessionState::Inactive;
+        let mut live = session("new", "teamspeak.exe");
+        live.volume = 0.2;
+        live.muted = true;
+        let mut rig = Rig::new(world(&[(DEFAULT, vec![stale]), (VOICE, vec![live])]));
+        let ts = rig.app("teamspeak.exe").unwrap();
+        assert_eq!((ts.volume, ts.muted, ts.active), (0.2, true, true));
+        assert_eq!(ts.process_count, 2, "every session is counted");
+
+        // An external change on the active session is what the app shows.
+        rig.w().find(VOICE, "new").unwrap().muted = false;
+        rig.w().find(VOICE, "new").unwrap().volume = 0.6;
+        let ts = rig.app("teamspeak.exe").unwrap();
+        assert_eq!((ts.volume, ts.muted), (0.6, false));
+        rig.w().find(DEFAULT, "old").unwrap().muted = true;
+        rig.w().find(DEFAULT, "old").unwrap().volume = 0.0;
+        assert_eq!(rig.app("teamspeak.exe").unwrap().volume, 0.6);
+
+        // Writes still reach both, so the stale one matches when it resumes.
+        rig.set_mute("teamspeak.exe", true).unwrap();
+        assert!(rig.w().find(DEFAULT, "old").unwrap().muted);
+        assert!(rig.w().find(VOICE, "new").unwrap().muted);
+    }
+
+    #[test]
+    fn without_an_active_session_every_session_is_summarised() {
+        let mut a = session("a", "discord.exe");
+        a.state = SessionState::Inactive;
+        a.volume = 0.4;
+        a.muted = true;
+        let mut b = session("b", "discord.exe");
+        b.state = SessionState::Inactive;
+        b.volume = 0.7;
+        let mut rig = Rig::new(world(&[(VOICE, vec![a]), (GAME, vec![b])]));
+        let d = rig.app("discord.exe").unwrap();
+        assert_eq!(
+            (d.volume, d.muted, d.active, d.process_count),
+            (0.7, false, false, 2)
+        );
+        rig.w().find(GAME, "b").unwrap().muted = true;
+        assert!(rig.app("discord.exe").unwrap().muted);
     }
 
     #[test]
@@ -880,7 +1056,7 @@ mod tests {
             Duration::from_secs(3600)
         }
         fn snapshot(&mut self) -> Result<Vec<App>, Error> {
-            Ok(self.inventory.snapshot(&mut self.fake, Instant::now()))
+            self.inventory.snapshot(&mut self.fake, Instant::now())
         }
         fn set_volume(&mut self, app: &str, volume: f32) -> Result<(), Error> {
             self.inventory.set_volume(&mut self.fake, app, volume)
@@ -960,10 +1136,16 @@ mod tests {
         }
         let endpoint: Endpoint<OrderOnly> = Endpoint {
             id: "e".into(),
+            failures: 0,
             sessions: vec![Tracked {
                 instance: "i".into(),
-                app_id: "a".into(),
-                name: "a".into(),
+                last: Member {
+                    app_id: "a".into(),
+                    name: "a".into(),
+                    active: false,
+                    volume: 1.0,
+                    muted: false,
+                },
                 session: Logged(Arc::clone(&order), "session"),
             }],
             endpoint: Logged(Arc::clone(&order), "endpoint"),
