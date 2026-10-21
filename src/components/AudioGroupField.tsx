@@ -88,7 +88,7 @@ export function AudioGroupField({ groupId, onChange, volumeOnly = true }: { grou
         <Button size="sm" onClick={() => { setDraft(null); setError(null); }}>Cancel</Button>
         {groups.some((item) => item.id === draft.id) && <Button size="sm" variant="danger" className="ml-auto" onClick={() => setConfirmDelete(true)}>Delete group</Button>}
       </div>
-      {confirmDelete && <div role="alert" className="flex flex-wrap items-center gap-2 border-t border-stage-700 pt-3 text-xs text-stage-300"><p className="w-full">Delete “{draft.name}”? Groups in use cannot be deleted.</p><Button size="sm" variant="danger" onClick={() => { setConfirmDelete(false); void run(() => api.removeAudioGroup(draft.id), () => setDraft(null)); }}>Confirm delete group</Button><Button size="sm" onClick={() => setConfirmDelete(false)}>Keep group</Button></div>}
+      {confirmDelete && <div role="alert" className="flex flex-wrap items-center gap-2 border-t border-stage-700 pt-3 text-xs text-stage-300"><p className="w-full">Delete “{draft.name}”? Groups in use cannot be deleted.</p><Button size="sm" variant="danger" onClick={() => { setConfirmDelete(false); void run(() => api.removeAudioGroup(draft.id), () => { if (groupId === draft.id) onChange(""); setDraft(null); }); }}>Confirm delete group</Button><Button size="sm" onClick={() => setConfirmDelete(false)}>Keep group</Button></div>}
     </fieldset>}
     {error && <p role="alert" className="text-xs text-warn">{error}</p>}
   </div>;

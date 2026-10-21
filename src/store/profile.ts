@@ -187,8 +187,11 @@ export const useProfileStore = create<ProfileStore>((set, get) => ({
   saveFader: async (fader) => {
     const target = get().faderEditor;
     if (!target) return;
-    await guard(set, () => api.setFader(target.pageId, fader));
-    set({ faderEditor: null });
+    const saved = await guard(set, async () => {
+      await api.setFader(target.pageId, fader);
+      return true;
+    });
+    if (saved) set({ faderEditor: null });
   },
   removeFader: async (faderId) => {
     const page = get().activePage();
