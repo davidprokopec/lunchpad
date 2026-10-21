@@ -4,7 +4,7 @@ import type { Action, HubSharedItem, HubShareTarget } from "../lib/api";
 /** The share dialog: a fresh share of a target, or an update of something shared before. */
 export type ShareIntent = { mode: "share"; target: HubShareTarget } | { mode: "update"; target: HubShareTarget; item: HubSharedItem };
 
-export type SettingsTabId = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "hub" | "pages" | "variables" | "secrets" | "about" | "diagnostics";
+export type SettingsTabId = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "hub" | "pages" | "audioGroups" | "variables" | "secrets" | "about" | "diagnostics";
 
 interface UiStore {
   settingsOpen: boolean;

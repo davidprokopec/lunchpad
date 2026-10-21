@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { useUiStore } from "../../store/ui";
 import { IconClose } from "../ui";
 import { AboutTab } from "./AboutTab";
+import { AudioGroupsTab } from "./AudioGroupsTab";
 import { DiagnosticsTab } from "./DiagnosticsTab";
 import { HomeAssistantTab } from "./HomeAssistantTab";
 import { HubTab } from "./HubTab";
@@ -21,7 +22,7 @@ import { WaveLinkTab } from "./WaveLinkTab";
 import { FineTuneTab } from "./FineTuneTab";
 import { platformOptionAvailable } from "../../lib/platform";
 
-export type SettingsTab = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "waveLink" | "fineTune" | "hub" | "pages" | "variables" | "secrets" | "about" | "diagnostics";
+export type SettingsTab = "launchpad" | "sound" | "keyboard" | "interface" | "obs" | "slobs" | "homeAssistant" | "waveLink" | "fineTune" | "hub" | "pages" | "audioGroups" | "variables" | "secrets" | "about" | "diagnostics";
 
 interface NavGroup {
   group: string;
@@ -32,7 +33,7 @@ interface NavGroup {
 const NAV: NavGroup[] = [
   { group: "general", tabs: ["launchpad", "sound", "keyboard", "interface"] },
   { group: "integrations", tabs: ["hub", "obs", "slobs", "homeAssistant", "waveLink", "fineTune"] },
-  { group: "data", tabs: ["pages", "variables", "secrets"] },
+  { group: "data", tabs: ["pages", "audioGroups", "variables", "secrets"] },
   { group: "about", tabs: ["about", "diagnostics"] },
 ];
 
@@ -48,6 +49,7 @@ const TABS: Record<SettingsTab, () => React.ReactElement> = {
   homeAssistant: HomeAssistantTab,
   hub: HubTab,
   pages: PagesTab,
+  audioGroups: AudioGroupsTab,
   variables: VariablesTab,
   secrets: SecretsTab,
   about: AboutTab,

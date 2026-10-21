@@ -1,4 +1,4 @@
-import type { AudioGroup, AudioGroupReport, AudioMemberTarget } from "./api";
+import type { Action, AudioGroup, AudioGroupReport, AudioMemberTarget, Page } from "./api";
 import { audioTargetConfigured, aggregateGroup } from "./systemAudio";
 
 /** Labels are decoration, not endpoint identity. Keep every qualified parent ID. */
@@ -16,6 +16,40 @@ export function audioGroupValidation(group: AudioGroup): string | null {
   if (group.members.some((member) => !audioTargetConfigured(member) || member.type === "device" && member.device.type === "named" && !member.device.id?.trim() || member.type === "app" && !member.app.id.trim() || (member.type === "fineTune" || member.type === "waveLink") && Object.values(member.target).some((value) => !value.trim()))) return "Choose a complete target for every member.";
   if (new Set(group.members.map(audioMemberKey)).size !== group.members.length) return "Each member can only appear once.";
   return null;
+}
+
+export interface AudioGroupUse {
+  pageId: string;
+  pageName: string;
+  /** a fader (bound target or one of its action lists) or a button (actions or "active while" link) */
+  kind: "fader" | "button";
+  /** fader name or id; for a button its "column,row" (1-based) */
+  name: string;
+  how: "bound" | "action" | "link";
+}
+
+/**
+ * Where a group is used in the given pages, from the profile already in the
+ * store. Mirrors `profile::groups::visit_targets` in Rust (the same places the
+ * backend checks before deleting a group). Read-only, display only.
+ */
+export function audioGroupUses(pages: Page[], groupId: string): AudioGroupUse[] {
+  const uses: AudioGroupUse[] = [];
+  const inActions = (lists: (Action[] | undefined)[]) => lists.some((list) => (list ?? []).some((action) => action.type === "setAudio" && action.target.type === "group" && action.target.groupId === groupId));
+  for (const page of pages) {
+    for (const button of page.buttons) {
+      const base = { pageId: page.id, pageName: page.name, kind: "button" as const, name: `${button.x + 1},${button.y + 1}` };
+      const target = button.stateLink?.target;
+      if (target?.type === "group" && target.groupId === groupId) uses.push({ ...base, how: "link" });
+      if (inActions([button.down, button.up, button.hold])) uses.push({ ...base, how: "action" });
+    }
+    for (const fader of page.faders ?? []) {
+      const base = { pageId: page.id, pageName: page.name, kind: "fader" as const, name: fader.name || fader.id };
+      if (fader.bound?.type === "group" && fader.bound.groupId === groupId) uses.push({ ...base, how: "bound" });
+      if (inActions([fader.onChange, fader.onTouch, fader.onRelease])) uses.push({ ...base, how: "action" });
+    }
+  }
+  return uses;
 }
 
 /** Full-array publications remove absent groups, while old per-group revisions cannot regress. */

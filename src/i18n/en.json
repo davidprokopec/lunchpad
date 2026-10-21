@@ -313,7 +313,8 @@
       "homeAssistant": "Home Assistant",
       "variables": "Variables",
       "secrets": "Secrets",
-      "hub": "Community hub"
+      "hub": "Community hub",
+      "audioGroups": "Audio groups"
     },
     "deviceTitle": "Connected device",
     "deviceModel": "Model",
@@ -1033,6 +1034,24 @@
     "muteHint": "Mutes the chosen device, “System default” follows whatever is the default at the time. A device without a mute switch (the Mac's microphone, some USB interfaces) is parked at level 0 and brought back on unmute.",
     "device": "Device",
     "defaultDevice": "System default"
+  },
+  "audioGroupsTab": {
+    "title": "Audio groups in this profile",
+    "hint": "An audio group sets one volume for several apps or devices at once, for example Discord, Slack and TeamSpeak as “Comms”. Groups are saved with the current profile, not across profiles. To use one, open a fader and choose Source → Audio group.",
+    "volumeOnly": "Volume only: a group fader sets the same level on every member that is available. Groups cannot be muted, held or adjusted step by step.",
+    "noAudio": "Creating, editing or deleting a group never changes any volume.",
+    "new": "New group",
+    "empty": "No audio groups yet.",
+    "edit": "Edit",
+    "members_one": "{{count}} member",
+    "members_other": "{{count}} members",
+    "usedBy": "Used by",
+    "unused": "Not used by any fader or button yet.",
+    "useFader": "Page “{{page}}” · fader “{{name}}”",
+    "useFaderAction": "Page “{{page}}” · fader “{{name}}” action",
+    "useButtonAction": "Page “{{page}}” · button {{name}} action",
+    "useButtonLink": "Page “{{page}}” · button {{name}} “active while” link",
+    "inUseNote": "A group that is used cannot be deleted. Change those faders and buttons first."
   },
   "fader": {
     "titleNew": "New fader",
