@@ -63,5 +63,19 @@
   { "name": "short colon ids are not prefix-stripped",
     "saved": { "id": "00-11-22-33-44-55:output", "label": null, "kind": "output" },
     "live": [ { "id": "aa-11-22-33-44-55:output", "name": "AirPods", "kind": "output" } ],
-    "expected": null }
+    "expected": null },
+  { "name": "exact id only in the other direction; the same-direction driver match wins",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": null, "kind": "output" },
+    "live": [
+      { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "input" },
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "output" }
+    ],
+    "expected": { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "match": "driver" } },
+  { "name": "a unique driver match beats a label that points to another device",
+    "saved": { "id": "AppleUSBAudioEngine:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "label": "MacBook Pro Speakers", "kind": "output" },
+    "live": [
+      { "id": "BuiltInSpeakerDevice", "name": "MacBook Pro Speakers", "kind": "output" },
+      { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "name": "PRO X 2 LIGHTSPEED", "kind": "output" }
+    ],
+    "expected": { "id": "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", "match": "driver" } }
 ]

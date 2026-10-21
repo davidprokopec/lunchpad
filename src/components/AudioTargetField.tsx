@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import type { AudioTarget } from "../lib/api";
-import { audioControllable, DEFAULT_INPUT, DEFAULT_OUTPUT } from "../lib/systemAudio";
+import { audioControllable, DEFAULT_INPUT, DEFAULT_OUTPUT, savedDeviceMatch } from "../lib/systemAudio";
 import { useMediaStore } from "../store/media";
 import { Select } from "./Select";
 import { Button } from "./ui";
@@ -10,6 +10,7 @@ import { FineTuneAppField, FineTuneDeviceField } from "./FineTuneFields";
 import { fineTuneReason } from "../lib/fineTune";
 import { platformOptionAvailable } from "../lib/platform";
 import { AudioGroupField } from "./AudioGroupField";
+import { DeviceMatchNote } from "./DeviceMatchNote";
 
 type Source = "manual" | "device" | "app" | "waveLink" | "fineTune" | "group";
 const targetKey = (target: AudioTarget): string => target.type === "group" ? `group:${target.groupId}` : target.type === "fineTune" ? `fineTune:${JSON.stringify(target.target)}` : target.type === "waveLink" ? waveLinkKey(target.target) : target.type === "app" ? `app:${target.app.id}` : target.device.type === "named" ? `device:${target.device.kind}:${target.device.id || target.device.label}` : target.device.type;
@@ -32,6 +33,10 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
   const loadFineTune = useMediaStore((s) => s.loadFineTune);
   useEffect(() => { if (value?.type !== "fineTune") void refresh(); }, [refresh, value?.type]);
   const source: Source = value?.type ?? (manual ? "manual" : "device");
+  // A saved named device in use through a driver or name fallback (exact matches need no note).
+  const saved = value?.type === "device" && value.device.type === "named" ? value.device : null;
+  const found = saved ? savedDeviceMatch(value, status) : null;
+  const matched = saved && found && found.match !== "exact" ? found : null;
   const targets: { target: AudioTarget; label: string }[] = source === "fineTune" ? [] : source === "waveLink"
     ? (waveLink?.status === "ready" ? waveLink.controls : []).filter((item) => !allowGroups || (control === "volume" ? item.canSetLevel && item.level !== null : item.canMute && item.muted !== null)).map((item) => ({ target: { type: "waveLink", target: item.target }, label: `${t(`waveLink.kinds.${item.target.type}`)} · ${item.name}` }))
     : source === "app"
@@ -39,9 +44,12 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
     : [
       { target: DEFAULT_INPUT, label: t("audio.defaultInput") },
       { target: DEFAULT_OUTPUT, label: t("audio.defaultOutput") },
-      ...(status?.devices ?? []).map((d) => ({ target: { type: "device" as const, device: { type: "named" as const, id: d.id, kind: d.kind, label: d.name } }, label: t(d.present ? "audio.namedDevice" : "audio.missingDevice", { name: d.name, kind: t(`audio.${d.kind}`) }) })),
+      ...(status?.devices ?? [])
+        // The report keeps a not-connected entry for the saved id; hide it while that id resolves to a live device.
+        .filter((d) => !(matched && saved && !d.present && d.kind === saved.kind && d.id === saved.id))
+        .map((d) => ({ target: { type: "device" as const, device: { type: "named" as const, id: d.id, kind: d.kind, label: d.name } }, label: t(!d.present ? "audio.missingDevice" : matched && saved && d.present && d.id === matched.id && d.kind === saved.kind ? (matched.match === "label" ? "audio.matchedLabelShort" : "audio.matchedDriverShort") : "audio.namedDevice", { name: d.name, kind: t(`audio.${d.kind}`) }) })),
     ];
-  if (value && value.type !== "group" && !targets.some((item) => targetKey(item.target) === targetKey(value))) {
+  if (value && value.type !== "group" && !matched && !targets.some((item) => targetKey(item.target) === targetKey(value))) {
     const name = value.type === "fineTune" ? "FineTune" : value.type === "waveLink" ? waveLinkControl(value.target, waveLink)?.name ?? waveLinkKey(value.target) : value.type === "app" ? value.app.name : value.device.type === "named" ? value.device.label : "";
     targets.push({ target: value, label: t(value.type === "app" ? "audio.notRunning" : "audio.missingTarget", { name }) });
   }
@@ -71,9 +79,10 @@ export function AudioTargetField({ value, onChange, manual = false, control = "v
           {value?.type === "fineTune" && value.target.type !== "app" ? <FineTuneDeviceField selection={false} direction={value.target.type} value={value.target.deviceUid} label={value.target.label} onChange={(deviceUid, label) => { if (value.target.type !== "app") onChange({ type: "fineTune", target: { type: value.target.type, deviceUid, ...(label ? { label } : {}) } }); }} /> : <FineTuneAppField value={value?.type === "fineTune" && value.target.type === "app" ? value.target.appId : ""} onChange={(appId) => onChange({ type: "fineTune", target: { type: "app", appId } })} />}
         </div> : source !== "manual" && source !== "group" && <div className="flex min-w-0 flex-col gap-1 text-xs text-stage-400">
           {t(source === "waveLink" ? "waveLink.control" : source === "app" ? "audio.app" : "volume.device")}
-          <Select size="sm" ariaLabel={t(source === "waveLink" ? "waveLink.control" : source === "app" ? "audio.app" : "volume.device")} value={value && (value.type !== "app" || value.app.id) ? targetKey(value) : null} placeholder={t("waveLink.chooseTarget")} options={targets.filter(({ target }) => target.type !== "app" || !!target.app.id).map(({ target, label }) => ({ value: targetKey(target), label }))} onChange={(key) => { const item = targets.find(({ target }) => targetKey(target) === key); if (item) onChange(item.target); }} />
+          <Select size="sm" ariaLabel={t(source === "waveLink" ? "waveLink.control" : source === "app" ? "audio.app" : "volume.device")} value={matched ? targetKey(matched.update) : value && (value.type !== "app" || value.app.id) ? targetKey(value) : null} placeholder={t("waveLink.chooseTarget")} options={targets.filter(({ target }) => target.type !== "app" || !!target.app.id).map(({ target, label }) => ({ value: targetKey(target), label }))} onChange={(key) => { const item = targets.find(({ target }) => targetKey(target) === key); if (item) onChange(item.target); }} />
         </div>}
       </div>
+      {matched && <DeviceMatchNote match={matched.match} name={matched.name} onUpdate={() => onChange(matched.update)} />}
       {source === "group" && <AudioGroupField groupId={value?.type === "group" ? value.groupId : ""} volumeOnly={control === "volume"} onChange={(groupId) => onChange({ type: "group", groupId })} />}
       {source !== "manual" && source !== "group" && <div className="flex items-start justify-between gap-3">
         <p role="status" className={"text-xs " + (unavailable || error ? "text-warn" : "text-stage-500")}>

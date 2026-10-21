@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api, fineTuneAppCatalogue, type AudioGroup, type AudioMemberTarget } from "../lib/api";
 import { audioGroupFeedback, audioGroupValidation, audioMemberKey } from "../lib/audioGroups";
 import { fineTuneDevice } from "../lib/fineTune";
+import { savedDeviceMatch } from "../lib/systemAudio";
 import { useMediaStore } from "../store/media";
 import { useProfileStore } from "../store/profile";
 import { AudioTargetField } from "./AudioTargetField";
 import { Select } from "./Select";
 import { Button } from "./ui";
+import { DeviceMatchNote } from "./DeviceMatchNote";
 
 const EMPTY_GROUPS: AudioGroup[] = [];
 
@@ -27,9 +30,10 @@ export function AudioGroupStatus({ groupId, details = false }: { groupId: string
 export function useMemberLabel() {
   const fineTune = useMediaStore((s) => s.fineTune);
   const waveLink = useMediaStore((s) => s.waveLink);
+  const status = useMediaStore((s) => s.systemAudio);
   return (member: AudioMemberTarget): string => {
     if (member.type === "app") return member.app.name || member.app.id;
-    if (member.type === "device") return member.device.type === "named" ? member.device.label || member.device.id || "Device" : member.device.type === "defaultInput" ? "Default input" : "Default output";
+    if (member.type === "device") return member.device.type === "named" ? savedDeviceMatch(member, status)?.name || member.device.label || member.device.id || "Device" : member.device.type === "defaultInput" ? "Default input" : "Default output";
     if (member.type === "fineTune" && member.target.type === "app") {
       const id = member.target.appId;
       const app = fineTune && fineTuneAppCatalogue(fineTune).find((app) => app.appId === id);
@@ -56,7 +60,10 @@ export function AudioGroupEditor({ initial, onSaved, onDeleted, onCancel, onPend
   onCancel: () => void;
   onPendingChange?: (pending: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const memberLabel = useMemberLabel();
+  const status = useMediaStore((s) => s.systemAudio);
+  const fineTune = useMediaStore((s) => s.fineTune);
   const groups = useProfileStore((s) => s.profile?.audioGroups) ?? EMPTY_GROUPS;
   const [draft, setDraft] = useState<AudioGroup>(() => ({ ...initial, members: [...initial.members] }));
   const [candidate, setCandidate] = useState<AudioMemberTarget | null>(null);
@@ -85,7 +92,16 @@ export function AudioGroupEditor({ initial, onSaved, onDeleted, onCancel, onPend
       <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-stage-100">{saved ? "Edit audio group" : "New audio group"}</h3><span className="text-xs text-stage-500">{draft.members.length}/32 members</span></div>
       <label className="flex flex-col gap-1 text-xs text-stage-400">Group name<input aria-label="Group name" className="h-8 rounded-md bg-stage-800 px-2.5 text-sm text-stage-100 outline-none focus:ring-1 focus:ring-accent-400" value={draft.name} placeholder="e.g. Comms" onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
       <p className="text-xs text-stage-500">Saved with this profile. Editing a group updates every binding that uses it; it does not change audio.</p>
-      <ul className="flex flex-col gap-1">{draft.members.map((member, index) => <li key={`${audioMemberKey(member)}:${index}`} className="flex items-center justify-between gap-3 rounded-md bg-stage-800 px-2 py-1 text-xs text-stage-200"><span className="min-w-0 break-all">{memberLabel(member)}</span><Button size="sm" aria-label={`Remove ${memberLabel(member)}`} onClick={() => setDraft({ ...draft, members: draft.members.filter((_, at) => at !== index) })}>Remove</Button></li>)}</ul>
+      <ul className="flex flex-col gap-1">{draft.members.map((member, index) => {
+        // A saved device member in use through a driver or name fallback; "Update" edits this draft only.
+        const found = savedDeviceMatch(member, status, fineTune);
+        const matched = found && found.match !== "exact" ? found : null;
+        const taken = !!matched && draft.members.some((other, at) => at !== index && audioMemberKey(other) === audioMemberKey(matched.update));
+        return <li key={`${audioMemberKey(member)}:${index}`} className="flex flex-col gap-1.5 rounded-md bg-stage-800 px-2 py-1 text-xs text-stage-200">
+          <div className="flex items-center justify-between gap-3"><span className="min-w-0 break-all">{memberLabel(member)}</span><Button size="sm" aria-label={`Remove ${memberLabel(member)}`} onClick={() => setDraft({ ...draft, members: draft.members.filter((_, at) => at !== index) })}>Remove</Button></div>
+          {matched && <div className="pb-1"><DeviceMatchNote match={matched.match} name={matched.name} blocked={taken ? t("audio.alreadyInGroup") : undefined} onUpdate={() => setDraft({ ...draft, members: draft.members.map((other, at) => at === index ? matched.update : other) })} /></div>}
+        </li>;
+      })}</ul>
       <div className="flex flex-col gap-2 border-t border-stage-800 pt-3"><span className="text-xs font-medium text-stage-300">Add a member</span><AudioTargetField value={candidate} onChange={(target) => { if (!target || target.type !== "group") setCandidate(target); }} allowGroups={false} />
         {duplicate && <p role="alert" className="text-xs text-warn">This member is already in the group.</p>}
         <Button size="sm" className="self-start" disabled={!candidate || !!candidateError || duplicate || draft.members.length >= 32} onClick={() => { if (candidate) { setDraft({ ...draft, members: [...draft.members, candidate] }); setCandidate(null); } }}>Add member</Button>

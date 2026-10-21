@@ -1,8 +1,8 @@
-import type { Action, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary, AudioGroupReport } from "./api";
+import type { Action, AudioMemberTarget, AudioStatus, AudioTarget, Fader, WaveLinkState, FineTuneState, AudioGroupMemberReport, AudioGroupSummary, AudioGroupReport } from "./api";
 import { waveLinkControl } from "./waveLink";
-import { fineTuneApp, fineTuneReason } from "./fineTune";
+import { fineTuneApp, fineTuneDevice, fineTuneReason } from "./fineTune";
 import { faderMutedColor, faderMutedLevel } from "./fader";
-import { resolveDevice } from "./deviceIdentity";
+import { resolveDevice, type DeviceMatch } from "./deviceIdentity";
 
 export const DEFAULT_INPUT: AudioTarget = { type: "device", device: { type: "defaultInput" } };
 export const DEFAULT_OUTPUT: AudioTarget = { type: "device", device: { type: "defaultOutput" } };
@@ -117,4 +117,25 @@ export function audioFaderView(fader: Fader, status: AudioStatus | null, waveLin
 
 export function audioFader(fader: Fader, status: AudioStatus | null, waveLink: WaveLinkState | null = null, fineTune: FineTuneState | null = null, groups: AudioGroupReport[] = []): Fader {
   return audioFaderView(fader, status, waveLink, fineTune, groups).fader;
+}
+
+/**
+ * Which live device a saved device target (native named device, or FineTune
+ * output/input) currently means, and how it was matched. `update` is the same
+ * target pointing at that live device (its id and name), for an explicit
+ * "Update to current device" through the normal draft/save path. Display only:
+ * the saved target is never rewritten here.
+ */
+export function savedDeviceMatch(target: AudioTarget | null | undefined, status: AudioStatus | null, fineTune: FineTuneState | null = null): { match: DeviceMatch; name: string; id: string; update: AudioMemberTarget } | null {
+  if (target?.type === "device" && target.device.type === "named" && target.device.id) {
+    const { id, label, kind } = target.device;
+    const found = status?.available ? resolveDevice(id, label, kind, status.devices.filter((d) => d.present)) : null;
+    return found && { match: found.match, name: found.device.name, id: found.device.id, update: { type: "device", device: { type: "named", id: found.device.id, kind, label: found.device.name } } };
+  }
+  if (target?.type === "fineTune" && target.target.type !== "app") {
+    const type = target.target.type;
+    const found = fineTuneDevice(target.target, fineTune);
+    return found && { match: found.match, name: found.device.name, id: found.device.uid, update: { type: "fineTune", target: { type, deviceUid: found.device.uid, label: found.device.name } } };
+  }
+  return null;
 }
