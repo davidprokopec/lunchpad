@@ -137,3 +137,12 @@ test("profile initial fetch cannot erase groups delivered by a newer profile rec
     dispose();
   } finally { globalThis.window = originalWindow; }
 });
+
+test("FineTune member identity ignores the optional label, matching Rust", () => {
+  const bare: AudioMemberTarget = { type: "fineTune", target: { type: "output", deviceUid: "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1" } };
+  const labelled: AudioMemberTarget = { type: "fineTune", target: { type: "output", deviceUid: "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", label: "PRO X 2 LIGHTSPEED" } };
+  const otherDirection: AudioMemberTarget = { type: "fineTune", target: { type: "input", deviceUid: "LogiGamingAudio:Logitech:PRO X 2 LIGHTSPEED:0000000000000000:1", label: "PRO X 2 LIGHTSPEED" } };
+  expect(audioMemberKey(labelled)).toBe(audioMemberKey(bare));
+  expect(audioMemberKey(otherDirection)).not.toBe(audioMemberKey(bare));
+  expect(audioGroupValidation({ id: "g", name: "G", members: [bare, labelled] })).toBe("Each member can only appear once.");
+});

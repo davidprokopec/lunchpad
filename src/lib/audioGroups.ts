@@ -6,7 +6,8 @@ export function audioMemberKey(member: AudioMemberTarget): string {
   if (member.type === "app") return JSON.stringify([member.type, member.app.id]);
   if (member.type === "device") return JSON.stringify(member.device.type === "named" ? [member.type, member.device.type, member.device.kind, member.device.id] : [member.type, member.device.type]);
   const target = member.target;
-  return JSON.stringify([member.type, ...Object.keys(target).sort().map((key) => [key, target[key as keyof typeof target]])]);
+  const keys = Object.keys(target).filter((key) => !(member.type === "fineTune" && key === "label")).sort();
+  return JSON.stringify([member.type, ...keys.map((key) => [key, target[key as keyof typeof target]])]);
 }
 
 export function audioGroupValidation(group: AudioGroup): string | null {
