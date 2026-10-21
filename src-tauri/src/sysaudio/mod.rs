@@ -26,6 +26,8 @@ mod emulation;
 mod engine;
 mod hub;
 mod model;
+#[cfg(any(windows, test))]
+mod sessions;
 
 #[cfg(target_os = "macos")]
 mod macos;

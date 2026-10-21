@@ -1,12 +1,19 @@
-//! Windows backend: Core Audio sessions on the default render endpoint.
+//! Windows backend: Core Audio sessions on every active render endpoint, not
+//! only the default one (e.g. Elgato Wave Link's per-channel virtual outputs).
 //!
 //! Every COM object lives on the engine's worker thread, which initialises COM
 //! as multithreaded (MTA). API calls reach it through the engine's command
-//! channel. Session notifications arrive on COM worker threads; they only ask
-//! the worker for a refresh (`Notifier`), they never touch session objects.
+//! channel. Session and endpoint notifications arrive on COM worker threads;
+//! they only set a flag and ask the worker for a refresh (`Notifier`), they
+//! never touch session objects.
 //!
-//! Sessions are grouped by executable file name. The system-sounds session is
-//! exposed as the app `system`.
+//! Endpoint and session lifecycle, identity, aggregation and write fan-out live
+//! in the platform-independent [`Inventory`]; this file is the thin COM layer
+//! behind its [`Platform`] trait. Sessions are grouped by executable file name
+//! across endpoints; the system-sounds sessions are exposed as the app
+//! `system`. A process whose image path cannot be queried keeps the existing
+//! `pid:<n>` fallback id (not stable across restarts); a session whose volume
+//! or events interface cannot be obtained is skipped. No elevation is needed.
 
 use std::ffi::c_void;
 use std::sync::{
@@ -15,7 +22,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use windows::core::{implement, Interface, Ref, BOOL, GUID, PCWSTR, PWSTR};
+use windows::core::{implement, Interface, Ref, BOOL, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, PROPERTYKEY, S_OK};
 use windows::Win32::Media::Audio::Endpoints::{
@@ -27,7 +34,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateActive,
-    AudioSessionStateExpired, IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents,
+    AudioSessionStateInactive, IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents,
     IAudioSessionEvents_Impl, IAudioSessionManager2, IAudioSessionNotification,
     IAudioSessionNotification_Impl, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
 };
@@ -44,14 +51,11 @@ use super::engine::{
     AppStatus, Backend, BackendKind, Error, ErrorKind, MakeBackend, Notifier, Permission,
 };
 use super::model::{
-    group, slugify, valid_device_id, windows_app_id, windows_app_name, App, Device, DeviceKind,
-    Member,
+    slugify, valid_device_id, windows_app_id, windows_app_name, App, Device, DeviceKind,
 };
+use super::sessions::{Adopted, Inventory, Listed, Platform, SessionState};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How often the default endpoint is re-checked (device switch, unplug).
-const ENDPOINT_CHECK: Duration = Duration::from_secs(2);
-const NO_ENDPOINT: &str = "no default audio output device";
 
 fn native(what: &str, e: windows::core::Error) -> Error {
     Error::new(ErrorKind::Native, format!("{what} failed: {e}"))
@@ -158,16 +162,13 @@ impl IAudioSessionEvents_Impl for SessionChanged_Impl {
 }
 
 /// One audio session we hold and listen to.
-struct Session {
-    instance: String,
-    app_id: String,
-    name: String,
+struct WinSession {
     control: IAudioSessionControl,
     volume: ISimpleAudioVolume,
     events: IAudioSessionEvents,
 }
 
-impl Drop for Session {
+impl Drop for WinSession {
     fn drop(&mut self) {
         // SAFETY: `events` was registered on `control` when the session was added.
         let _ = unsafe {
@@ -177,18 +178,15 @@ impl Drop for Session {
     }
 }
 
-/// The default render endpoint's session manager and our registrations.
-/// Field order is drop order: sessions unregister before the manager goes.
-struct Endpoint {
-    device_id: String,
-    sessions: Vec<Session>,
+/// One render endpoint's session manager and our registration on it. The
+/// inventory drops the endpoint's sessions before it.
+struct WinEndpoint {
     notification: IAudioSessionNotification,
     manager: IAudioSessionManager2,
 }
 
-impl Drop for Endpoint {
+impl Drop for WinEndpoint {
     fn drop(&mut self) {
-        self.sessions.clear();
         // SAFETY: `notification` was registered on `manager` in `open_endpoint`.
         let _ = unsafe {
             self.manager
@@ -208,16 +206,24 @@ impl Drop for ComApartment {
     }
 }
 
-/// Field order is drop order: COM objects before the apartment.
-pub struct WinBackend {
-    endpoint: Option<Endpoint>,
-    device_controls: Vec<DeviceControl>,
-    _device_notification: DeviceNotification,
-    topology_dirty: Arc<AtomicBool>,
+/// The COM side of the session inventory.
+struct WinPlatform {
     enumerator: IMMDeviceEnumerator,
     notifier: Notifier,
-    last_check: Instant,
-    last_error: String,
+}
+
+/// Field order is drop order: sessions and endpoints (inventory) unregister
+/// first, then device controls and the device callback, then the enumerator,
+/// and the apartment last.
+pub struct WinBackend {
+    inventory: Inventory<WinPlatform>,
+    device_controls: Vec<DeviceControl>,
+    _device_notification: DeviceNotification,
+    /// Set by device notifications; consumed by the device snapshot.
+    devices_dirty: Arc<AtomicBool>,
+    /// Set by device notifications; consumed by the app snapshot.
+    sessions_dirty: Arc<AtomicBool>,
+    platform: WinPlatform,
     _com: ComApartment,
 }
 
@@ -236,10 +242,12 @@ pub fn make() -> MakeBackend {
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(|e| unavailable("creating MMDeviceEnumerator", e))?;
-        let topology_dirty = Arc::new(AtomicBool::new(true));
+        let devices_dirty = Arc::new(AtomicBool::new(true));
+        let sessions_dirty = Arc::new(AtomicBool::new(true));
         let notification: IMMNotificationClient = DevicesChanged {
             notifier: notifier.clone(),
-            dirty: Arc::clone(&topology_dirty),
+            devices: Arc::clone(&devices_dirty),
+            sessions: Arc::clone(&sessions_dirty),
         }
         .into();
         // SAFETY: registration on the worker; callback only queues a dirty notification.
@@ -250,109 +258,152 @@ pub fn make() -> MakeBackend {
             notification,
         };
         let mut backend = WinBackend {
-            endpoint: None,
+            inventory: Inventory::default(),
             device_controls: Vec::new(),
             _device_notification: device_notification,
-            topology_dirty,
-            enumerator,
-            notifier,
-            last_check: Instant::now(),
-            last_error: NO_ENDPOINT.into(),
+            devices_dirty,
+            sessions_dirty,
+            platform: WinPlatform {
+                enumerator,
+                notifier,
+            },
             _com: com,
         };
-        backend.reopen();
+        backend
+            .inventory
+            .sync_endpoints(&mut backend.platform, Instant::now());
         Ok(Box::new(backend) as Box<dyn Backend>)
     })
 }
 
-impl WinBackend {
-    fn default_device_id(&self) -> Result<String, Error> {
-        // SAFETY: plain COM calls on the owning thread; the id string is ours.
+impl Platform for WinPlatform {
+    type Endpoint = WinEndpoint;
+    type Session = WinSession;
+    type Listed = IAudioSessionControl;
+
+    fn render_endpoints(&mut self) -> Result<Vec<String>, Error> {
+        // SAFETY: COM calls on the owning thread; returned ids are ours.
         unsafe {
-            let device = self
+            let endpoints = self
                 .enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|e| native("GetDefaultAudioEndpoint", e))?;
-            Ok(take_string(
-                device.GetId().map_err(|e| native("IMMDevice::GetId", e))?,
-            ))
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .map_err(|e| native("EnumAudioEndpoints", e))?;
+            let count = endpoints
+                .GetCount()
+                .map_err(|e| native("IMMDeviceCollection::GetCount", e))?;
+            let mut ids = Vec::new();
+            for i in 0..count {
+                let Ok(endpoint) = endpoints.Item(i) else {
+                    continue;
+                };
+                let Ok(raw_id) = endpoint.GetId() else {
+                    continue;
+                };
+                let id = take_string(raw_id);
+                if !id.is_empty() {
+                    ids.push(id);
+                }
+            }
+            Ok(ids)
         }
     }
 
-    fn open_endpoint(&self) -> Result<Endpoint, Error> {
+    fn open_endpoint(&mut self, id: &str) -> Result<WinEndpoint, Error> {
         // SAFETY: COM calls on the owning thread with valid arguments.
         unsafe {
             let device = self
                 .enumerator
-                .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|e| native("GetDefaultAudioEndpoint", e))?;
-            let device_id = take_string(device.GetId().map_err(|e| native("IMMDevice::GetId", e))?);
+                .GetDevice(&HSTRING::from(id))
+                .map_err(|e| device_error("IMMDeviceEnumerator::GetDevice", e))?;
             let manager: IAudioSessionManager2 = device
                 .Activate(CLSCTX_ALL, None)
-                .map_err(|e| native("Activate(IAudioSessionManager2)", e))?;
+                .map_err(|e| device_error("Activate(IAudioSessionManager2)", e))?;
             // Session-created notifications only start once the session list
             // has been enumerated at least once (documented quirk).
             manager
                 .GetSessionEnumerator()
-                .map_err(|e| native("GetSessionEnumerator", e))?;
+                .map_err(|e| device_error("GetSessionEnumerator", e))?;
             let notification: IAudioSessionNotification = SessionCreated {
                 notifier: self.notifier.clone(),
             }
             .into();
             manager
                 .RegisterSessionNotification(&notification)
-                .map_err(|e| native("RegisterSessionNotification", e))?;
-            Ok(Endpoint {
-                device_id,
-                sessions: Vec::new(),
+                .map_err(|e| device_error("RegisterSessionNotification", e))?;
+            Ok(WinEndpoint {
                 notification,
                 manager,
             })
         }
     }
 
-    /// (Re)opens the default endpoint; on failure the backend is unavailable
-    /// until a later check finds one.
-    fn reopen(&mut self) {
-        self.endpoint = None;
-        match self.open_endpoint() {
-            Ok(endpoint) => self.endpoint = Some(endpoint),
-            Err(e) => self.last_error = format!("{NO_ENDPOINT} ({})", e.message),
+    fn list_sessions(
+        &mut self,
+        endpoint: &WinEndpoint,
+    ) -> Result<Vec<Listed<IAudioSessionControl>>, Error> {
+        // SAFETY: COM calls on the owning thread.
+        let list = unsafe { endpoint.manager.GetSessionEnumerator() }
+            .map_err(|e| device_error("GetSessionEnumerator", e))?;
+        // SAFETY: as above.
+        let count = unsafe { list.GetCount() }.map_err(|e| device_error("GetCount", e))?;
+        let mut listed = Vec::new();
+        for i in 0..count {
+            // SAFETY: `i` is within the enumerator's count; COM calls on the owning thread.
+            let Ok(control) = (unsafe { list.GetSession(i) }) else {
+                continue;
+            };
+            // SAFETY: as above.
+            let state = match unsafe { control.GetState() } {
+                Ok(s) if s == AudioSessionStateActive => SessionState::Active,
+                Ok(s) if s == AudioSessionStateInactive => SessionState::Inactive,
+                _ => SessionState::Expired,
+            };
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            // SAFETY: as above; the returned string is ours.
+            let instance = match unsafe { control2.GetSessionInstanceIdentifier() } {
+                Ok(p) => unsafe { take_string(p) },
+                Err(_) => continue,
+            };
+            listed.push(Listed {
+                instance,
+                state,
+                handle: control,
+            });
         }
-        self.last_check = Instant::now();
+        Ok(listed)
     }
 
-    fn check_endpoint(&mut self) {
-        if self.endpoint.is_some() && self.last_check.elapsed() < ENDPOINT_CHECK {
-            return;
-        }
-        let current = self.default_device_id().ok();
-        let open = self.endpoint.as_ref().map(|e| e.device_id.clone());
-        if current.is_none() || current != open {
-            self.reopen();
-        } else {
-            self.last_check = Instant::now();
+    fn adopt(&mut self, control: IAudioSessionControl) -> Option<Adopted<WinSession>> {
+        // SAFETY: we are on the COM worker thread.
+        unsafe { adopt(control, &self.notifier) }
+    }
+
+    fn read(&mut self, session: &WinSession) -> (f32, bool) {
+        // SAFETY: COM calls on the owning thread.
+        unsafe {
+            (
+                session.volume.GetMasterVolume().unwrap_or(1.0),
+                session
+                    .volume
+                    .GetMute()
+                    .map(|m| m.as_bool())
+                    .unwrap_or(false),
+            )
         }
     }
 
-    fn sessions_of(&self, app: &str) -> Result<Vec<&ISimpleAudioVolume>, Error> {
-        let endpoint = self
-            .endpoint
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::Unsupported, NO_ENDPOINT))?;
-        let volumes: Vec<_> = endpoint
-            .sessions
-            .iter()
-            .filter(|s| s.app_id == app)
-            .map(|s| &s.volume)
-            .collect();
-        if volumes.is_empty() {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                "the app has no audio session",
-            ));
-        }
-        Ok(volumes)
+    fn set_volume(&mut self, session: &WinSession, volume: f32) -> Result<(), Error> {
+        // SAFETY: COM call on the owning thread; a null event context is allowed.
+        unsafe { session.volume.SetMasterVolume(volume, std::ptr::null()) }
+            .map_err(|e| device_error("SetMasterVolume", e))
+    }
+
+    fn set_mute(&mut self, session: &WinSession, muted: bool) -> Result<(), Error> {
+        // SAFETY: COM call on the owning thread; a null event context is allowed.
+        unsafe { session.volume.SetMute(muted, std::ptr::null()) }
+            .map_err(|e| device_error("SetMute", e))
     }
 }
 
@@ -371,12 +422,14 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeChanged_Impl {
 #[implement(IMMNotificationClient)]
 struct DevicesChanged {
     notifier: Notifier,
-    dirty: Arc<AtomicBool>,
+    devices: Arc<AtomicBool>,
+    sessions: Arc<AtomicBool>,
 }
 
 impl DevicesChanged_Impl {
     fn changed(&self) {
-        self.dirty.store(true, Ordering::Release);
+        self.devices.store(true, Ordering::Release);
+        self.sessions.store(true, Ordering::Release);
         self.notifier.notify();
     }
 }
@@ -469,10 +522,8 @@ impl WinBackend {
 
     fn device_snapshot(&mut self) -> Result<Vec<Device>, Error> {
         let mut previous = std::mem::take(&mut self.device_controls);
-        if self.topology_dirty.swap(false, Ordering::AcqRel) {
+        if self.devices_dirty.swap(false, Ordering::AcqRel) {
             previous.clear();
-            // Session endpoint switching should also react immediately.
-            self.last_check = Instant::now() - ENDPOINT_CHECK;
         }
         let mut controls = Vec::new();
         let mut devices = Vec::new();
@@ -482,12 +533,14 @@ impl WinBackend {
             (|| {
                 for (kind, flow) in [(DeviceKind::Output, eRender), (DeviceKind::Input, eCapture)] {
                     let default = self
+                        .platform
                         .enumerator
                         .GetDefaultAudioEndpoint(flow, eConsole)
                         .ok()
                         .and_then(|d| d.GetId().ok())
                         .map(|p| take_string(p));
                     let endpoints = self
+                        .platform
                         .enumerator
                         .EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)
                         .map_err(|e| native("EnumAudioEndpoints", e))?;
@@ -515,7 +568,7 @@ impl WinBackend {
                                     .and_then(|volume| {
                                         let callback: IAudioEndpointVolumeCallback =
                                             VolumeChanged {
-                                                notifier: self.notifier.clone(),
+                                                notifier: self.platform.notifier.clone(),
                                             }
                                             .into();
                                         volume.RegisterControlChangeNotify(&callback).ok()?;
@@ -581,11 +634,7 @@ fn image_path(pid: u32) -> Option<String> {
 ///
 /// # Safety
 /// Must run on the COM worker thread.
-unsafe fn adopt(
-    control: IAudioSessionControl,
-    instance: String,
-    notifier: &Notifier,
-) -> Option<Session> {
+unsafe fn adopt(control: IAudioSessionControl, notifier: &Notifier) -> Option<Adopted<WinSession>> {
     // SAFETY: COM calls on the owning thread.
     unsafe {
         let control2: IAudioSessionControl2 = control.cast().ok()?;
@@ -604,13 +653,14 @@ unsafe fn adopt(
         }
         .into();
         control.RegisterAudioSessionNotification(&events).ok()?;
-        Some(Session {
-            instance,
+        Some(Adopted {
             app_id,
             name,
-            control,
-            volume,
-            events,
+            session: WinSession {
+                control,
+                volume,
+                events,
+            },
         })
     }
 }
@@ -632,16 +682,20 @@ impl Backend for WinBackend {
             .map_err(|e| device_error("IAudioEndpointVolume::SetMute", e))
     }
     fn status(&self) -> AppStatus {
-        match self.endpoint {
-            Some(_) => AppStatus {
+        if self.inventory.available() {
+            AppStatus {
                 backend: BackendKind::WindowsCoreAudio,
                 available: true,
                 can_set_volume: true,
                 can_mute: true,
                 permission: Permission::Granted,
                 message: String::new(),
-            },
-            None => AppStatus::unavailable(BackendKind::WindowsCoreAudio, self.last_error.clone()),
+            }
+        } else {
+            AppStatus::unavailable(
+                BackendKind::WindowsCoreAudio,
+                self.inventory.unavailable_reason(),
+            )
         }
     }
 
@@ -650,85 +704,18 @@ impl Backend for WinBackend {
     }
 
     fn snapshot(&mut self) -> Result<Vec<App>, Error> {
-        self.check_endpoint();
-        let notifier = self.notifier.clone();
-        let Some(endpoint) = self.endpoint.as_mut() else {
-            return Ok(Vec::new());
-        };
-        // SAFETY: COM calls on the owning thread.
-        let list = unsafe { endpoint.manager.GetSessionEnumerator() }
-            .map_err(|e| native("GetSessionEnumerator", e))?;
-        // SAFETY: as above.
-        let count = unsafe { list.GetCount() }.map_err(|e| native("GetCount", e))?;
-        let mut previous = std::mem::take(&mut endpoint.sessions);
-        let mut members = Vec::new();
-        for i in 0..count {
-            // SAFETY: `i` is within the enumerator's count; COM calls on the owning thread.
-            let Ok(control) = (unsafe { list.GetSession(i) }) else {
-                continue;
-            };
-            // SAFETY: as above.
-            let state = unsafe { control.GetState() }.unwrap_or(AudioSessionStateExpired);
-            if state == AudioSessionStateExpired {
-                continue;
-            }
-            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
-                continue;
-            };
-            // SAFETY: as above; the returned string is ours.
-            let instance = match unsafe { control2.GetSessionInstanceIdentifier() } {
-                Ok(p) => unsafe { take_string(p) },
-                Err(_) => continue,
-            };
-            let session = match previous.iter().position(|s| s.instance == instance) {
-                Some(at) => previous.swap_remove(at),
-                // SAFETY: we are on the COM worker thread.
-                None => match unsafe { adopt(control, instance, &notifier) } {
-                    Some(session) => session,
-                    None => continue,
-                },
-            };
-            // SAFETY: COM calls on the owning thread.
-            let (volume, muted) = unsafe {
-                (
-                    session.volume.GetMasterVolume().unwrap_or(1.0),
-                    session
-                        .volume
-                        .GetMute()
-                        .map(|m| m.as_bool())
-                        .unwrap_or(false),
-                )
-            };
-            members.push(Member {
-                app_id: session.app_id.clone(),
-                name: session.name.clone(),
-                active: state == AudioSessionStateActive,
-                volume: volume.clamp(0.0, 1.0),
-                muted,
-            });
-            endpoint.sessions.push(session);
+        if self.sessions_dirty.swap(false, Ordering::AcqRel) {
+            self.inventory.invalidate();
         }
-        // Sessions no longer listed are dropped here, which unregisters them.
-        drop(previous);
-        Ok(group(members))
+        Ok(self.inventory.snapshot(&mut self.platform, Instant::now()))
     }
 
-    /// Grouped sessions may disagree; every one of them gets the new value.
+    /// Every session of the app, on every endpoint, gets the new value.
     fn set_volume(&mut self, app: &str, volume: f32) -> Result<(), Error> {
-        for session in self.sessions_of(app)? {
-            // SAFETY: COM call on the owning thread; a null event context is allowed.
-            unsafe { session.SetMasterVolume(volume, std::ptr::null()) }
-                .map_err(|e| native("SetMasterVolume", e))?;
-        }
-        Ok(())
+        self.inventory.set_volume(&mut self.platform, app, volume)
     }
 
     fn set_mute(&mut self, app: &str, muted: bool) -> Result<(), Error> {
-        for session in self.sessions_of(app)? {
-            // SAFETY: COM call on the owning thread; a null event context is allowed.
-            unsafe { session.SetMute(muted, std::ptr::null()) }
-                .map_err(|e| native("SetMute", e))?;
-        }
-        Ok(())
+        self.inventory.set_mute(&mut self.platform, app, muted)
     }
 }
