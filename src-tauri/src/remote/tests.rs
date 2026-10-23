@@ -1312,3 +1312,43 @@ fn signing_in_does_not_rewrite_the_settings_file_every_time() {
     auth.revoke(&device.id).unwrap();
     assert!(!auth.is_paired(&device.id));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_toggle_overtaken_right_after_reading_the_settings_does_not_listen() {
+    let b = backend();
+    let (service, settings, _dir) = service(b, Limits::default());
+    // Call A reads "on"; before it goes on, call B saves "off" and runs to the end.
+    settings.lock().settings.remote.enabled = true;
+    *service.inner.after_read.lock() = Some(Box::new({
+        let service = service.clone();
+        let settings = settings.clone();
+        move || {
+            Box::pin(async move {
+                settings.lock().settings.remote.enabled = false;
+                service.apply_settings().await;
+            })
+        }
+    }));
+    let status = service.apply_settings().await;
+    assert!(!status.enabled && !status.running, "{status:?}");
+    assert!(
+        service.inner.running_port.lock().is_none(),
+        "nothing listens while the setting says off"
+    );
+    assert!(service.inner.server.lock().is_none());
+
+    // The same race ending "on" leaves it listening.
+    *service.inner.after_read.lock() = Some(Box::new({
+        let service = service.clone();
+        let settings = settings.clone();
+        move || {
+            Box::pin(async move {
+                settings.lock().settings.remote.enabled = true;
+                service.apply_settings().await;
+            })
+        }
+    }));
+    let status = service.apply_settings().await;
+    assert!(status.enabled && status.running, "{status:?}");
+    service.configure(false, 4000).await.unwrap();
+}

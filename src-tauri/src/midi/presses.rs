@@ -7,6 +7,9 @@
 //! * a press of a pad held by the **same** source (a hardware note-off or a
 //!   click release that got lost) first ends the stale gesture, then starts
 //!   the new one, so the first tap after a lost release works;
+//! * the hardware also takes over a pad held by a click (whose release may
+//!   have been lost with the window): only a phone's hold is exclusive against
+//!   the hardware;
 //! * a release only ends the gesture of the source that started it.
 //!
 //! Ownership is decided under the locks; events are dispatched after they are
@@ -74,6 +77,11 @@ impl PadPresses {
             }
             // The same device pressing again without a release in between: the release got lost.
             (true, Some(owner)) if owner == source => RESTART,
+            // The hardware ends a click's hold and starts its own.
+            (true, Some(PressSource::Desktop)) if source == PressSource::Hardware => {
+                owners.insert((x, y), source);
+                RESTART
+            }
             (true, Some(_)) => NONE,
             (false, Some(owner)) if owner == source => {
                 set.remove(&(x, y));
@@ -226,6 +234,29 @@ mod tests {
         assert!(r.apply(Remote(1), 0, 0, false));
         assert_eq!(r.take(), vec![(0, 0, true), (0, 0, false)]);
         assert!(r.apply(Hardware, 0, 0, true), "free again");
+    }
+
+    #[test]
+    fn the_hardware_takes_over_a_pad_a_click_holds() {
+        let r = Rig::new();
+        assert!(r.apply(Desktop, 0, 0, true));
+        // The click's release got lost (window hidden with the button down).
+        assert!(
+            r.apply(Hardware, 0, 0, true),
+            "the hardware press ends the click's hold"
+        );
+        assert_eq!(r.presses.owner(0, 0), Some(Hardware));
+        assert!(
+            !r.apply(Desktop, 0, 0, false),
+            "the late click release does nothing now"
+        );
+        assert!(r.apply(Hardware, 0, 0, false));
+        assert_eq!(
+            r.take(),
+            vec![(0, 0, true), (0, 0, false), (0, 0, true), (0, 0, false)],
+            "never two downs in a row"
+        );
+        assert!(!r.held());
     }
 
     #[test]

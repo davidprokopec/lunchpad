@@ -217,6 +217,10 @@ impl Default for Options {
     }
 }
 
+#[cfg(test)]
+type TestHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
 struct Running {
     server: RunningServer,
     port: u16,
@@ -229,6 +233,9 @@ struct Inner {
     server: Mutex<Option<Running>>,
     /// Bumped by every `apply_settings`; an older call that sees a newer one gives way.
     generation: AtomicU64,
+    /// Tests: runs once right after `apply_settings` read the settings.
+    #[cfg(test)]
+    after_read: Mutex<Option<TestHook>>,
     /// The port listened on, readable without the async lock.
     running_port: Mutex<Option<u16>>,
     error: Mutex<Option<String>>,
@@ -270,6 +277,8 @@ impl RemoteService {
                 options,
                 server: Mutex::new(None),
                 generation: AtomicU64::new(0),
+                #[cfg(test)]
+                after_read: Mutex::new(None),
                 running_port: Mutex::new(None),
                 error: Mutex::new(None),
                 code: Mutex::new(None),
@@ -352,15 +361,26 @@ impl RemoteService {
 
     /// Listen or not, as the settings say. Restarts when the port changed.
     pub async fn apply_settings(&self) -> RemoteStatus {
-        let config = self.inner.settings.lock().settings.remote.clone();
-        let wanted = config.enabled.then_some(config.port);
         // Locks are only held for bookkeeping, never across an await. A newer call
         // takes over from an older one still stopping or binding (`generation`).
+        // The number is taken before the settings are read: every save is followed by
+        // its own call, so the newest call always acts on the newest saved settings.
         let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let config = self.inner.settings.lock().settings.remote.clone();
+        let wanted = config.enabled.then_some(config.port);
+        #[cfg(test)]
+        {
+            let hook = self.inner.after_read.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
         let current = || self.inner.generation.load(Ordering::SeqCst) == generation;
         let old = {
             let mut server = self.inner.server.lock();
-            if matches!((&*server, wanted), (Some(r), Some(port)) if r.port == port) {
+            // Overtaken already (the newer call has done or is doing its own work), or
+            // nothing to change: leave the server as it is.
+            if !current() || matches!((&*server, wanted), (Some(r), Some(port)) if r.port == port) {
                 drop(server);
                 self.publish();
                 return self.status();
