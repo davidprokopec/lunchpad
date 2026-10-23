@@ -9,6 +9,17 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
 
+  // Two pages: the app, and the phone remote (`remote.html`) that Lunchpad's phone remote
+  // serves on the local network from the same `dist/` (see src-tauri/src/remote/http.rs).
+  build: {
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        remote: "remote.html",
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent vite from obscuring rust errors
