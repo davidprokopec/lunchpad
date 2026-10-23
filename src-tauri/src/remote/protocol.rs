@@ -385,11 +385,17 @@ pub fn fader_control(
     })
 }
 
+/// Zero-width, bidirectional and other format characters that could make one
+/// name look like another in the device list.
+fn invisible_or_bidi(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
 /// A trimmed, printable device name of reasonable length.
 pub fn clean_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !invisible_or_bidi(*c))
         .take(MAX_NAME)
         .collect();
     let cleaned = cleaned.trim();
@@ -397,5 +403,20 @@ pub fn clean_name(name: &str) -> String {
         "Phone".into()
     } else {
         cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_name;
+
+    #[test]
+    fn names_lose_control_bidi_and_invisible_characters() {
+        assert_eq!(clean_name("  Pixel\u{7}  "), "Pixel");
+        assert_eq!(clean_name("evil\u{202E}lexip"), "evillexip");
+        assert_eq!(clean_name("a\u{200B}b\u{2066}c\u{FEFF}"), "abc");
+        assert_eq!(clean_name("\u{202E}\u{200F}"), "Phone");
+        assert_eq!(clean_name("Žluťoučký telefon 📱"), "Žluťoučký telefon 📱");
+        assert_eq!(clean_name(&"x".repeat(100)).len(), 40);
     }
 }

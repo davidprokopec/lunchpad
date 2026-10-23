@@ -4,13 +4,19 @@ use super::pairing::{hash_token, new_token, token_matches, AuthError, Pairing};
 use super::protocol::clean_name;
 use crate::config::{RemoteDevice, SharedSettings};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
 
 pub struct RemoteAuth {
     settings: SharedSettings,
     pairing: Mutex<Pairing>,
+    /// The last-seen time last written to the file, per device.
+    saved_seen: Mutex<HashMap<String, i64>>,
 }
+
+/// A sign-in rewrites the settings file only when the stored last-seen time is older.
+pub const LAST_SEEN_SAVE_INTERVAL_MS: i64 = 60 * 60 * 1000;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -21,6 +27,7 @@ impl RemoteAuth {
         RemoteAuth {
             settings,
             pairing: Mutex::new(Pairing::default()),
+            saved_seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -34,6 +41,17 @@ impl RemoteAuth {
 
     pub fn pending(&self, now: Instant) -> Option<Instant> {
         self.pairing.lock().pending(now)
+    }
+
+    /// Whether a device is still paired (not revoked meanwhile).
+    pub fn is_paired(&self, device_id: &str) -> bool {
+        self.settings
+            .lock()
+            .settings
+            .remote
+            .devices
+            .iter()
+            .any(|d| d.id == device_id)
     }
 
     pub fn devices(&self) -> Vec<RemoteDevice> {
@@ -92,11 +110,28 @@ impl RemoteAuth {
             self.pairing.lock().record_failure(ip, now);
             return Err(AuthError::Rejected);
         };
-        store.settings.remote.devices[i].last_seen = Some(now_ms());
-        if let Err(e) = store.save() {
-            tracing::warn!(error = %e, "last-seen time of a phone could not be saved");
+        // The time is kept current in memory; the file (and the credential store
+        // written with it) at most once per interval per phone.
+        let at = now_ms();
+        let device = &mut store.settings.remote.devices[i];
+        let persisted = *self
+            .saved_seen
+            .lock()
+            .entry(device.id.clone())
+            .or_insert(device.last_seen.unwrap_or(i64::MIN));
+        device.last_seen = Some(at);
+        let device = device.clone();
+        if at.saturating_sub(persisted) >= LAST_SEEN_SAVE_INTERVAL_MS {
+            match store.save() {
+                Ok(()) => {
+                    self.saved_seen.lock().insert(device.id.clone(), at);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "last-seen time of a phone could not be saved")
+                }
+            }
         }
-        Ok(store.settings.remote.devices[i].clone())
+        Ok(device)
     }
 
     /// Forget a device; its token stops working. False when there was no such device.

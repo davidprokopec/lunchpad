@@ -9,13 +9,14 @@ use crate::macros::{Action, ActionKind, EngineSink, RunningMacro, Services, VarS
 use crate::midi::models::driver_for;
 use crate::midi::render::{bump, frame_ticks, FrameTicks, RenderInputs};
 use crate::midi::{
-    claim_remote_press, remote_pressable, ButtonEvent, ConnectedDevice, LaunchpadModel, Layout,
+    presses::{PadPresses, PressSource},
+    remote_pressable, ButtonEvent, ConnectedDevice, LaunchpadModel, Layout,
 };
 use crate::profile::{
     Button, Fader, FaderDirection, Look, PadColor, Page, Profile, DEFAULT_PAGE_ID,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -40,8 +41,26 @@ struct TestBackend {
     profile: Arc<Mutex<ProfileStore>>,
     layout: Layout,
     inputs: RenderInputs,
-    owners: Mutex<HashMap<(u8, u8), u64>>,
+    presses: PadPresses,
     device: ConnectedDevice,
+}
+
+impl TestBackend {
+    /// What the device manager does for any source: ownership, then the engine.
+    fn apply(&self, source: PressSource, x: u8, y: u8, pressed: bool) -> bool {
+        let event = ButtonEvent {
+            x,
+            y,
+            pressed,
+            note: 0,
+            cc: false,
+            value: if pressed { 127 } else { 0 },
+        };
+        self.presses.apply(source, event, &|e| {
+            bump(&self.inputs.ticks);
+            self.engine.on_button(e);
+        })
+    }
 }
 
 impl RemoteBackend for TestBackend {
@@ -52,19 +71,7 @@ impl RemoteBackend for TestBackend {
         if pressed && !remote_pressable(&self.layout, x, y) {
             return Ok(false);
         }
-        if !claim_remote_press(&self.inputs.pressed, &self.owners, session, x, y, pressed) {
-            return Ok(false);
-        }
-        bump(&self.inputs.ticks);
-        self.engine.on_button(&ButtonEvent {
-            x,
-            y,
-            pressed,
-            note: 0,
-            cc: false,
-            value: if pressed { 127 } else { 0 },
-        });
-        Ok(true)
+        Ok(self.apply(PressSource::Remote(session), x, y, pressed))
     }
     fn set_fader(&self, fader_id: &str, fraction: f64) -> Result<(), BackendError> {
         let event = fader_control(&self.profile, fader_id, fraction)?;
@@ -122,8 +129,8 @@ fn backend() -> Arc<TestBackend> {
         engine,
         profile,
         layout: driver_for(model).layout(),
+        presses: PadPresses::new(inputs.pressed.clone()),
         inputs,
-        owners: Mutex::new(HashMap::new()),
         device,
     })
 }
@@ -247,7 +254,7 @@ async fn a_pad_has_one_gesture_whatever_holds_it() {
     );
 
     // Held on the hardware (or the window): the phone is refused.
-    b.inputs.pressed.lock().insert((2, 2));
+    assert!(b.apply(PressSource::Hardware, 2, 2, true));
     assert_eq!(
         error_code(phone.handle(&press(2, 2))).as_deref(),
         Some("busy")
@@ -261,23 +268,6 @@ async fn a_pad_has_one_gesture_whatever_holds_it() {
         error_code(phone.handle(&press(40, 40))).as_deref(),
         Some("busy")
     );
-}
-
-#[test]
-fn the_hardware_release_ends_a_remote_gesture_and_the_late_remote_release_is_ignored() {
-    let pressed = Mutex::new(HashSet::new());
-    let owners = Mutex::new(HashMap::new());
-    assert!(claim_remote_press(&pressed, &owners, 7, 0, 0, true));
-    // The hardware lets go (the input callback removes the pad and its owner)...
-    pressed.lock().remove(&(0, 0));
-    owners.lock().remove(&(0, 0));
-    // ...and presses again: that gesture is the hardware's now.
-    pressed.lock().insert((0, 0));
-    assert!(
-        !claim_remote_press(&pressed, &owners, 7, 0, 0, false),
-        "the phone's late release does not end the hardware's press"
-    );
-    assert!(pressed.lock().contains(&(0, 0)));
 }
 
 #[tokio::test]
@@ -556,9 +546,25 @@ impl AssetSource for NoAssets {
     }
 }
 
+/// One very large file, more than any socket buffer holds.
+struct BigAsset;
+impl AssetSource for BigAsset {
+    fn get(&self, path: &str) -> Option<(Vec<u8>, String)> {
+        (path == "assets/big.js").then(|| (vec![b'x'; 16 * 1024 * 1024], "text/javascript".into()))
+    }
+}
+
 fn service(
     b: Arc<TestBackend>,
     limits: Limits,
+) -> (RemoteService, SharedSettings, std::path::PathBuf) {
+    service_with(b, limits, Arc::new(NoAssets))
+}
+
+fn service_with(
+    b: Arc<TestBackend>,
+    limits: Limits,
+    assets: Arc<dyn AssetSource>,
 ) -> (RemoteService, SharedSettings, std::path::PathBuf) {
     let dir = temp_dir("settings");
     let settings: SharedSettings = Arc::new(Mutex::new(SettingsStore::load(&dir)));
@@ -574,7 +580,7 @@ fn service(
         limits,
     };
     (
-        RemoteService::new(settings.clone(), b, Arc::new(NoAssets), options),
+        RemoteService::new(settings.clone(), b, assets, options),
         settings,
         dir,
     )
@@ -1075,4 +1081,234 @@ async fn wrong_codes_are_rate_limited_over_the_wire() {
         "and lock the address out"
     );
     service.configure(false, 4000).await.unwrap();
+}
+
+/// Clients that request the big file and never read a byte of the answer.
+async fn stalled_downloads(port: u16, count: usize) -> Vec<tokio::net::TcpStream> {
+    let mut streams = Vec::new();
+    for _ in 0..count {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!("GET /assets/big.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        streams.push(stream);
+    }
+    // Long enough for the server to fill the socket buffers and block in the write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    streams
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn downloads_that_never_read_cannot_hold_up_turning_it_off() {
+    let b = backend();
+    // A write timeout far longer than the test: stopping must cancel the writes.
+    let limits = Limits {
+        write_timeout: Duration::from_secs(60),
+        ..Limits::default()
+    };
+    let (service, _settings, _dir) = service_with(b, limits, Arc::new(BigAsset));
+    service.apply_settings().await;
+    let port = port_of(&service);
+    let _stalled = stalled_downloads(port, 4).await;
+
+    let started = Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(3), service.configure(false, 4000))
+        .await
+        .expect("turning it off returns promptly")
+        .unwrap();
+    assert!(!status.running);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_err());
+    // And it can be turned on again at once.
+    let status = tokio::time::timeout(Duration::from_secs(3), service.configure(true, 4000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.error.is_none() || status.running, "{status:?}");
+    service.configure(false, 4000).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_download_gives_its_connection_slot_back_after_the_write_timeout() {
+    let b = backend();
+    let limits = Limits {
+        write_timeout: Duration::from_millis(300),
+        max_connections: 1,
+        ..Limits::default()
+    };
+    let (service, _settings, _dir) = service_with(b, limits, Arc::new(BigAsset));
+    service.apply_settings().await;
+    let port = port_of(&service);
+    let _stalled = stalled_downloads(port, 1).await;
+    let mut served = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !served && Instant::now() < deadline {
+        served = raw_get(port, "/", &format!("127.0.0.1:{port}"))
+            .await
+            .starts_with("HTTP/1.1 200");
+        if !served {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    assert!(served, "the only slot was freed by the write timeout");
+    service.configure(false, 4000).await.unwrap();
+}
+
+/// Keeps changing a huge label, so every state push is large and different.
+fn flood_state(b: Arc<TestBackend>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut n = 0u64;
+        loop {
+            n += 1;
+            let caption = format!("{n}{}", "x".repeat(256 * 1024));
+            set_button(
+                &b,
+                5,
+                5,
+                Button {
+                    look: Look::Text {
+                        caption,
+                        size: 16,
+                        face: "sans".into(),
+                        color: "#ffffff".into(),
+                    },
+                    ..Default::default()
+                },
+            );
+            bump(&b.inputs.ticks);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+}
+
+/// A paired phone that pressed a pad and then stopped reading.
+async fn stalled_phone(
+    b: &Arc<TestBackend>,
+    limits: Limits,
+) -> (
+    RemoteService,
+    SharedSettings,
+    Client,
+    tokio::task::JoinHandle<()>,
+) {
+    set_button(
+        b,
+        3,
+        3,
+        Button {
+            down: vec![mark("D")],
+            up: vec![mark("U")],
+            ..Default::default()
+        },
+    );
+    b.engine.set_global("seq", String::new()).unwrap();
+    let (service, settings, _dir) = service(b.clone(), limits);
+    service.apply_settings().await;
+    let port = port_of(&service);
+    let token = paired_token(&service, port).await;
+    let mut ws = signed_in(port, &token).await;
+    send_json(
+        &mut ws,
+        serde_json::json!({ "type": "press", "x": 3, "y": 3 }),
+    )
+    .await;
+    assert!(until(|| b.inputs.pressed.lock().contains(&(3, 3))).await);
+    let flood = flood_state(b.clone());
+    (service, settings, ws, flood)
+}
+
+async fn released_within(b: &TestBackend, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while b.inputs.pressed.lock().contains(&(3, 3)) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    !b.inputs.pressed.lock().contains(&(3, 3))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_that_stops_reading_is_dropped_and_its_hold_released() {
+    let b = backend();
+    let limits = Limits {
+        write_timeout: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let (service, _settings, _ws, flood) = stalled_phone(&b, limits).await;
+    assert!(
+        released_within(&b, Duration::from_secs(15)).await,
+        "the stuck write timed out and the hold was released"
+    );
+    assert_eq!(seq_once(&b, "DU").await, "DU");
+    assert!(until(|| service.status().connected.is_empty()).await);
+    flood.abort();
+    service.configure(false, 4000).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_phone_that_stopped_reading_cuts_it_off_at_once() {
+    let b = backend();
+    // Writes would block for a minute: only the revoke can end it in time.
+    let limits = Limits {
+        write_timeout: Duration::from_secs(60),
+        ..Limits::default()
+    };
+    let (service, settings, _ws, flood) = stalled_phone(&b, limits).await;
+    // Let the pushes fill the socket buffers so the session sits in a write.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let id = settings.lock().settings.remote.devices[0].id.clone();
+    let started = Instant::now();
+    service.revoke(&id).unwrap();
+    assert!(
+        released_within(&b, Duration::from_secs(3)).await,
+        "released after the revoke"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(seq_once(&b, "DU").await, "DU");
+    flood.abort();
+    let stopped =
+        tokio::time::timeout(Duration::from_secs(3), service.configure(false, 4000)).await;
+    assert!(stopped.is_ok(), "turning it off is prompt too");
+}
+
+#[test]
+fn signing_in_does_not_rewrite_the_settings_file_every_time() {
+    let dir = temp_dir("seen");
+    let settings: SharedSettings = Arc::new(Mutex::new(SettingsStore::load(&dir)));
+    let auth = auth::RemoteAuth::new(settings.clone());
+    let phone = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 30));
+    let now = Instant::now();
+    let (code, _) = auth.start_pairing(now);
+    let (device, token) = auth.pair(&code, "Phone", phone, now).unwrap();
+    let file = dir.join("settings.json");
+    assert!(file.exists(), "pairing is saved");
+    std::fs::remove_file(&file).unwrap();
+
+    for _ in 0..3 {
+        auth.authenticate(&token, phone, now).unwrap();
+    }
+    assert!(
+        !file.exists(),
+        "fresh sign-ins only update the time in memory"
+    );
+    assert!(settings.lock().settings.remote.devices[0].last_seen >= device.last_seen);
+
+    // Stored long ago: the next sign-in writes it.
+    let old = chrono::Utc::now().timestamp_millis() - auth::LAST_SEEN_SAVE_INTERVAL_MS - 1;
+    let auth = auth::RemoteAuth::new(settings.clone());
+    settings.lock().settings.remote.devices[0].last_seen = Some(old);
+    auth.authenticate(&token, phone, now).unwrap();
+    assert!(file.exists());
+    assert!(
+        !dir.join("settings.json.partial").exists(),
+        "written atomically, nothing left over"
+    );
+    assert!(auth.is_paired(&device.id));
+    auth.revoke(&device.id).unwrap();
+    assert!(!auth.is_paired(&device.id));
 }

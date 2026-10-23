@@ -31,6 +31,8 @@ pub struct Limits {
     /// Largest WebSocket message (and frame) a phone may send.
     pub max_message: usize,
     pub head_timeout: Duration,
+    /// Longest any single write may block (a client that stops reading is dropped).
+    pub write_timeout: Duration,
     /// Time from the upgrade to the `auth`/`pair` message.
     pub auth_timeout: Duration,
     /// Silence (no message, no pong) after which a phone counts as gone.
@@ -49,6 +51,7 @@ impl Default for Limits {
             max_sessions: 4,
             max_message: 4 * 1024,
             head_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
             auth_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
             ping_interval: Duration::from_secs(10),
@@ -81,13 +84,19 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    pub fn add(
+    /// Register a signed-in phone unless `max` are already connected.
+    pub fn try_add(
         &self,
         device_id: &str,
         name: &str,
         address: IpAddr,
         token: CancellationToken,
-    ) -> u64 {
+        max: usize,
+    ) -> Option<u64> {
+        let mut live = self.live.lock();
+        if live.len() >= max {
+            return None;
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let info = ConnectedRemote {
             session: id,
@@ -95,8 +104,8 @@ impl Sessions {
             name: name.into(),
             address: address.to_string(),
         };
-        self.live.lock().insert(id, LiveSession { info, token });
-        id
+        live.insert(id, LiveSession { info, token });
+        Some(id)
     }
 
     pub fn remove(&self, id: u64) {
@@ -138,6 +147,9 @@ pub struct Context {
     pub notify: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// Longest [`RunningServer::stop`] waits for connections to end.
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+
 pub struct RunningServer {
     addr: SocketAddr,
     token: CancellationToken,
@@ -164,9 +176,14 @@ impl RunningServer {
     }
 
     /// Stop listening, end every connection and wait until they have released what they held.
+    ///
+    /// Every write and close is bounded, so this takes at most a few seconds; past
+    /// [`STOP_GRACE`] it stops waiting (the connections still end on their own).
     pub async fn stop(self) {
         self.token.cancel();
-        let _ = self.task.await;
+        if tokio::time::timeout(STOP_GRACE, self.task).await.is_err() {
+            tracing::warn!(addr = %self.addr, "phone remote connections still ending after stop");
+        }
         tracing::info!(addr = %self.addr, "phone remote stopped");
     }
 }
@@ -202,9 +219,29 @@ async fn accept_loop(
     while connections.join_next().await.is_some() {}
 }
 
-async fn respond(stream: &mut TcpStream, response: Response) {
-    let _ = stream.write_all(&response.to_bytes()).await;
-    let _ = stream.shutdown().await;
+/// Write a whole answer and close, giving up after the write timeout or on cancel:
+/// a client that never reads must not keep a slot or delay stopping.
+async fn write_bounded(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    ctx: &Context,
+    token: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = token.cancelled() => false,
+        written = tokio::time::timeout(ctx.limits.write_timeout, stream.write_all(bytes)) => matches!(written, Ok(Ok(()))),
+    }
+}
+
+async fn respond(
+    stream: &mut TcpStream,
+    ctx: &Context,
+    token: &CancellationToken,
+    response: Response,
+) {
+    if write_bounded(stream, &response.to_bytes(), ctx, token).await {
+        let _ = tokio::time::timeout(super::session::CLOSE_TIMEOUT, stream.shutdown()).await;
+    }
 }
 
 async fn connection(
@@ -225,6 +262,8 @@ async fn connection(
         Ok(Err(HeadError::TooLarge)) => {
             return respond(
                 &mut stream,
+                &ctx,
+                &token,
                 Response::text(431, "Request Header Fields Too Large", "request too large"),
             )
             .await
@@ -232,6 +271,8 @@ async fn connection(
         Ok(Err(_)) => {
             return respond(
                 &mut stream,
+                &ctx,
+                &token,
                 Response::text(400, "Bad Request", "bad request"),
             )
             .await
@@ -239,6 +280,8 @@ async fn connection(
         Err(_) => {
             return respond(
                 &mut stream,
+                &ctx,
+                &token,
                 Response::text(408, "Request Timeout", "timeout"),
             )
             .await
@@ -249,6 +292,8 @@ async fn connection(
         tracing::debug!(%peer, host = %host, "phone remote: host refused");
         return respond(
             &mut stream,
+            &ctx,
+            &token,
             Response::text(403, "Forbidden", "host not allowed"),
         )
         .await;
@@ -256,17 +301,27 @@ async fn connection(
     if req.method != "GET" {
         return respond(
             &mut stream,
+            &ctx,
+            &token,
             Response::text(405, "Method Not Allowed", "method not allowed"),
         )
         .await;
     }
     let path = req.path.split(['?', '#']).next().unwrap_or_default();
     if path != "/ws" {
-        return respond(&mut stream, static_response(&req, ctx.assets.as_ref())).await;
+        return respond(
+            &mut stream,
+            &ctx,
+            &token,
+            static_response(&req, ctx.assets.as_ref()),
+        )
+        .await;
     }
     let Some(key) = req.websocket_key() else {
         return respond(
             &mut stream,
+            &ctx,
+            &token,
             Response::text(400, "Bad Request", "expected a WebSocket upgrade"),
         )
         .await;
@@ -275,13 +330,15 @@ async fn connection(
         tracing::warn!(%peer, origin = ?req.header("origin"), "phone remote: cross-site WebSocket refused");
         return respond(
             &mut stream,
+            &ctx,
+            &token,
             Response::text(403, "Forbidden", "origin not allowed"),
         )
         .await;
     }
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     let upgrade = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
-    if stream.write_all(upgrade.as_bytes()).await.is_err() {
+    if !write_bounded(&mut stream, upgrade.as_bytes(), &ctx, &token).await {
         return;
     }
     let config = WebSocketConfig::default()

@@ -381,7 +381,14 @@ impl SettingsStore {
             }
         }
         let json = serde_json::to_string_pretty(&on_disk).map_err(|e| MidiError::Settings(e.to_string()))?;
-        fs::write(&self.path, json).map_err(|e| MidiError::Settings(e.to_string()))
+        // Written next to it and moved over it, so a crash mid-write cannot leave a torn file
+        // (which would load as defaults and lose every setting).
+        let partial = self.path.with_extension("json.partial");
+        fs::write(&partial, json).map_err(|e| MidiError::Settings(e.to_string()))?;
+        fs::rename(&partial, &self.path).map_err(|e| {
+            let _ = fs::remove_file(&partial);
+            MidiError::Settings(e.to_string())
+        })
     }
 
     /// Add or replace a named secret and remember its name.

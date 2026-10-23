@@ -123,7 +123,11 @@ pub fn host_allowed(host: &str, port: u16) -> bool {
         }
         match after {
             "" => return true,
-            p => (addr, p.strip_prefix(':')),
+            // Anything after the bracket but a port is not a host.
+            p => match p.strip_prefix(':') {
+                Some(port) => (addr, Some(port)),
+                None => return false,
+            },
         }
     } else {
         match host.rsplit_once(':') {
@@ -307,6 +311,10 @@ mod tests {
             ".local",
             "a.local:x",
             "[zz]:7373",
+            "[::1]junk",
+            "[::1];x",
+            "[::1]:",
+            "[::1]:80",
             "1.2.3.4.nip.io:7373",
             "lunchpad.local@evil.example",
         ] {

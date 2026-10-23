@@ -4,6 +4,7 @@ pub mod inquiry;
 pub mod manager;
 pub mod models;
 pub mod palette;
+pub mod presses;
 pub mod render;
 pub mod scan;
 pub mod types;

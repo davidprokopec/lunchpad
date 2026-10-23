@@ -35,10 +35,14 @@ use protocol::{build_state, fader_control, BackendError, RemoteBackend, RemoteSt
 use serde::Serialize;
 use server::{ConnectedRemote, Context, Limits, RunningServer, Sessions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 pub const EVENT_STATUS: &str = "remote:status";
+
+const BIND_RETRIES: usize = 10;
+const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Lowest port Settings accepts (below are privileged ports).
 pub const MIN_PORT: u16 = 1024;
@@ -91,11 +95,15 @@ impl RemoteBackend for AppBackend {
     }
 
     fn switch_page(&self, page_id: &str) -> Result<(), BackendError> {
-        if self.engine.switch_page(page_id) {
-            Ok(())
-        } else {
-            Err(BackendError::UnknownPage)
+        if !self.engine.switch_page(page_id) {
+            return Err(BackendError::UnknownPage);
         }
+        // With a Launchpad the repaint announces it; without one nothing paints.
+        let manager = self.manager.lock();
+        if !manager.is_connected() {
+            manager.notify_view_changed();
+        }
+        Ok(())
     }
 
     fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -218,7 +226,9 @@ struct Inner {
     settings: SharedSettings,
     ctx: Arc<Context>,
     options: Options,
-    server: tokio::sync::Mutex<Option<Running>>,
+    server: Mutex<Option<Running>>,
+    /// Bumped by every `apply_settings`; an older call that sees a newer one gives way.
+    generation: AtomicU64,
     /// The port listened on, readable without the async lock.
     running_port: Mutex<Option<u16>>,
     error: Mutex<Option<String>>,
@@ -258,7 +268,8 @@ impl RemoteService {
                 settings,
                 ctx,
                 options,
-                server: tokio::sync::Mutex::new(None),
+                server: Mutex::new(None),
+                generation: AtomicU64::new(0),
                 running_port: Mutex::new(None),
                 error: Mutex::new(None),
                 code: Mutex::new(None),
@@ -343,39 +354,59 @@ impl RemoteService {
     pub async fn apply_settings(&self) -> RemoteStatus {
         let config = self.inner.settings.lock().settings.remote.clone();
         let wanted = config.enabled.then_some(config.port);
-        {
-            let mut server = self.inner.server.lock().await;
-            let unchanged = matches!((&*server, wanted), (Some(r), Some(port)) if r.port == port);
-            if !unchanged {
-                if let Some(running) = server.take() {
-                    *self.inner.running_port.lock() = None;
-                    running.server.stop().await;
+        // Locks are only held for bookkeeping, never across an await. A newer call
+        // takes over from an older one still stopping or binding (`generation`).
+        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current = || self.inner.generation.load(Ordering::SeqCst) == generation;
+        let old = {
+            let mut server = self.inner.server.lock();
+            if matches!((&*server, wanted), (Some(r), Some(port)) if r.port == port) {
+                drop(server);
+                self.publish();
+                return self.status();
+            }
+            *self.inner.running_port.lock() = None;
+            *self.inner.error.lock() = None;
+            if !config.enabled {
+                self.cancel_pairing_quiet();
+            }
+            server.take()
+        };
+        if let Some(old) = old {
+            old.server.stop().await;
+        }
+        if let Some(port) = wanted.filter(|_| current()) {
+            let addr = SocketAddr::new(self.inner.options.bind_ip, port);
+            let mut bound = RunningServer::bind(addr, self.inner.ctx.clone()).await;
+            // An older call may still be letting go of the same port.
+            for _ in 0..BIND_RETRIES {
+                match &bound {
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && current() => {
+                        tokio::time::sleep(BIND_RETRY_DELAY).await;
+                        bound = RunningServer::bind(addr, self.inner.ctx.clone()).await;
+                    }
+                    _ => break,
                 }
-                *self.inner.error.lock() = None;
-                if !config.enabled {
-                    self.cancel_pairing_quiet();
-                }
-                if let Some(port) = wanted {
-                    match RunningServer::bind(
-                        SocketAddr::new(self.inner.options.bind_ip, port),
-                        self.inner.ctx.clone(),
-                    )
-                    .await
-                    {
-                        Ok(running) => {
-                            *self.inner.running_port.lock() = Some(running.port());
-                            *server = Some(Running {
-                                server: running,
-                                port,
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(port, error = %e, "phone remote could not listen");
-                            *self.inner.error.lock() =
-                                Some(format!("Port {port} could not be opened: {e}"));
-                        }
+            }
+            match bound {
+                Ok(running) => {
+                    let mut server = self.inner.server.lock();
+                    if current() && server.is_none() {
+                        *self.inner.running_port.lock() = Some(running.port());
+                        *server = Some(Running {
+                            server: running,
+                            port,
+                        });
+                    } else {
+                        running.cancel();
                     }
                 }
+                Err(e) if current() => {
+                    tracing::warn!(port, error = %e, "phone remote could not listen");
+                    *self.inner.error.lock() =
+                        Some(format!("Port {port} could not be opened: {e}"));
+                }
+                Err(_) => {}
             }
         }
         self.publish();
@@ -434,10 +465,8 @@ impl RemoteService {
 
     /// App exit: stop listening and end every connection without waiting.
     pub fn shutdown(&self) {
-        if let Ok(server) = self.inner.server.try_lock() {
-            if let Some(running) = server.as_ref() {
-                running.server.cancel();
-            }
+        if let Some(running) = self.inner.server.lock().as_ref() {
+            running.server.cancel();
         }
     }
 }

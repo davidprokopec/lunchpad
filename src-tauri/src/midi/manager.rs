@@ -20,7 +20,8 @@ use crossbeam_channel::{unbounded, Sender};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use super::presses::{PadPresses, PressSource};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -148,37 +149,10 @@ struct Active {
     /// Firmware reported over the live connection when the scan got no inquiry reply.
     late_firmware: Arc<Mutex<Option<String>>>,
     pressed: Arc<Mutex<HashSet<(u8, u8)>>>,
-    /// Pads held by a phone remote, by the session holding them.
-    remote_owners: RemoteOwners,
+    /// Who holds which pad: the hardware, a click, or a phone (see [`PadPresses`]).
+    presses: PadPresses,
     render: RenderHandle,
     driver: Arc<dyn LaunchpadDriver>,
-}
-
-/// Which phone remote session holds a pad. A pad has one gesture at a time
-/// whatever its source: a remote press is refused while the pad is held, and the
-/// first release (from the hardware or the owning remote) ends it.
-pub type RemoteOwners = Arc<Mutex<HashMap<(u8, u8), u64>>>;
-
-/// Claim (or end) a remote session's gesture on a pad. A press succeeds only on a
-/// pad nobody holds; a release only when that session still owns the press. Lock
-/// order: `pressed`, then `owners` (the input callback takes them the same way).
-pub fn claim_remote_press(pressed: &Mutex<HashSet<(u8, u8)>>, owners: &Mutex<HashMap<(u8, u8), u64>>, session: u64, x: u8, y: u8, down: bool) -> bool {
-    let mut set = pressed.lock();
-    let mut owners = owners.lock();
-    if down {
-        if !set.insert((x, y)) {
-            return false;
-        }
-        owners.insert((x, y), session);
-        true
-    } else {
-        if owners.get(&(x, y)) != Some(&session) {
-            return false;
-        }
-        owners.remove(&(x, y));
-        set.remove(&(x, y));
-        true
-    }
 }
 
 /// Whether a remote may press this cell: a real control that is not a knob, a
@@ -445,39 +419,35 @@ impl DeviceManager {
         }
     }
 
-    /// A phone remote's press or release, handled like a hardware press once claimed
-    /// (see [`claim_remote_press`]). `Ok(false)`: refused (held elsewhere, or not this
-    /// session's press any more).
+    /// Bump the ticks without a frame: something the remote shows changed while no
+    /// renderer runs (the active page with no Launchpad connected).
+    pub fn notify_view_changed(&self) {
+        bump(&self.ticks);
+    }
+
+    /// A phone remote's press or release, handled like a hardware press once the
+    /// pad is its own (see [`PadPresses`]). `Ok(false)`: refused (held by another
+    /// source, not pressable, or not this session's press).
     pub fn remote_press(&self, session: u64, x: u8, y: u8, pressed: bool) -> MidiResult<bool> {
         let a = self.active.as_ref().ok_or(MidiError::NotConnected)?;
         if pressed && !remote_pressable(&a.driver.layout(), x, y) {
             return Ok(false);
         }
-        if !claim_remote_press(&a.pressed, &a.remote_owners, session, x, y, pressed) {
-            return Ok(false);
-        }
-        self.dispatch_remote(a, x, y, pressed);
-        Ok(true)
+        Ok(a.presses.apply(PressSource::Remote(session), synthetic_event(a, x, y, pressed), &|e| self.dispatch(a, e)))
     }
 
-    fn dispatch_remote(&self, a: &Active, x: u8, y: u8, pressed: bool) {
-        let (note, cc) = a.driver.xy_to_note(x, y).unwrap_or((0, false));
-        let event = ButtonEvent { x, y, pressed, note, cc, value: if pressed { 127 } else { 0 } };
+    /// One press or release on its way to the window and the engine.
+    fn dispatch(&self, a: &Active, event: &ButtonEvent) {
         a.render.repaint();
-        let _ = self.app.emit(EVENT_BUTTON, event);
+        let _ = self.app.emit(EVENT_BUTTON, *event);
         for listener in self.listeners.lock().iter() {
-            listener(&event);
+            listener(event);
         }
     }
 
     /// A connection going away ends the gestures phones hold on it, so no hold is left armed.
     fn release_remote_presses(&self, a: &Active) {
-        let held: Vec<((u8, u8), u64)> = a.remote_owners.lock().iter().map(|(k, v)| (*k, *v)).collect();
-        for ((x, y), session) in held {
-            if claim_remote_press(&a.pressed, &a.remote_owners, session, x, y, false) {
-                self.dispatch_remote(a, x, y, false);
-            }
-        }
+        a.presses.release_where(|s| matches!(s, PressSource::Remote(_)), |x, y| synthetic_event(a, x, y, false), &|e| self.dispatch(a, e));
     }
 
     /// Slot holding the current connection's renderer; `None` while disconnected.
@@ -493,25 +463,11 @@ impl DeviceManager {
         Ok(())
     }
 
-    /// Treat a click in the UI exactly like a press on the hardware.
+    /// Treat a click in the UI exactly like a press on the hardware (a pad held by
+    /// the hardware or a phone ignores the click; see [`PadPresses`]).
     pub fn simulate_press(&self, x: u8, y: u8, pressed: bool) -> MidiResult<()> {
         let a = self.active.as_ref().ok_or(MidiError::NotConnected)?;
-        let (note, cc) = a.driver.xy_to_note(x, y).unwrap_or((0, false));
-        let event = ButtonEvent { x, y, pressed, note, cc, value: if pressed { 127 } else { 0 } };
-        {
-            let mut set = a.pressed.lock();
-            if pressed {
-                set.insert((x, y));
-            } else {
-                set.remove(&(x, y));
-                a.remote_owners.lock().remove(&(x, y));
-            }
-        }
-        a.render.repaint();
-        let _ = self.app.emit(EVENT_BUTTON, event);
-        for listener in self.listeners.lock().iter() {
-            listener(&event);
-        }
+        a.presses.apply(PressSource::Desktop, synthetic_event(a, x, y, pressed), &|e| self.dispatch(a, e));
         Ok(())
     }
 
@@ -679,7 +635,8 @@ impl DeviceManager {
             is_virtual: true,
         };
         *self.render_slot.lock() = Some(render.clone());
-        self.active = Some(Active { _input: None, _secondary_input: None, secondary_input_name: None, output, info, pressed, remote_owners: Arc::new(Mutex::new(HashMap::new())), render, driver, late_firmware: Arc::new(Mutex::new(None)) });
+        let presses = PadPresses::new(pressed.clone());
+        self.active = Some(Active { _input: None, _secondary_input: None, secondary_input_name: None, output, info, pressed, presses, render, driver, late_firmware: Arc::new(Mutex::new(None)) });
         self.status = ConnectionStatus::Connected;
         {
             let mut st = self.settings.lock();
@@ -769,13 +726,13 @@ impl DeviceManager {
         let render = spawn_renderer(output.clone(), driver.layout(), self.render_inputs(pressed.clone()));
 
         // Input callbacks ----------------------------------------------------
-        let remote_owners: RemoteOwners = Arc::new(Mutex::new(HashMap::new()));
+        let presses = PadPresses::new(pressed.clone());
         let sink = InputSink {
             app: self.app.clone(),
             driver: driver.clone(),
             output: output.clone(),
             pressed: pressed.clone(),
-            remote_owners: remote_owners.clone(),
+            presses: presses.clone(),
             render: render.clone(),
             listeners: self.listeners.clone(),
             pressure_listeners: self.pressure_listeners.clone(),
@@ -851,7 +808,7 @@ impl DeviceManager {
             },
             late_firmware,
             pressed,
-            remote_owners,
+            presses,
         })
     }
 
@@ -903,7 +860,7 @@ struct InputSink {
     /// For the driver's immediate answers to what the device reports.
     output: OutputHandle,
     pressed: Arc<Mutex<HashSet<(u8, u8)>>>,
-    remote_owners: RemoteOwners,
+    presses: PadPresses,
     render: RenderHandle,
     listeners: Arc<Mutex<Vec<ButtonListener>>>,
     pressure_listeners: Arc<Mutex<Vec<PressureListener>>>,
@@ -996,31 +953,26 @@ impl InputSink {
     }
 
     fn button(&self, event: ButtonEvent) {
-        {
-            let mut set = self.pressed.lock();
-            if event.pressed {
-                if !set.insert((event.x, event.y)) {
-                    // Already held (by a phone remote): one gesture per pad at a time.
-                    tracing::trace!(x = event.x, y = event.y, "press of a held pad ignored");
-                    return;
-                }
-            } else if !set.remove(&(event.x, event.y)) {
-                // A release for a pad that never counted as pressed (a brush below
-                // the velocity threshold): nothing to release, so nothing to run.
-                tracing::trace!(x = event.x, y = event.y, "release without press ignored");
-                return;
-            } else {
-                // The hardware let go: the gesture is over, whoever started it.
-                self.remote_owners.lock().remove(&(event.x, event.y));
+        // A release for a pad that never counted as pressed (a brush below the
+        // velocity threshold), or a pad a phone or a click holds: nothing to run.
+        let dispatched = self.presses.apply(PressSource::Hardware, event, &|e| {
+            tracing::debug!(x = e.x, y = e.y, pressed = e.pressed, note = e.note, cc = e.cc, value = e.value, "button");
+            self.render.repaint();
+            let _ = self.app.emit(EVENT_BUTTON, *e);
+            for listener in self.listeners.lock().iter() {
+                listener(e);
             }
-        }
-        tracing::debug!(x = event.x, y = event.y, pressed = event.pressed, note = event.note, cc = event.cc, value = event.value, "button");
-        self.render.repaint();
-        let _ = self.app.emit(EVENT_BUTTON, event);
-        for listener in self.listeners.lock().iter() {
-            listener(&event);
+        });
+        if !dispatched {
+            tracing::trace!(x = event.x, y = event.y, pressed = event.pressed, "press or release ignored");
         }
     }
+}
+
+/// A press or release made up for a pad (a click, a phone, a release that ends a gesture).
+fn synthetic_event(a: &Active, x: u8, y: u8, pressed: bool) -> ButtonEvent {
+    let (note, cc) = a.driver.xy_to_note(x, y).unwrap_or((0, false));
+    ButtonEvent { x, y, pressed, note, cc, value: if pressed { 127 } else { 0 } }
 }
 
 /// Open a device's second input interface with its own MIDI client.

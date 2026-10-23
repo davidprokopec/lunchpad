@@ -10,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -102,28 +102,56 @@ impl Session {
     }
 }
 
-async fn send<S: AsyncRead + AsyncWrite + Unpin>(
-    ws: &mut WebSocketStream<S>,
-    msg: &ServerMessage,
-) -> bool {
-    match serde_json::to_string(msg) {
-        Ok(text) => ws.send(Message::text(text)).await.is_ok(),
-        Err(_) => false,
+/// How long the goodbye may take; the holds are released before it.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Where writes go and how long each may block: a phone that stops reading must
+/// not hold up revoking it, the idle timeout or stopping the server.
+struct Out<'a> {
+    token: &'a CancellationToken,
+    timeout: Duration,
+}
+
+impl Out<'_> {
+    /// Send one frame; false when it failed, timed out or the connection is being cancelled.
+    async fn raw<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        ws: &mut WebSocketStream<S>,
+        msg: Message,
+    ) -> bool {
+        tokio::select! {
+            _ = self.token.cancelled() => false,
+            sent = tokio::time::timeout(self.timeout, ws.send(msg)) => matches!(sent, Ok(Ok(()))),
+        }
+    }
+
+    async fn send<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        ws: &mut WebSocketStream<S>,
+        msg: &ServerMessage,
+    ) -> bool {
+        match serde_json::to_string(msg) {
+            Ok(text) => self.raw(ws, Message::text(text)).await,
+            Err(_) => false,
+        }
     }
 }
 
+/// Say goodbye, briefly: never more than [`CLOSE_TIMEOUT`].
 async fn close<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
     code: u16,
     reason: &str,
 ) {
-    let _ = ws
-        .send(Message::Close(Some(CloseFrame {
-            code: CloseCode::from(code),
-            reason: reason.to_string().into(),
-        })))
-        .await;
-    let _ = ws.flush().await;
+    let frame = Message::Close(Some(CloseFrame {
+        code: CloseCode::from(code),
+        reason: reason.to_string().into(),
+    }));
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+        let _ = ws.send(frame).await;
+        let _ = ws.flush().await;
+    })
+    .await;
 }
 
 /// The first text message, skipping pings and pongs; `None` when the socket ended.
@@ -145,6 +173,10 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: Arc<Context>,
     token: CancellationToken,
 ) {
+    let out = Out {
+        token: &token,
+        timeout: ctx.limits.write_timeout,
+    };
     let first = tokio::select! {
         _ = token.cancelled() => return,
         first = tokio::time::timeout(ctx.limits.auth_timeout, first_text(&mut ws)) => first,
@@ -153,17 +185,13 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(Some(text)) => text,
         Ok(None) => return,
         Err(_) => {
-            send(&mut ws, &ServerMessage::error("timeout", "sign in first")).await;
+            out.send(&mut ws, &ServerMessage::error("timeout", "sign in first"))
+                .await;
             return close(&mut ws, CLOSE_UNAUTHORIZED, "timeout").await;
         }
     };
     if ctx.sessions.count() >= ctx.limits.max_sessions {
-        send(
-            &mut ws,
-            &ServerMessage::error("tooManySessions", "too many phones are connected"),
-        )
-        .await;
-        return close(&mut ws, 1013, "busy").await;
+        return too_many(&mut ws, &out).await;
     }
     let now = Instant::now();
     let signed_in = match serde_json::from_str::<ClientMessage>(&text) {
@@ -216,19 +244,40 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(ok) => ok,
         Err((code, message)) => {
             tracing::warn!(%ip, code, "phone remote: sign-in refused");
-            send(&mut ws, &ServerMessage::error(code, message)).await;
+            out.send(&mut ws, &ServerMessage::error(code, message))
+                .await;
             return close(&mut ws, CLOSE_UNAUTHORIZED, code).await;
         }
     };
     let session_token = token.child_token();
-    let id = ctx
-        .sessions
-        .add(&device_id, &name, ip, session_token.clone());
+    let Some(id) = ctx.sessions.try_add(
+        &device_id,
+        &name,
+        ip,
+        session_token.clone(),
+        ctx.limits.max_sessions,
+    ) else {
+        return too_many(&mut ws, &out).await;
+    };
+    // Revoked between the sign-in and the registration above: `cancel_device` missed it.
+    if !ctx.auth.is_paired(&device_id) {
+        ctx.sessions.remove(id);
+        out.send(
+            &mut ws,
+            &ServerMessage::error("unauthorized", "sign-in refused"),
+        )
+        .await;
+        return close(&mut ws, CLOSE_UNAUTHORIZED, "unauthorized").await;
+    }
     (ctx.notify)();
     tracing::info!(session = id, device = %device_id, %ip, "phone remote connected");
     let mut session = Session::new(id, ctx.backend.clone());
-    let reason = if send(&mut ws, &reply).await {
-        serve(&mut ws, &mut session, &ctx, &session_token).await
+    let session_out = Out {
+        token: &session_token,
+        timeout: ctx.limits.write_timeout,
+    };
+    let reason = if session_out.send(&mut ws, &reply).await {
+        serve(&mut ws, &mut session, &ctx, &session_out).await
     } else {
         "gone"
     };
@@ -239,13 +288,23 @@ pub async fn run<S: AsyncRead + AsyncWrite + Unpin>(
     close(&mut ws, 1000, reason).await;
 }
 
+async fn too_many<S: AsyncRead + AsyncWrite + Unpin>(ws: &mut WebSocketStream<S>, out: &Out<'_>) {
+    out.send(
+        ws,
+        &ServerMessage::error("tooManySessions", "too many phones are connected"),
+    )
+    .await;
+    close(ws, 1013, "busy").await;
+}
+
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
     session: &mut Session,
     ctx: &Context,
-    token: &CancellationToken,
+    out: &Out<'_>,
 ) -> &'static str {
     let limits = &ctx.limits;
+    let token = out.token;
     let mut changes = ctx.backend.changes();
     let mut changes_open = true;
     let mut dirty = true;
@@ -264,8 +323,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             let state = ServerMessage::State(Box::new(ctx.backend.state()));
             if let Ok(text) = serde_json::to_string(&state) {
                 if last_state.as_deref() != Some(text.as_str()) {
-                    if ws.send(Message::text(text.clone())).await.is_err() {
-                        return "gone";
+                    if !out.raw(ws, Message::text(text.clone())).await {
+                        return if token.is_cancelled() {
+                            "stopped"
+                        } else {
+                            "stuck"
+                        };
                     }
                     last_state = Some(text);
                 }
@@ -281,11 +344,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             },
             _ = ping.tick() => {
                 if last_activity.elapsed() >= limits.idle_timeout {
-                    send(ws, &ServerMessage::error("timeout", "no sign of life")).await;
+                    out.send(ws, &ServerMessage::error("timeout", "no sign of life")).await;
                     return "timeout";
                 }
-                if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    return "gone";
+                if !out.raw(ws, Message::Ping(Vec::new().into())).await {
+                    return "stuck";
                 }
             }
             msg = ws.next() => match msg {
@@ -299,19 +362,19 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     window.1 += 1;
                     if window.1 > limits.max_messages_per_second {
-                        send(ws, &ServerMessage::error("tooManyMessages", "slow down")).await;
+                        out.send(ws, &ServerMessage::error("tooManyMessages", "slow down")).await;
                         return "flood";
                     }
                     if let Some(reply) = session.handle(text.as_str()) {
-                        if !send(ws, &reply).await {
-                            return "gone";
+                        if !out.send(ws, &reply).await {
+                            return "stuck";
                         }
                     }
                 }
                 Some(Ok(_)) => {
                     last_activity = Instant::now();
-                    if !send(ws, &ServerMessage::error("badRequest", "text messages only")).await {
-                        return "gone";
+                    if !out.send(ws, &ServerMessage::error("badRequest", "text messages only")).await {
+                        return "stuck";
                     }
                 }
             },
