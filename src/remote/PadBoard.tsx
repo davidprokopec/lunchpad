@@ -60,6 +60,10 @@ export function PadBoard({ layout, state, held, drafts, client, live }: Props) {
     return () => {
       window.removeEventListener("pointerup", end);
       window.removeEventListener("pointercancel", end);
+      // The board can disappear under a held finger (e.g. the Launchpad was unplugged);
+      // its lift would then never reach us, so let go of everything now.
+      controls.current.clear();
+      client.releaseAll();
     };
   }, [client]);
 
