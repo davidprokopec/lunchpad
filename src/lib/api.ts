@@ -192,6 +192,130 @@ export interface FineTuneSettings {
   autoConnect: boolean;
 }
 
+/** A paired phone as stored in the settings (only a hash of its token). */
+export interface RemoteDevice {
+  id: string;
+  name: string;
+  tokenHash: string;
+  /** Unix milliseconds */
+  createdAt: number;
+  lastSeen: number | null;
+}
+
+/** Phone remote: off by default; turning it off keeps the paired phones. */
+export interface RemoteSettings {
+  enabled: boolean;
+  port: number;
+  devices: RemoteDevice[];
+}
+
+/** A paired phone for the Settings list. */
+export interface RemoteDeviceStatus {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeen: number | null;
+  connected: boolean;
+}
+
+/** A phone signed in right now. */
+export interface ConnectedRemote {
+  session: number;
+  deviceId: string;
+  name: string;
+  address: string;
+}
+
+/** A pairing code waiting to be used (once, until `expiresAt`). */
+export interface RemotePairing {
+  code: string;
+  /** For the QR code: the page with `#pair=<code>`; null when no address is known. */
+  url: string | null;
+  /** Unix milliseconds */
+  expiresAt: number;
+}
+
+/** Settings → Phone remote; also pushed as `remote:status`. */
+export interface RemoteStatus {
+  enabled: boolean;
+  port: number;
+  /** Listening right now. */
+  running: boolean;
+  /** Why it is not listening although enabled (e.g. the port is taken). */
+  error: string | null;
+  addresses: string[];
+  /** Where phones open the page, best first. */
+  urls: string[];
+  pairing: RemotePairing | null;
+  devices: RemoteDeviceStatus[];
+  connected: ConnectedRemote[];
+}
+
+/** Phone remote WebSocket protocol (`/ws`, JSON text messages), version 1. */
+export const REMOTE_PROTOCOL_VERSION = 1;
+
+/** Phone → app. The first message must be `pair` or `auth`; nothing else is accepted before. */
+export type RemoteClientMessage =
+  | { type: "pair"; v: number; code: string; name?: string }
+  | { type: "auth"; v: number; token: string }
+  | { type: "press"; x: number; y: number }
+  | { type: "release"; x: number; y: number }
+  /** `value` 0..1 over the fader's travel; only faders of the page on screen. */
+  | { type: "setFader"; faderId: string; value: number }
+  | { type: "switchPage"; pageId: string }
+  | { type: "ping" };
+
+/** An LED colour as the hardware shows it, with its on-screen RGB (`#rrggbb`). */
+export type RemoteColor =
+  | { mode: "off" }
+  | { mode: "palette"; index: number; rgb: string }
+  | { mode: "flashing"; index: number; alt: number; rgb: string; altRgb: string }
+  | { mode: "pulsing"; index: number; rgb: string }
+  | { mode: "rgb"; rgb: string };
+
+export type RemoteLabel = { type: "text"; caption: string; color: string } | { type: "image" };
+
+export interface RemotePad {
+  x: number;
+  y: number;
+  color: RemoteColor;
+  pressed: boolean;
+  label?: RemoteLabel;
+  /** The fader this pad belongs to. */
+  fader?: string;
+}
+
+export interface RemoteFader {
+  id: string;
+  name: string;
+  direction: FaderDirection;
+  /** Pads from the minimum to the maximum, as [x, y]. */
+  pads: [number, number][];
+  value: number;
+  /** 0..1, what `setFader` takes. */
+  fraction: number;
+  display: string;
+}
+
+export interface RemoteState {
+  v: number;
+  /** null while no Launchpad (real or virtual) is connected. */
+  device: { model: LaunchpadModel; modelName: string; virtual: boolean } | null;
+  layout: Layout | null;
+  pages: { id: string; name: string }[];
+  activePage: string | null;
+  pads: RemotePad[];
+  faders: RemoteFader[];
+}
+
+/** App → phone. */
+export type RemoteServerMessage =
+  | { type: "paired"; v: number; deviceId: string; name: string; token: string }
+  | { type: "authOk"; v: number; deviceId: string; name: string }
+  | ({ type: "state" } & RemoteState)
+  | { type: "pong" }
+  | { type: "error"; code: string; message: string };
+
 export type FineTuneTarget =
   | { type: "app"; appId: string }
   | { type: "output"; deviceUid: string; label?: string }
@@ -499,6 +623,7 @@ export interface Settings {
   /** Names of the user's secrets, used as `{{secret.<name>}}`; the values stay in the credential store. */
   secrets: string[];
   hub: HubSettings;
+  remote: RemoteSettings;
 }
 
 /** A knob, a touch strip that stays put, or one that springs back to the middle. */
@@ -1311,6 +1436,14 @@ export const api = {
   waveLinkDisconnect: () => invoke<WaveLinkState>("wave_link_disconnect"),
   waveLinkRefresh: () => invoke<WaveLinkState>("wave_link_refresh"),
   setWaveLinkSettings: (config: WaveLinkSettings) => invoke<Settings>("set_wave_link_settings", { config }),
+  remoteStatus: () => invoke<RemoteStatus>("remote_status"),
+  /** Turn the phone remote on/off and set its port (1024-65535); starts, restarts or stops it. */
+  setRemoteSettings: (enabled: boolean, port: number) => invoke<RemoteStatus>("set_remote_settings", { enabled, port }),
+  /** A fresh one-time code (replaces any earlier one); fails while the remote is off. */
+  remoteStartPairing: () => invoke<RemotePairing>("remote_start_pairing"),
+  remoteCancelPairing: () => invoke<RemoteStatus>("remote_cancel_pairing"),
+  /** Forget a phone and disconnect it at once. */
+  remoteRevokeDevice: (deviceId: string) => invoke<RemoteStatus>("remote_revoke_device", { deviceId }),
   fileName: (path: string) => invoke<string>("file_name", { path }),
   listVoices: () => invoke<VoiceInfo[]>("list_voices"),
   previewSpeech: (request: { text: string; voice: string | null; volume: number }) => invoke<void>("preview_speech", { request }),
@@ -1420,6 +1553,7 @@ export const events = {
   onVariables: (cb: (globals: Record<string, string>) => void): Promise<UnlistenFn> =>
     listen<Record<string, string>>("vars:changed", (e) => cb(e.payload)),
   onHubState: (cb: (state: HubState) => void): Promise<UnlistenFn> => listen<HubState>("hub:state", (e) => cb(e.payload)),
+  onRemoteStatus: (cb: (status: RemoteStatus) => void): Promise<UnlistenFn> => listen<RemoteStatus>("remote:status", (e) => cb(e.payload)),
 };
 
 export const padKey = (x: number, y: number) => `${x},${y}`;

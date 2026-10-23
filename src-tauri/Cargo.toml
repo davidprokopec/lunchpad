@@ -43,6 +43,10 @@ percent-encoding = "2"
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+# LAN remote: request heads are parsed by hand (already used by tungstenite) and
+# pairing codes / device tokens come from the OS random source.
+httparse = "1"
+getrandom = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 tracing-appender = "0.2"

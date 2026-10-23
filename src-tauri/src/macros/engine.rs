@@ -567,6 +567,21 @@ impl MacroEngine {
         true
     }
 
+    /// Show another page, as the Switch page action does (held pads keep the page they
+    /// were pressed on). Returns false when there is no such page.
+    pub fn switch_page(&self, page_id: &str) -> bool {
+        let target = page_id.to_string();
+        self.inner
+            .commit(move |p| {
+                if p.page(&target).is_none() {
+                    return Err(crate::profile::store::ProfileError::PageNotFound(target));
+                }
+                p.active_page = target;
+                Ok(())
+            })
+            .is_some()
+    }
+
     /// The system audio changed: every bound fader on any page takes its target's level.
     /// Nothing runs and nothing is written back; a muted or missing target keeps the value
     /// (the LEDs show it as muted or unavailable), and a level within a thousandth of the

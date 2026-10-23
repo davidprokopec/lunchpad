@@ -186,6 +186,38 @@ impl Default for HomeAssistantSettings {
     }
 }
 
+/// The phone remote: a page served on the local network that mirrors the pads.
+/// Off until the user turns it on; paired phones are kept while it is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteSettings {
+    pub enabled: bool,
+    pub port: u16,
+    pub devices: Vec<RemoteDevice>,
+}
+
+pub const DEFAULT_REMOTE_PORT: u16 = 7373;
+
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        RemoteSettings { enabled: false, port: DEFAULT_REMOTE_PORT, devices: Vec::new() }
+    }
+}
+
+/// A paired phone. Only a SHA-256 of its token is kept; the token itself lives on the phone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDevice {
+    pub id: String,
+    pub name: String,
+    /// Hex SHA-256 of the device token.
+    pub token_hash: String,
+    /// Unix milliseconds
+    pub created_at: i64,
+    #[serde(default)]
+    pub last_seen: Option<i64>,
+}
+
 /// Window behaviour, also reachable from the tray menu.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -245,6 +277,8 @@ pub struct Settings {
     /// The community hub: its address and who is signed in (the token is in the credential store).
     #[serde(default)]
     pub hub: crate::hub::HubSettings,
+    #[serde(default)]
+    pub remote: RemoteSettings,
 }
 
 fn default_version() -> u32 {
@@ -273,6 +307,7 @@ impl Default for Settings {
             developer_mode: false,
             secrets: Vec::new(),
             hub: crate::hub::HubSettings::default(),
+            remote: RemoteSettings::default(),
         }
     }
 }

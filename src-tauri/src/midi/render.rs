@@ -37,6 +37,20 @@ pub struct RenderInputs {
     pub press_feedback: Arc<Mutex<bool>>,
     /// Streaming app state for buttons with a `state_link`.
     pub live: SharedLive,
+    /// Bumped after every frame the renderer builds, so others showing the pads
+    /// (the phone remote) can follow without a renderer of their own.
+    pub ticks: FrameTicks,
+}
+
+/// Counter bumped whenever the pads were (re)painted or the connection changed.
+pub type FrameTicks = Arc<tokio::sync::watch::Sender<u64>>;
+
+pub fn frame_ticks() -> FrameTicks {
+    Arc::new(tokio::sync::watch::channel(0).0)
+}
+
+pub fn bump(ticks: &FrameTicks) {
+    ticks.send_modify(|n| *n = n.wrapping_add(1));
 }
 
 #[derive(Clone)]
@@ -82,6 +96,7 @@ fn render_loop(rx: Receiver<RenderCmd>, output: OutputHandle, layout: Layout, in
             RenderCmd::Repaint => {}
         }
         let frame = build_frame(&layout, &inputs);
+        bump(&inputs.ticks);
         let changed: Vec<(u8, u8, LedColor)> = frame
             .iter()
             .filter(|((x, y), c)| last.get(&(*x, *y)) != Some(*c))
@@ -180,6 +195,7 @@ mod tests {
             running: Arc::new(Mutex::new(HashSet::new())),
             press_feedback: Arc::new(Mutex::new(true)),
             live: Default::default(),
+            ticks: frame_ticks(),
         }
     }
 

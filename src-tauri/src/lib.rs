@@ -21,6 +21,7 @@ pub mod macros;
 pub mod midi;
 pub mod obs;
 pub mod profile;
+pub mod remote;
 pub mod script;
 pub mod homeassistant;
 pub mod hub;
@@ -357,6 +358,22 @@ pub fn run() {
             );
             let audio_bridge = system_audio_bridge::Bridge { audio: system_audio.clone(), live, engine: engine.clone(), profile: profile.clone(), app: Some(app.handle().clone()) }.spawn();
 
+            // Phone remote: listens only when turned on in Settings.
+            let remote = remote::RemoteService::new(
+                settings.clone(),
+                Arc::new(remote::AppBackend::new(manager.clone(), engine.clone(), profile.clone())),
+                Arc::new(remote::TauriAssets(app.handle().clone())),
+                remote::Options::default(),
+            );
+            {
+                let app = app.handle().clone();
+                remote.set_listener(Arc::new(move |status| {
+                    let _ = app.emit(remote::EVENT_STATUS, status);
+                }));
+                let remote = remote.clone();
+                tauri::async_runtime::spawn(async move { remote.apply_settings().await });
+            }
+
             let window_settings = settings.lock().settings.window.clone();
             app.manage(AppState {
                 manager: manager.clone(),
@@ -378,6 +395,7 @@ pub fn run() {
                 wave_link_bridge: Mutex::new(Some(wave_link_bridge)),
                 fine_tune,
                 fine_tune_bridge: Mutex::new(Some(fine_tune_bridge)),
+                remote,
                 history: Mutex::new(Vec::new()),
                 redo: Mutex::new(Vec::new()),
             });
@@ -539,6 +557,12 @@ pub fn run() {
             hub_list_backups,
             hub_delete_backup,
             hub_restore_backup,
+            // phone remote
+            remote_status,
+            set_remote_settings,
+            remote_start_pairing,
+            remote_cancel_pairing,
+            remote_revoke_device,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -551,6 +575,7 @@ pub fn run() {
             }
             // Taps, listeners and COM objects are released on the audio thread.
             if let tauri::RunEvent::Exit = event {
+                app.state::<AppState>().remote.shutdown();
                 app.state::<AppState>().sysaudio.shutdown();
                 app.state::<AppState>().wave_link.shutdown();
                 app.state::<AppState>().wave_link_bridge.lock().take();

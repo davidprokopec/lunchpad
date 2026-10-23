@@ -10,7 +10,7 @@
 
 use super::inquiry::{is_inquiry_reply, parse_inquiry_reply, DEVICE_INQUIRY};
 use super::models::{driver_for, LaunchpadDriver};
-use super::render::{spawn_renderer, RenderHandle, RenderInputs};
+use super::render::{bump, frame_ticks, spawn_renderer, FrameTicks, RenderHandle, RenderInputs};
 use crate::live::SharedLive;
 use super::scan::{self, port_fingerprint};
 use super::types::*;
@@ -20,7 +20,7 @@ use crossbeam_channel::{unbounded, Sender};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput};
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -148,8 +148,51 @@ struct Active {
     /// Firmware reported over the live connection when the scan got no inquiry reply.
     late_firmware: Arc<Mutex<Option<String>>>,
     pressed: Arc<Mutex<HashSet<(u8, u8)>>>,
+    /// Pads held by a phone remote, by the session holding them.
+    remote_owners: RemoteOwners,
     render: RenderHandle,
     driver: Arc<dyn LaunchpadDriver>,
+}
+
+/// Which phone remote session holds a pad. A pad has one gesture at a time
+/// whatever its source: a remote press is refused while the pad is held, and the
+/// first release (from the hardware or the owning remote) ends it.
+pub type RemoteOwners = Arc<Mutex<HashMap<(u8, u8), u64>>>;
+
+/// Claim (or end) a remote session's gesture on a pad. A press succeeds only on a
+/// pad nobody holds; a release only when that session still owns the press. Lock
+/// order: `pressed`, then `owners` (the input callback takes them the same way).
+pub fn claim_remote_press(pressed: &Mutex<HashSet<(u8, u8)>>, owners: &Mutex<HashMap<(u8, u8), u64>>, session: u64, x: u8, y: u8, down: bool) -> bool {
+    let mut set = pressed.lock();
+    let mut owners = owners.lock();
+    if down {
+        if !set.insert((x, y)) {
+            return false;
+        }
+        owners.insert((x, y), session);
+        true
+    } else {
+        if owners.get(&(x, y)) != Some(&session) {
+            return false;
+        }
+        owners.remove(&(x, y));
+        set.remove(&(x, y));
+        true
+    }
+}
+
+/// Whether a remote may press this cell: a real control that is not a knob, a
+/// strip or an LED-only spot.
+pub fn remote_pressable(layout: &Layout, x: u8, y: u8) -> bool {
+    layout.pads.iter().any(|p| p.x == x && p.y == y && !matches!(p.shape, PadShape::Empty | PadShape::Logo | PadShape::Knob | PadShape::Strip))
+}
+
+/// What the pads of the current connection are painted from, for others that show them.
+#[derive(Clone)]
+pub struct RenderView {
+    pub device: ConnectedDevice,
+    pub layout: Layout,
+    pub inputs: RenderInputs,
 }
 
 pub struct DeviceManager {
@@ -174,6 +217,8 @@ pub struct DeviceManager {
     /// Someone is watching the MIDI monitor, so raw messages are worth sending.
     monitor: Arc<AtomicBool>,
     live: SharedLive,
+    /// Bumped by every frame and connection change; see [`DeviceManager::frame_ticks`].
+    ticks: FrameTicks,
     next_auto_connect: Instant,
 }
 
@@ -253,6 +298,7 @@ impl DeviceManager {
             press_threshold: Arc::new(Mutex::new(press_threshold)),
             monitor: Arc::new(AtomicBool::new(false)),
             live: Arc::new(Mutex::new(Default::default())),
+            ticks: frame_ticks(),
             next_auto_connect: Instant::now(),
         }
     }
@@ -293,6 +339,7 @@ impl DeviceManager {
     fn emit_state(&self) {
 
         let state = self.state();
+        bump(&self.ticks);
 
         for listener in self.state_listeners.lock().iter() {
 
@@ -376,6 +423,63 @@ impl DeviceManager {
         }
     }
 
+    /// Follows every frame painted and every connection change.
+    pub fn frame_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ticks.subscribe()
+    }
+
+    /// The connection's layout and render inputs; `None` while disconnected.
+    pub fn render_view(&self) -> Option<RenderView> {
+        let a = self.active.as_ref()?;
+        Some(RenderView { device: a.info(), layout: a.driver.layout(), inputs: self.render_inputs(a.pressed.clone()) })
+    }
+
+    fn render_inputs(&self, pressed: Arc<Mutex<HashSet<(u8, u8)>>>) -> RenderInputs {
+        RenderInputs {
+            profile: self.profile.clone(),
+            pressed,
+            running: self.running.clone(),
+            press_feedback: self.press_feedback.clone(),
+            live: self.live.clone(),
+            ticks: self.ticks.clone(),
+        }
+    }
+
+    /// A phone remote's press or release, handled like a hardware press once claimed
+    /// (see [`claim_remote_press`]). `Ok(false)`: refused (held elsewhere, or not this
+    /// session's press any more).
+    pub fn remote_press(&self, session: u64, x: u8, y: u8, pressed: bool) -> MidiResult<bool> {
+        let a = self.active.as_ref().ok_or(MidiError::NotConnected)?;
+        if pressed && !remote_pressable(&a.driver.layout(), x, y) {
+            return Ok(false);
+        }
+        if !claim_remote_press(&a.pressed, &a.remote_owners, session, x, y, pressed) {
+            return Ok(false);
+        }
+        self.dispatch_remote(a, x, y, pressed);
+        Ok(true)
+    }
+
+    fn dispatch_remote(&self, a: &Active, x: u8, y: u8, pressed: bool) {
+        let (note, cc) = a.driver.xy_to_note(x, y).unwrap_or((0, false));
+        let event = ButtonEvent { x, y, pressed, note, cc, value: if pressed { 127 } else { 0 } };
+        a.render.repaint();
+        let _ = self.app.emit(EVENT_BUTTON, event);
+        for listener in self.listeners.lock().iter() {
+            listener(&event);
+        }
+    }
+
+    /// A connection going away ends the gestures phones hold on it, so no hold is left armed.
+    fn release_remote_presses(&self, a: &Active) {
+        let held: Vec<((u8, u8), u64)> = a.remote_owners.lock().iter().map(|(k, v)| (*k, *v)).collect();
+        for ((x, y), session) in held {
+            if claim_remote_press(&a.pressed, &a.remote_owners, session, x, y, false) {
+                self.dispatch_remote(a, x, y, false);
+            }
+        }
+    }
+
     /// Slot holding the current connection's renderer; `None` while disconnected.
     pub fn render_slot(&self) -> Arc<Mutex<Option<RenderHandle>>> {
         self.render_slot.clone()
@@ -400,6 +504,7 @@ impl DeviceManager {
                 set.insert((x, y));
             } else {
                 set.remove(&(x, y));
+                a.remote_owners.lock().remove(&(x, y));
             }
         }
         a.render.repaint();
@@ -564,17 +669,7 @@ impl DeviceManager {
             .map_err(|e| MidiError::Init(e.to_string()))?;
         let output = OutputHandle { tx, driver: driver.clone() };
         let pressed = Arc::new(Mutex::new(HashSet::<(u8, u8)>::new()));
-        let render = spawn_renderer(
-            output.clone(),
-            driver.layout(),
-            RenderInputs {
-                profile: self.profile.clone(),
-                pressed: pressed.clone(),
-                running: self.running.clone(),
-                press_feedback: self.press_feedback.clone(),
-                live: self.live.clone(),
-            },
-        );
+        let render = spawn_renderer(output.clone(), driver.layout(), self.render_inputs(pressed.clone()));
         let info = ConnectedDevice {
             model,
             model_name: model.display_name().to_string(),
@@ -584,7 +679,7 @@ impl DeviceManager {
             is_virtual: true,
         };
         *self.render_slot.lock() = Some(render.clone());
-        self.active = Some(Active { _input: None, _secondary_input: None, secondary_input_name: None, output, info, pressed, render, driver, late_firmware: Arc::new(Mutex::new(None)) });
+        self.active = Some(Active { _input: None, _secondary_input: None, secondary_input_name: None, output, info, pressed, remote_owners: Arc::new(Mutex::new(HashMap::new())), render, driver, late_firmware: Arc::new(Mutex::new(None)) });
         self.status = ConnectionStatus::Connected;
         {
             let mut st = self.settings.lock();
@@ -671,24 +766,16 @@ impl DeviceManager {
 
         // LED renderer -------------------------------------------------------
         let pressed = Arc::new(Mutex::new(HashSet::<(u8, u8)>::new()));
-        let render = spawn_renderer(
-            output.clone(),
-            driver.layout(),
-            RenderInputs {
-                profile: self.profile.clone(),
-                pressed: pressed.clone(),
-                running: self.running.clone(),
-                press_feedback: self.press_feedback.clone(),
-                live: self.live.clone(),
-            },
-        );
+        let render = spawn_renderer(output.clone(), driver.layout(), self.render_inputs(pressed.clone()));
 
         // Input callbacks ----------------------------------------------------
+        let remote_owners: RemoteOwners = Arc::new(Mutex::new(HashMap::new()));
         let sink = InputSink {
             app: self.app.clone(),
             driver: driver.clone(),
             output: output.clone(),
             pressed: pressed.clone(),
+            remote_owners: remote_owners.clone(),
             render: render.clone(),
             listeners: self.listeners.clone(),
             pressure_listeners: self.pressure_listeners.clone(),
@@ -764,12 +851,14 @@ impl DeviceManager {
             },
             late_firmware,
             pressed,
+            remote_owners,
         })
     }
 
     fn disconnect_quiet(&mut self) {
         *self.render_slot.lock() = None;
         if let Some(active) = self.active.take() {
+            self.release_remote_presses(&active);
             active.render.close();
             for msg in active.output.driver.unload_messages() {
                 let _ = active.output.send_raw(msg);
@@ -794,6 +883,7 @@ impl DeviceManager {
     fn device_lost(&mut self) {
         *self.render_slot.lock() = None;
         if let Some(active) = self.active.take() {
+            self.release_remote_presses(&active);
             active.render.close();
             let _ = active.output.tx.send(OutCmd::Close);
             tracing::warn!(model = %active.info.model, "device unplugged");
@@ -813,6 +903,7 @@ struct InputSink {
     /// For the driver's immediate answers to what the device reports.
     output: OutputHandle,
     pressed: Arc<Mutex<HashSet<(u8, u8)>>>,
+    remote_owners: RemoteOwners,
     render: RenderHandle,
     listeners: Arc<Mutex<Vec<ButtonListener>>>,
     pressure_listeners: Arc<Mutex<Vec<PressureListener>>>,
@@ -908,12 +999,19 @@ impl InputSink {
         {
             let mut set = self.pressed.lock();
             if event.pressed {
-                set.insert((event.x, event.y));
+                if !set.insert((event.x, event.y)) {
+                    // Already held (by a phone remote): one gesture per pad at a time.
+                    tracing::trace!(x = event.x, y = event.y, "press of a held pad ignored");
+                    return;
+                }
             } else if !set.remove(&(event.x, event.y)) {
                 // A release for a pad that never counted as pressed (a brush below
                 // the velocity threshold): nothing to release, so nothing to run.
                 tracing::trace!(x = event.x, y = event.y, "release without press ignored");
                 return;
+            } else {
+                // The hardware let go: the gesture is over, whoever started it.
+                self.remote_owners.lock().remove(&(event.x, event.y));
             }
         }
         tracing::debug!(x = event.x, y = event.y, pressed = event.pressed, note = event.note, cc = event.cc, value = event.value, "button");

@@ -9,6 +9,7 @@ pub mod hub;
 pub mod macros;
 pub mod media;
 pub mod profile;
+pub mod remote;
 pub mod settings;
 pub mod wavelink;
 
@@ -44,6 +45,7 @@ pub struct AppState {
     pub wave_link_bridge: Mutex<Option<crate::wavelink::WaveLinkBridge>>,
     pub fine_tune: crate::finetune::FineTune,
     pub fine_tune_bridge: Mutex<Option<crate::finetune::FineTuneBridge>>,
+    pub remote: crate::remote::RemoteService,
     /// Profiles before each edit made from the UI, newest last (undo).
     pub history: Mutex<Vec<crate::profile::Profile>>,
     /// Profiles undone, newest last (redo); cleared by the next edit.
@@ -65,5 +67,6 @@ pub use hub::*;
 pub use macros::*;
 pub use media::*;
 pub use profile::*;
+pub use remote::*;
 pub use settings::*;
 pub use wavelink::*;
