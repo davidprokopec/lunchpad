@@ -963,20 +963,27 @@ async fn oversized_and_flooding_messages_end_the_connection() {
         "a message over the limit closes the socket"
     );
 
+    // One over the limit, and the phone keeps sending while the server closes.
     let mut ws = signed_in(port, &token).await;
-    for _ in 0..40 {
-        if ws.send(Message::text(r#"{"type":"ping"}"#)).await.is_err() {
-            break;
-        }
+    for _ in 0..21 {
+        ws.send(Message::text(r#"{"type":"ping"}"#)).await.unwrap();
     }
+    assert!(until(|| service.status().connected.is_empty()).await);
+    let _ = ws.send(Message::text(r#"{"type":"ping"}"#)).await;
     let mut flood = false;
-    while let Some(v) = next_json(&mut ws).await {
-        if v["code"] == "tooManyMessages" {
-            flood = true;
-            break;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(3), ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
+                flood |= v["code"] == "tooManyMessages";
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(None) => break,
+            Ok(Some(Err(e))) => panic!("the connection ends cleanly, not with {e}"),
+            Err(_) => panic!("the connection ends"),
         }
     }
-    assert!(flood);
+    assert!(flood, "the phone is told why");
     service.configure(false, 4000).await.unwrap();
 }
 

@@ -138,6 +138,10 @@ impl Out<'_> {
 }
 
 /// Say goodbye, briefly: never more than [`CLOSE_TIMEOUT`].
+///
+/// Reads on until the phone answers the close: dropping the socket while the phone
+/// is still sending makes the OS reset the connection, and on Windows a reset
+/// discards what the phone has not read yet, the error that explains the close included.
 async fn close<S: AsyncRead + AsyncWrite + Unpin>(
     ws: &mut WebSocketStream<S>,
     code: u16,
@@ -148,8 +152,9 @@ async fn close<S: AsyncRead + AsyncWrite + Unpin>(
         reason: reason.to_string().into(),
     }));
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
-        let _ = ws.send(frame).await;
-        let _ = ws.flush().await;
+        if ws.send(frame).await.is_ok() {
+            while let Some(Ok(_)) = ws.next().await {}
+        }
     })
     .await;
 }
