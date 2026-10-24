@@ -42,6 +42,9 @@ const MAX_DEPTH: u8 = 8;
 const MIN_PASS: Duration = Duration::from_millis(5);
 /// Legacy waited this long after toggling push-to-talk before continuing.
 const PTT_SETTLE: Duration = Duration::from_millis(250);
+/// After the user moves a fader, Home Assistant's state lags behind its own write:
+/// the read-back leaves that fader alone this long so it does not jump back.
+const HA_FOLLOW_HOLD: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +134,8 @@ struct Inner {
     device: Mutex<Option<ConnectedDevice>>,
     /// Latest knob / strip value per fader while a worker is pacing its actions.
     pending_controls: Mutex<HashMap<String, PendingControl>>,
+    /// When each fader (by id) was last moved by the user, for the Home Assistant read-back.
+    user_moves: Mutex<HashMap<String, Instant>>,
     ptt_count: Mutex<i32>,
     epoch: Instant,
     #[cfg(test)]
@@ -213,6 +218,7 @@ impl MacroEngine {
                 input_dispatch: Mutex::new(()),
                 device: Mutex::new(None),
                 pending_controls: Mutex::new(HashMap::new()),
+                user_moves: Mutex::new(HashMap::new()),
                 ptt_count: Mutex::new(0),
                 epoch: Instant::now(),
                 #[cfg(test)]
@@ -644,6 +650,97 @@ impl MacroEngine {
         }
     }
 
+    /// Home Assistant reported entity states: every fader whose change list sets one of
+    /// them from its own level takes that level. Like the system audio follow, nothing
+    /// runs and nothing is written back. A fader being moved, or moved by the user within
+    /// `HA_FOLLOW_HOLD`, is left alone; an unreadable state keeps the value.
+    pub fn follow_home_assistant(&self, states: &HashMap<String, serde_json::Value>) {
+        self.follow_home_assistant_at(states, Instant::now());
+    }
+
+    fn follow_home_assistant_at(&self, states: &HashMap<String, serde_json::Value>, now: Instant) {
+        let bound: Vec<(String, Fader, HaFaderBinding)> = {
+            let store = self.inner.profile.lock();
+            store
+                .profile
+                .pages
+                .iter()
+                .flat_map(|p| {
+                    p.faders
+                        .iter()
+                        .filter_map(|f| ha_binding(f).map(|b| (p.id.clone(), f.clone(), b)))
+                })
+                .collect()
+        };
+        if bound.is_empty() {
+            return;
+        }
+        let moving: HashSet<String> = self
+            .inner
+            .pending_controls
+            .lock()
+            .iter()
+            .filter(|(_, slot)| slot.busy || slot.touching)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for (page_id, fader, binding) in bound {
+            if moving.contains(&fader.id) {
+                continue;
+            }
+            if self
+                .inner
+                .user_moves
+                .lock()
+                .get(&fader.id)
+                .is_some_and(|at| now.saturating_duration_since(*at) < HA_FOLLOW_HOLD)
+            {
+                continue;
+            }
+            let Some(reading) = states
+                .get(&binding.entity)
+                .and_then(|st| crate::homeassistant::read_value(binding.kind, st))
+            else {
+                continue;
+            };
+            let Some(value) = binding.scale.level(&fader, reading) else {
+                continue;
+            };
+            if (fader.value - value).abs() <= (fader.max - fader.min).abs() / 1000.0 {
+                continue;
+            }
+            let mut at = fader.clone();
+            at.value = value;
+            let hit = FaderHit {
+                id: fader.id.clone(),
+                key: fader.variable_key(),
+                step: at.level_step(),
+                steps: at.steps(),
+                value,
+                min: fader.min,
+                max: fader.max,
+                decimals: fader.decimals,
+                display: at.display_text(),
+                bound: None,
+            };
+            self.fader_pressed_from(&page_id, fader.x, fader.y, hit, 127, None, FaderOrigin::Os);
+        }
+    }
+
+    /// The entities faders follow, for the Home Assistant read-back.
+    pub fn home_assistant_entities(&self) -> Vec<String> {
+        let store = self.inner.profile.lock();
+        store
+            .profile
+            .pages
+            .iter()
+            .flat_map(|p| {
+                p.faders
+                    .iter()
+                    .filter_map(|f| ha_binding(f).map(|b| b.entity))
+            })
+            .collect()
+    }
+
     pub fn reconcile_audio_bindings(&self) {
         if let Some(audio) = &self.inner.services.system_audio {
             let groups = self.inner.profile.lock().profile.audio_groups.clone();
@@ -684,6 +781,10 @@ impl MacroEngine {
             },
             _ => None,
         };
+        if origin == FaderOrigin::User {
+            let now = Instant::now();
+            self.inner.user_moves.lock().insert(hit.id.clone(), now);
+        }
         let page_for = page_id.to_string();
         let id_for = hit.id.clone();
         let value = hit.value;
@@ -1349,6 +1450,102 @@ struct FaderHit {
     bound: Option<Arc<crate::profile::AudioTarget>>,
 }
 
+/// How a fader's level reaches a Home Assistant value: the variable its
+/// `HomeAssistantSetValue` reads (`value_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaScale {
+    /// `value`, `fader.<name>`: the level itself
+    Level,
+    /// `percent`: 0–100 over the range
+    Percent,
+    /// `fraction`: 0–1 over the range
+    Fraction,
+}
+
+impl HaScale {
+    /// The fader level that sends `reading` (the reverse of the write), clamped to the range.
+    fn level(self, fader: &Fader, reading: f64) -> Option<f64> {
+        let span = fader.max - fader.min;
+        let value = match self {
+            HaScale::Level => reading,
+            HaScale::Percent => fader.min + span * reading / 100.0,
+            HaScale::Fraction => fader.min + span * reading,
+        };
+        if !value.is_finite() {
+            return None;
+        }
+        let (lo, hi) = if fader.min <= fader.max {
+            (fader.min, fader.max)
+        } else {
+            (fader.max, fader.min)
+        };
+        Some(value.clamp(lo, hi))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HaFaderBinding {
+    entity: String,
+    kind: HaValueKind,
+    scale: HaScale,
+}
+
+/// The Home Assistant value a fader sets with its own level: the first
+/// `HomeAssistantSetValue` in its change list with a literal entity whose value
+/// comes from the fader. Audio-bound faders follow their audio target instead.
+fn ha_binding(fader: &Fader) -> Option<HaFaderBinding> {
+    if fader.bound.is_some() {
+        return None;
+    }
+    fader.on_change.iter().find_map(|action| {
+        let ActionKind::HomeAssistantSetValue {
+            entity,
+            kind,
+            value_from,
+            ..
+        } = &action.kind
+        else {
+            return None;
+        };
+        let entity = entity.trim();
+        if !crate::homeassistant::is_entity_id(entity) {
+            return None;
+        }
+        let raw = value_from.as_deref()?.trim();
+        let name = match raw.strip_prefix("{{").and_then(|r| r.strip_suffix("}}")) {
+            Some(inner) => inner.trim(),
+            None => raw,
+        };
+        if name.contains('{') || name.contains('}') {
+            return None;
+        }
+        let scale = match name {
+            "value" => HaScale::Level,
+            "percent" => HaScale::Percent,
+            "fraction" => HaScale::Fraction,
+            other => match other.strip_prefix("fader.") {
+                Some(key) if key == fader.id || key == fader.variable_key() => HaScale::Level,
+                _ => return None,
+            },
+        };
+        Some(HaFaderBinding {
+            entity: entity.to_string(),
+            kind: *kind,
+            scale,
+        })
+    })
+}
+
+impl crate::homeassistant::HaFollower for MacroEngine {
+    fn entities(&self) -> Vec<String> {
+        self.home_assistant_entities()
+    }
+
+    fn follow(&self, states: &HashMap<String, serde_json::Value>) {
+        self.follow_home_assistant(states);
+    }
+}
+
 /// Who moved a fader: someone at the pads or in the window (the system follows), or the
 /// system itself (the fader follows, nothing runs and nothing is written back).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1914,6 +2111,303 @@ mod tests {
         assert_eq!(g.get("got").map(String::as_str), Some("-30|50|2/5"));
         assert_eq!(g.get("fader.mic").map(String::as_str), Some("-30"));
         assert_eq!(profile.lock().profile.page(DEFAULT_PAGE_ID).unwrap().faders[0].value, -30.0);
+    }
+
+    fn ha_value(entity: &str, kind: HaValueKind, from: Option<&str>) -> Action {
+        a(ActionKind::HomeAssistantSetValue {
+            entity: entity.into(),
+            kind,
+            value: 50.0,
+            value_from: from.map(str::to_string),
+        })
+    }
+
+    fn ha_fader(
+        profile: &SharedProfile,
+        id: &str,
+        x: u8,
+        min: f64,
+        max: f64,
+        value: f64,
+        on_change: Vec<Action>,
+    ) {
+        profile
+            .lock()
+            .profile
+            .page_mut(DEFAULT_PAGE_ID)
+            .unwrap()
+            .set_fader(Fader {
+                id: id.into(),
+                name: id.into(),
+                x,
+                y: 0,
+                direction: FaderDirection::Up,
+                length: 4,
+                min,
+                max,
+                value,
+                on_change,
+                ..Fader::default()
+            });
+    }
+
+    fn fader_value(profile: &SharedProfile, id: &str) -> f64 {
+        profile
+            .lock()
+            .profile
+            .page(DEFAULT_PAGE_ID)
+            .unwrap()
+            .faders
+            .iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .value
+    }
+
+    fn light(state: &str, brightness: Option<u32>) -> HashMap<String, serde_json::Value> {
+        [("light.kulate".to_string(), serde_json::json!({ "entity_id": "light.kulate", "state": state, "attributes": { "brightness": brightness } }))].into()
+    }
+
+    #[tokio::test]
+    async fn a_home_assistant_fader_shows_the_entity_level_without_running_anything() {
+        let (engine, profile) = engine();
+        let ran = a(ActionKind::SetVariable {
+            name: "ran".into(),
+            value: "yes".into(),
+            scope: VarScope::Global,
+        });
+        ha_fader(
+            &profile,
+            "kulate",
+            0,
+            0.0,
+            100.0,
+            10.0,
+            vec![
+                ha_value("light.kulate", HaValueKind::Brightness, Some("value")),
+                ran,
+            ],
+        );
+        assert_eq!(
+            engine.home_assistant_entities(),
+            vec!["light.kulate".to_string()]
+        );
+        engine.follow_home_assistant(&light("on", Some(128)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fader_value(&profile, "kulate"), 50.0);
+        assert_eq!(
+            engine.globals().get("fader.kulate").map(String::as_str),
+            Some("50")
+        );
+        assert!(
+            !engine.globals().contains_key("ran"),
+            "the change list did not run"
+        );
+        assert!(
+            engine.running().is_empty(),
+            "nothing was started, so no service was called"
+        );
+        engine.follow_home_assistant(&light("off", None));
+        assert_eq!(fader_value(&profile, "kulate"), 0.0, "off is the bottom");
+        engine.follow_home_assistant(&light("unavailable", None));
+        assert_eq!(
+            fader_value(&profile, "kulate"),
+            0.0,
+            "an unavailable light keeps the value"
+        );
+        engine.follow_home_assistant(&HashMap::new());
+        assert_eq!(
+            fader_value(&profile, "kulate"),
+            0.0,
+            "a missing entity keeps the value"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_home_assistant_reading_maps_back_into_the_fader_range() {
+        let (engine, profile) = engine();
+        ha_fader(
+            &profile,
+            "lvl",
+            0,
+            0.0,
+            200.0,
+            0.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("{{fader.lvl}}"),
+            )],
+        );
+        ha_fader(
+            &profile,
+            "pct",
+            1,
+            -60.0,
+            0.0,
+            0.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("percent"),
+            )],
+        );
+        ha_fader(
+            &profile,
+            "frac",
+            2,
+            10.0,
+            20.0,
+            0.0,
+            vec![ha_value(
+                "input_number.mix",
+                HaValueKind::Number,
+                Some("{{fraction}}"),
+            )],
+        );
+        ha_fader(
+            &profile,
+            "small",
+            3,
+            0.0,
+            40.0,
+            0.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("value"),
+            )],
+        );
+        let mut states = light("on", Some(191)); // 75 %
+        states.insert(
+            "input_number.mix".into(),
+            serde_json::json!({ "state": "0.75", "attributes": {} }),
+        );
+        engine.follow_home_assistant(&states);
+        assert_eq!(
+            fader_value(&profile, "lvl"),
+            75.0,
+            "the level is the value itself"
+        );
+        assert_eq!(
+            fader_value(&profile, "pct"),
+            -15.0,
+            "percent maps over the range"
+        );
+        assert_eq!(
+            fader_value(&profile, "frac"),
+            17.5,
+            "a fraction (the value Home Assistant gets) maps over the range"
+        );
+        assert_eq!(fader_value(&profile, "small"), 40.0, "clamped to the range");
+    }
+
+    #[tokio::test]
+    async fn only_faders_that_send_their_own_level_follow_home_assistant() {
+        let (engine, profile) = engine();
+        ha_fader(
+            &profile,
+            "fixed",
+            0,
+            0.0,
+            100.0,
+            5.0,
+            vec![ha_value("light.kulate", HaValueKind::Brightness, None)],
+        );
+        ha_fader(
+            &profile,
+            "other",
+            1,
+            0.0,
+            100.0,
+            5.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("someVariable"),
+            )],
+        );
+        ha_fader(
+            &profile,
+            "templ",
+            2,
+            0.0,
+            100.0,
+            5.0,
+            vec![ha_value(
+                "light.{{room}}",
+                HaValueKind::Brightness,
+                Some("value"),
+            )],
+        );
+        ha_fader(
+            &profile,
+            "mixed",
+            3,
+            0.0,
+            100.0,
+            5.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("{{value}}{{percent}}"),
+            )],
+        );
+        assert!(engine.home_assistant_entities().is_empty());
+        engine.follow_home_assistant(&light("on", Some(255)));
+        for id in ["fixed", "other", "templ", "mixed"] {
+            assert_eq!(fader_value(&profile, id), 5.0, "{id} is not bound");
+        }
+    }
+
+    #[tokio::test]
+    async fn home_assistant_does_not_fight_the_hand_on_a_fader() {
+        let (engine, profile) = engine();
+        ha_fader(
+            &profile,
+            "kulate",
+            0,
+            0.0,
+            100.0,
+            10.0,
+            vec![ha_value(
+                "light.kulate",
+                HaValueKind::Brightness,
+                Some("value"),
+            )],
+        );
+        assert!(engine.set_fader_level("kulate", 80.0, false));
+        let moved = Instant::now();
+        // Home Assistant still reports the old level while its own write catches up.
+        engine.follow_home_assistant_at(&light("on", Some(26)), moved + Duration::from_secs(1));
+        assert_eq!(
+            fader_value(&profile, "kulate"),
+            80.0,
+            "just moved: left alone"
+        );
+        engine.follow_home_assistant_at(
+            &light("on", Some(26)),
+            moved + HA_FOLLOW_HOLD + Duration::from_millis(10),
+        );
+        assert_eq!(
+            fader_value(&profile, "kulate"),
+            10.0,
+            "afterwards the real state wins"
+        );
+
+        engine.inner.pending_controls.lock().insert(
+            "kulate".into(),
+            PendingControl {
+                busy: true,
+                ..Default::default()
+            },
+        );
+        engine.follow_home_assistant_at(&light("on", Some(255)), moved + Duration::from_secs(60));
+        assert_eq!(
+            fader_value(&profile, "kulate"),
+            10.0,
+            "a knob or strip in motion is left alone"
+        );
     }
 
     #[tokio::test]

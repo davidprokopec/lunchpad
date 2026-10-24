@@ -311,6 +311,8 @@ pub fn run() {
                 system_audio: Some(system_audio.clone()),
             };
             let engine = MacroEngine::new(profile.clone(), running_pads, sink, services, runtime);
+            // Faders that set a Home Assistant value show what Home Assistant reports.
+            home_assistant.set_follower(Arc::new(engine.clone()));
             {
                 let app = app.handle().clone();
                 let render = manager.lock().render_slot();
